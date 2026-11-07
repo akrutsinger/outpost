@@ -15,7 +15,6 @@ use crate::net::Protocol;
 use crate::text_input::TextInput;
 use crate::theme::*;
 
-const SIDEBAR_WIDTH: u16 = 26;
 const MIN_TAB_WIDTH: u16 = 8;
 const WORKSPACE_HEADER_ROWS: u16 = 2;
 
@@ -46,6 +45,10 @@ pub struct Hits {
     pub new_workspace: Rect,
     pub settings: Rect,
     pub pane: Rect,
+    /// The sidebar's vertical separator (full sidebar height).
+    pub sidebar_divider: Rect,
+    /// The line between the workspaces and sessions sections.
+    pub section_divider: Rect,
     /// Right-click menu rows: (row, index into `MENU_ITEMS`).
     pub menu_items: Vec<(Rect, usize)>,
     /// Settings form targets; protocol buttons come before the rows they sit in.
@@ -60,7 +63,7 @@ pub struct Hits {
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let mut hits = Hits::default();
-    let sidebar_width = SIDEBAR_WIDTH.min(area.width / 2);
+    let sidebar_width = app.sidebar_width.min(area.width / 2);
     let sidebar = Rect {
         width: sidebar_width,
         ..area
@@ -187,6 +190,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         return;
     }
     let separator_x = area.right() - 1;
+    hits.sidebar_divider = Rect::new(separator_x, area.y, 1, area.height);
     for y in area.top()..area.bottom() {
         buf[(separator_x, y)]
             .set_symbol("│")
@@ -199,7 +203,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     let top_height = if content.height < 6 {
         content.height.div_ceil(2)
     } else {
-        (content.height / 2).clamp(3, content.height - 3)
+        ((content.height as f32 * app.sidebar_split).round() as u16).clamp(3, content.height - 3)
     };
     let top = Rect {
         height: top_height,
@@ -210,6 +214,9 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         height: content.height - top_height,
         ..content
     };
+    if content.height >= 6 {
+        hits.section_divider = Rect::new(content.x, bottom.y, content.width, 1);
+    }
     render_workspaces(buf, top, app, hits);
     render_sessions(buf, bottom, app, hits);
 }
@@ -1164,7 +1171,11 @@ mod tests {
         let rows = render_rows(&mut app, W, H);
         let sidebar: Vec<String> = rows
             .iter()
-            .map(|row| row.chars().take(SIDEBAR_WIDTH as usize).collect())
+            .map(|row| {
+                row.chars()
+                    .take(crate::app::DEFAULT_SIDEBAR_WIDTH as usize)
+                    .collect()
+            })
             .collect();
         row_with(&sidebar, "255.255.255.255:65535");
     }
@@ -1386,6 +1397,35 @@ mod tests {
         row_with(&rows, "│ Close tab?");
         row_with(&rows, " db (255.255.255.255:65535) is still connected.");
         row_with(&rows, "↵ confirm");
+    }
+
+    #[test]
+    fn sidebar_follows_its_width_and_split() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.add_test_session(ws, "10.0.0.5:51234");
+        app.sidebar_width = 34;
+        app.sidebar_split = 0.75;
+        let rows = render_rows(&mut app, W, H);
+
+        for row in &rows {
+            assert_eq!(row.chars().nth(33), Some('│'), "separator column: {row:?}");
+        }
+        let tab_bar: String = rows[0].chars().skip(34).collect();
+        assert!(
+            tab_bar.starts_with("  10.0.0.5:51234"),
+            "tabs start after it"
+        );
+        assert!(rows[24].starts_with(&"─".repeat(33)), "section line moved");
+        assert!(rows[25].starts_with(" sessions"));
+    }
+
+    #[test]
+    fn sidebar_never_takes_more_than_half_the_screen() {
+        let (mut app, _rx) = App::test_new();
+        app.sidebar_width = 36;
+        render_rows(&mut app, 50, 20);
+        assert_eq!(app.hits.sidebar_divider.x, 24);
     }
 
     #[test]

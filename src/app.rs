@@ -1,6 +1,7 @@
 //! Application state: workspaces (listeners), sessions (connections), and input handling.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -17,6 +18,13 @@ use crate::ui::{FormHit, Hits, TextTarget};
 
 const MAX_LINES: usize = 10_000;
 const DEFAULT_PORT: u16 = 4444;
+/// Sidebar width limits, matching herdr's defaults.
+pub const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
+const MIN_SIDEBAR_WIDTH: u16 = 18;
+const MAX_SIDEBAR_WIDTH: u16 = 36;
+/// Share of the sidebar given to workspaces; sessions get the rest.
+const DEFAULT_SIDEBAR_SPLIT: f32 = 0.5;
+const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ListenerConfig {
@@ -301,12 +309,25 @@ pub enum Mode {
     ConfirmClose(Target),
 }
 
+/// A sidebar divider being dragged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Drag {
+    /// The vertical line between the sidebar and the tabs.
+    SidebarWidth,
+    /// The horizontal line between workspaces and sessions.
+    SidebarSplit,
+}
+
 pub struct App {
     pub workspaces: Vec<Workspace>,
     pub active: usize,
     pub mode: Mode,
     pub hits: Hits,
     pub quit: bool,
+    pub sidebar_width: u16,
+    pub sidebar_split: f32,
+    drag: Option<Drag>,
+    last_divider_click: Option<Instant>,
     events: UnboundedSender<Event>,
 }
 
@@ -318,6 +339,10 @@ impl App {
             mode: Mode::Normal,
             hits: Hits::default(),
             quit: false,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_split: DEFAULT_SIDEBAR_SPLIT,
+            drag: None,
+            last_divider_click: None,
             events,
         }
     }
@@ -577,6 +602,23 @@ impl App {
             .iter()
             .find(|(r, ..)| r.contains(pos))
             .map(|&(r, target, scroll)| (target, scroll + (pos.x - r.x) as usize));
+        // A divider drag follows the mouse until the button is released.
+        if let Some(drag) = self.drag {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    match drag {
+                        Drag::SidebarWidth => self.set_sidebar_width(mouse.column),
+                        Drag::SidebarSplit => self.set_sidebar_split(mouse.row),
+                    }
+                    return;
+                }
+                MouseEventKind::Up(_) => {
+                    self.drag = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Overlays capture the mouse while open.
         match &mut self.mode {
             Mode::Help => return,
@@ -678,7 +720,22 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mode = Mode::Normal;
-                if self.hits.new_workspace.contains(pos) {
+                if self.hits.sidebar_divider.contains(pos) {
+                    let now = Instant::now();
+                    let double = self
+                        .last_divider_click
+                        .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
+                    self.last_divider_click = Some(now);
+                    if double {
+                        self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+                    } else {
+                        self.drag = Some(Drag::SidebarWidth);
+                        self.set_sidebar_width(mouse.column);
+                    }
+                } else if self.hits.section_divider.contains(pos) {
+                    self.drag = Some(Drag::SidebarSplit);
+                    self.set_sidebar_split(mouse.row);
+                } else if self.hits.new_workspace.contains(pos) {
                     self.open_new_form();
                 } else if self.hits.settings.contains(pos) {
                     self.open_settings_form();
@@ -711,6 +768,20 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Puts the sidebar's right edge (its separator) at `column`.
+    fn set_sidebar_width(&mut self, column: u16) {
+        self.sidebar_width = (column + 1).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    }
+
+    /// Puts the workspaces/sessions divider at `row`.
+    fn set_sidebar_split(&mut self, row: u16) {
+        let sidebar = self.hits.sidebar_divider;
+        if sidebar.height > 0 {
+            let offset = row.saturating_sub(sidebar.y) as f32;
+            self.sidebar_split = (offset / sidebar.height as f32).clamp(0.1, 0.9);
         }
     }
 

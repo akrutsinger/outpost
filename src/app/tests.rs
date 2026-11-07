@@ -5,6 +5,8 @@ use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use std::time::{Duration, Instant};
+
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
@@ -1103,4 +1105,128 @@ fn a_tab_that_disconnects_while_asking_still_closes_on_confirm() {
     }));
     key(&mut app, KeyCode::Enter);
     assert_eq!(app.workspaces[0].sessions.len(), 2);
+}
+
+// ---- dragging the sidebar dividers ----
+
+fn at(column: u16, row: u16) -> Rect {
+    Rect::new(column, row, 1, 1)
+}
+
+fn drag_to(app: &mut App, column: u16, row: u16) {
+    mouse(
+        app,
+        MouseEventKind::Drag(MouseButton::Left),
+        at(column, row),
+    );
+}
+
+fn release(app: &mut App, column: u16, row: u16) {
+    mouse(app, MouseEventKind::Up(MouseButton::Left), at(column, row));
+}
+
+#[test]
+fn dragging_the_vertical_divider_resizes_the_sidebar() {
+    let (mut app, _ids) = three_workspaces();
+    let divider = app.hits.sidebar_divider;
+    assert_eq!((divider.x, divider.height), (25, 32));
+
+    click(&mut app, Rect { y: 10, ..divider });
+    assert_eq!(app.sidebar_width, 26, "grabbing alone doesn't move it");
+    drag_to(&mut app, 30, 12);
+    assert_eq!(app.sidebar_width, 31);
+    release(&mut app, 30, 12);
+
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.hits.sidebar_divider.x, 30);
+    drag_to(&mut app, 20, 12);
+    assert_eq!(app.sidebar_width, 31, "no drag after release");
+}
+
+#[test]
+fn sidebar_width_is_clamped() {
+    let (mut app, _ids) = three_workspaces();
+    let divider = app.hits.sidebar_divider;
+    click(&mut app, divider);
+    drag_to(&mut app, 2, 0);
+    assert_eq!(app.sidebar_width, 18);
+    drag_to(&mut app, 100, 0);
+    assert_eq!(app.sidebar_width, 36);
+}
+
+#[test]
+fn double_clicking_the_vertical_divider_restores_the_default_width() {
+    let (mut app, _ids) = three_workspaces();
+    let divider = app.hits.sidebar_divider;
+    click(&mut app, divider);
+    drag_to(&mut app, 33, 5);
+    release(&mut app, 33, 5);
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.sidebar_width, 34);
+
+    // A click long after the last one only grabs the divider.
+    app.last_divider_click = Some(Instant::now() - Duration::from_secs(1));
+    let divider = app.hits.sidebar_divider;
+    click(&mut app, divider);
+    release(&mut app, 33, 5);
+    assert_eq!(app.sidebar_width, 34);
+
+    let divider = app.hits.sidebar_divider;
+
+    click(&mut app, divider);
+    assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+}
+
+#[test]
+fn dragging_the_horizontal_divider_moves_the_section_split() {
+    let (mut app, _ids) = three_workspaces();
+    let divider = app.hits.section_divider;
+    assert_eq!((divider.y, divider.width), (16, 25));
+
+    click(&mut app, Rect { x: 8, ..divider });
+    drag_to(&mut app, 8, 24);
+    release(&mut app, 8, 24);
+    assert_eq!(app.sidebar_split, 0.75);
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.hits.section_divider.y, 24);
+}
+
+#[test]
+fn section_split_keeps_both_sections_visible() {
+    let (mut app, _ids) = three_workspaces();
+    let divider = app.hits.section_divider;
+    click(&mut app, divider);
+    drag_to(&mut app, 5, 0);
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.hits.section_divider.y, 3, "workspaces keep 3 rows");
+
+    drag_to(&mut app, 5, 31);
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.hits.section_divider.y, 29, "sessions keep 3 rows");
+}
+
+#[test]
+fn dragging_across_other_targets_does_not_click_them() {
+    let (mut app, ws) = three_workspaces();
+    let (_sess, _out) = app.add_test_session(ws[0], "10.0.0.5:1000");
+    render_rows(&mut app, 120, 32);
+    let other = app.hits.workspaces[2].0;
+    let tab = app.hits.tabs[0].0;
+
+    let divider = app.hits.section_divider;
+
+    click(&mut app, divider);
+    drag_to(&mut app, other.x, other.y);
+    release(&mut app, tab.x, tab.y);
+    assert_eq!(app.active, 0);
+    assert!(matches!(app.mode, Mode::Normal));
+}
+
+#[test]
+fn drag_events_without_a_grab_do_nothing() {
+    let (mut app, _ids) = three_workspaces();
+    drag_to(&mut app, 30, 10);
+    release(&mut app, 30, 10);
+    assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+    assert_eq!(app.sidebar_split, 0.5);
 }
