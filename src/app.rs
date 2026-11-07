@@ -30,7 +30,7 @@ pub enum ListenState {
 }
 
 /// Drives the sidebar icon/color for both workspaces and sessions.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Unread,
     Open,
@@ -116,7 +116,7 @@ impl Drop for Workspace {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {
     In,
     Out,
@@ -618,5 +618,54 @@ impl App {
             self.workspaces.remove(self.active);
             self.active = self.active.min(self.workspaces.len().saturating_sub(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+impl App {
+    /// An app with no workspaces. The receiver gets events from any listener the app starts.
+    pub fn test_new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self::new(tx), rx)
+    }
+
+    /// Adds a workspace that is already listening, with no socket behind it.
+    pub fn add_test_workspace(&mut self, protocol: Protocol, addr: &str) -> WsId {
+        let id = net::next_id();
+        self.workspaces.push(Workspace {
+            id,
+            config: ListenerConfig {
+                protocol,
+                addr: addr.parse().expect("test address"),
+            },
+            state: ListenState::Listening,
+            sessions: Vec::new(),
+            active_tab: 0,
+            listener: None,
+            udp_out: None,
+        });
+        id
+    }
+
+    /// Accepts a TCP session into `ws`, as the listener would. The receiver gets
+    /// every chunk the app sends to that peer; it reports disconnected once the
+    /// app drops the session.
+    pub fn add_test_session(
+        &mut self,
+        ws: WsId,
+        peer: &str,
+    ) -> (SessId, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sess = net::next_id();
+        self.handle(Event::Net(NetEvent::Accepted {
+            ws,
+            sess,
+            peer: peer.parse().expect("test peer"),
+            outlet: Outlet::Tcp(tx),
+        }));
+        (sess, rx)
     }
 }

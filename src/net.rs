@@ -231,3 +231,151 @@ async fn udp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
         }
     }
 }
+
+/// Real sockets on 127.0.0.1, all inside the test process.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::time::timeout;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    async fn next(rx: &mut UnboundedReceiver<Event>) -> NetEvent {
+        match timeout(WAIT, rx.recv()).await {
+            Ok(Some(Event::Net(ev))) => ev,
+            Ok(Some(Event::Input(_))) => panic!("unexpected input event"),
+            Ok(None) => panic!("event channel closed"),
+            Err(_) => panic!("timed out waiting for a net event"),
+        }
+    }
+
+    /// Starts a listener on an OS-assigned port and returns its address.
+    async fn listen(
+        protocol: Protocol,
+    ) -> (
+        UnboundedReceiver<Event>,
+        SocketAddr,
+        Option<UdpOut>,
+        AbortHandle,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_listener(1, protocol, "127.0.0.1:0".parse().unwrap(), tx);
+        let NetEvent::Listening { ws: 1, local, udp } = next(&mut rx).await else {
+            panic!("expected Listening");
+        };
+        (rx, local, udp, handle)
+    }
+
+    #[tokio::test]
+    async fn tcp_session_round_trip_and_peer_close() {
+        let (mut rx, local, udp, _listener) = listen(Protocol::Tcp).await;
+        assert!(udp.is_none());
+
+        let mut client = TcpStream::connect(local).await.unwrap();
+        let NetEvent::Accepted {
+            ws: 1,
+            sess,
+            peer,
+            outlet,
+        } = next(&mut rx).await
+        else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(peer, client.local_addr().unwrap());
+
+        client.write_all(b"hello\n").await.unwrap();
+        let NetEvent::Data { sess: s, bytes } = next(&mut rx).await else {
+            panic!("expected Data");
+        };
+        assert_eq!((s, bytes.as_slice()), (sess, b"hello\n".as_slice()));
+
+        assert!(outlet.send(b"hi back\n".to_vec()));
+        let mut buf = [0u8; 8];
+        timeout(WAIT, client.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"hi back\n");
+
+        drop(client);
+        let NetEvent::Closed { sess: s, error } = next(&mut rx).await else {
+            panic!("expected Closed");
+        };
+        assert_eq!((s, error), (sess, None));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_outlet_hangs_up_on_the_peer() {
+        let (mut rx, local, _, _listener) = listen(Protocol::Tcp).await;
+        let mut client = TcpStream::connect(local).await.unwrap();
+        let NetEvent::Accepted { sess, outlet, .. } = next(&mut rx).await else {
+            panic!("expected Accepted");
+        };
+
+        drop(outlet);
+        let mut buf = [0u8; 1];
+        let read = timeout(WAIT, client.read(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(read, 0, "peer sees EOF");
+        let NetEvent::Closed {
+            sess: s,
+            error: None,
+        } = next(&mut rx).await
+        else {
+            panic!("expected a clean Closed");
+        };
+        assert_eq!(s, sess);
+    }
+
+    #[tokio::test]
+    async fn bind_failure_is_reported() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_listener(7, Protocol::Tcp, addr, tx);
+        let NetEvent::ListenFailed { ws: 7, error } = next(&mut rx).await else {
+            panic!("expected ListenFailed");
+        };
+        assert!(!error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn udp_datagrams_in_and_replies_out() {
+        let (mut rx, local, udp, _listener) = listen(Protocol::Udp).await;
+        let udp = udp.expect("UDP listeners hand back a send channel");
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", local).await.unwrap();
+        let NetEvent::Datagram { ws: 1, peer, bytes } = next(&mut rx).await else {
+            panic!("expected Datagram");
+        };
+        assert_eq!(peer, client.local_addr().unwrap());
+        assert_eq!(bytes, b"ping");
+
+        let outlet = Outlet::Udp { tx: udp, peer };
+        assert!(outlet.send(b"pong".to_vec()));
+        let mut buf = [0u8; 16];
+        let (n, from) = timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&buf[..n], from), (b"pong".as_slice(), local));
+    }
+
+    #[tokio::test]
+    async fn aborting_a_listener_frees_its_port() {
+        let (_rx, local, _, listener) = listen(Protocol::Tcp).await;
+        listener.abort();
+        // The aborted task drops its socket the next time the runtime polls it.
+        let rebound = timeout(WAIT, async {
+            loop {
+                if let Ok(l) = TcpListener::bind(local).await {
+                    return l;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(rebound.is_ok(), "port {local} was not released");
+    }
+}

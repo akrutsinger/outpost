@@ -780,3 +780,197 @@ fn render_help(buf: &mut Buffer, area: Rect) {
         );
     }
 }
+
+/// Renders `app` into an off-screen buffer and returns each row as text.
+/// Also refreshes `app.hits`, so tests can click what was drawn.
+#[cfg(test)]
+pub fn render_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| render(frame, app)).expect("draw");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(width as usize)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Event;
+    use crate::net::NetEvent;
+
+    const W: u16 = 120;
+    const H: u16 = 32;
+
+    fn screen(app: &mut App) -> String {
+        render_rows(app, W, H).join("\n")
+    }
+
+    fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a str {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn empty_app_explains_how_to_start() {
+        let (mut app, _rx) = App::test_new();
+        let text = screen(&mut app);
+        assert!(text.contains(" workspaces"));
+        assert!(text.contains("no listeners"));
+        assert!(text.contains("no connections"));
+        assert!(text.contains("ctrl+b N or click new to open a listener"));
+    }
+
+    #[test]
+    fn listening_workspace_without_sessions_says_waiting() {
+        let (mut app, _rx) = App::test_new();
+        app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        let rows = render_rows(&mut app, W, H);
+        assert!(row_with(&rows, "1 tcp :4444").contains('○'));
+        assert!(row_with(&rows, "0.0.0.0 · 0 open").starts_with("   0.0.0.0"));
+        row_with(&rows, "listening on tcp 0.0.0.0:4444");
+        row_with(&rows, "waiting for connections…");
+    }
+
+    #[test]
+    fn session_shows_in_sidebar_tab_bar_and_pane() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+        app.handle(Event::Net(NetEvent::Data {
+            sess,
+            bytes: b"hello there\n".to_vec(),
+        }));
+        let rows = render_rows(&mut app, W, H);
+
+        // Tab bar (row 0) carries the peer and the listener address.
+        assert!(rows[0].contains("10.0.0.5:51234"));
+        assert!(rows[0].contains("tcp 0.0.0.0:4444"));
+        // Pane border: peer on the left, status and byte counts on the right.
+        assert!(rows[1].contains("╭ 10.0.0.5:51234 "));
+        assert!(rows[1].contains(" open · ↓12B ↑0B ╮"));
+        row_with(&rows, "── connected from 10.0.0.5:51234");
+        row_with(&rows, "hello there");
+        // Sessions panel.
+        row_with(&rows, " sessions          1 open");
+        assert!(row_with(&rows, "● 10.0.0.5:51234").starts_with(" ●"));
+        assert!(row_with(&rows, "tcp :4444 · ↓12B").contains("open"));
+        assert!(row_with(&rows, "❯").contains('❯'));
+    }
+
+    #[test]
+    fn full_ipv4_peer_is_not_truncated_in_sidebar() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.add_test_session(ws, "255.255.255.255:65535");
+        let rows = render_rows(&mut app, W, H);
+        let sidebar: Vec<String> = rows
+            .iter()
+            .map(|row| row.chars().take(SIDEBAR_WIDTH as usize).collect())
+            .collect();
+        row_with(&sidebar, "255.255.255.255:65535");
+    }
+
+    #[test]
+    fn failed_listener_shows_error_in_sidebar_and_pane() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.handle(Event::Net(NetEvent::ListenFailed {
+            ws,
+            error: "Address already in use (os error 98)".into(),
+        }));
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "   Address already in us");
+        row_with(&rows, "could not listen on tcp 0.0.0.0:4444");
+        row_with(&rows, "ctrl+b s to change settings");
+    }
+
+    #[test]
+    fn closed_session_replaces_input_with_hint() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+        app.handle(Event::Net(NetEvent::Closed { sess, error: None }));
+        let rows = render_rows(&mut app, W, H);
+        assert!(rows[1].contains(" closed · "));
+        row_with(&rows, "── disconnected");
+        row_with(&rows, "connection closed · ctrl+b X closes the tab");
+        // Closed sessions leave the sidebar list.
+        row_with(&rows, "no connections");
+    }
+
+    #[test]
+    fn prefix_mode_shows_mode_bar_on_last_row() {
+        let (mut app, _rx) = App::test_new();
+        app.mode = Mode::Prefix;
+        let rows = render_rows(&mut app, W, H);
+        let last = rows.last().unwrap();
+        assert!(last.contains(" PREFIX "));
+        assert!(last.contains("N new"));
+        assert!(last.contains("D close workspace"));
+    }
+
+    #[test]
+    fn settings_modal_fits_its_hint_line() {
+        let (mut app, _rx) = App::test_new();
+        app.mode = Mode::Settings(SettingsForm {
+            target: None,
+            protocol: Protocol::Udp,
+            address: "0.0.0.0".into(),
+            port: "4444".into(),
+            field: 2,
+            error: Some("invalid port".into()),
+        });
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "╭ new workspace ");
+        row_with(&rows, "address    0.0.0.0");
+        row_with(&rows, "port       4444");
+        row_with(&rows, "invalid port");
+        let hint = row_with(&rows, "tab field");
+        assert!(hint.contains("esc cancel"), "hint clipped: {hint:?}");
+    }
+
+    #[test]
+    fn transcript_follows_tail_and_scrolls_back() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+        let bytes: String = (0..100).map(|i| format!("line {i:03}\n")).collect();
+        app.handle(Event::Net(NetEvent::Data {
+            sess,
+            bytes: bytes.into_bytes(),
+        }));
+
+        let text = render_rows(&mut app, W, H).join("\n");
+        assert!(text.contains("line 099"));
+        assert!(!text.contains("line 000"));
+
+        app.workspaces[0].sessions[0].scroll = 1_000;
+        let text = render_rows(&mut app, W, H).join("\n");
+        assert!(text.contains("line 000"), "scrolled to the top");
+        assert!(!text.contains("line 099"));
+        assert!(text.contains("more "), "scroll indicator shown");
+        // Overscroll is clamped to the top of the transcript.
+        assert!(app.workspaces[0].sessions[0].scroll < 1_000);
+    }
+
+    #[test]
+    fn wrap_splits_on_width_and_keeps_empty_lines() {
+        assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
+        assert_eq!(wrap("", 4), vec![""]);
+        assert_eq!(wrap("abcd", 4), vec!["abcd"]);
+    }
+
+    #[test]
+    fn human_formats_byte_counts() {
+        assert_eq!(human(0), "0B");
+        assert_eq!(human(1023), "1023B");
+        assert_eq!(human(1536), "1.5K");
+        assert_eq!(human(3 * 1024 * 1024), "3.0M");
+    }
+}
