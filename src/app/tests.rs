@@ -729,7 +729,7 @@ fn clicking_protocol_buttons_selects_the_protocol() {
         },
     );
     assert_eq!(form(&app).protocol, Protocol::Udp);
-    assert_eq!(form(&app).field, 0);
+    assert_eq!(form(&app).field, Field::Protocol);
 
     let tcp = form_target(&app, |h| matches!(h, FormHit::Protocol(Protocol::Tcp)));
     click(&mut app, tcp);
@@ -742,7 +742,7 @@ fn clicking_a_field_lets_you_type_into_it() {
     prefix(&mut app, 'N');
     render_rows(&mut app, 120, 32);
 
-    let address = form_target(&app, |h| matches!(h, FormHit::Field(1)));
+    let address = form_target(&app, |h| matches!(h, FormHit::Field(Field::Address)));
     // Anywhere on the row works, including well right of the text.
     click(
         &mut app,
@@ -751,16 +751,16 @@ fn clicking_a_field_lets_you_type_into_it() {
             ..address
         },
     );
-    assert_eq!(form(&app).field, 1);
+    assert_eq!(form(&app).field, Field::Address);
     for _ in 0..7 {
         key(&mut app, KeyCode::Backspace);
     }
     type_str(&mut app, "127.0.0.1");
     assert_eq!(form(&app).address, "127.0.0.1");
 
-    let port = form_target(&app, |h| matches!(h, FormHit::Field(2)));
+    let port = form_target(&app, |h| matches!(h, FormHit::Field(Field::Port)));
     click(&mut app, port);
-    assert_eq!(form(&app).field, 2);
+    assert_eq!(form(&app).field, Field::Port);
     key(&mut app, KeyCode::Backspace);
     type_str(&mut app, "9");
     assert_eq!(form(&app).port, "4449");
@@ -909,7 +909,7 @@ fn clicking_inside_the_address_places_the_cursor() {
             ..field
         },
     );
-    assert_eq!(form(&app).field, 1);
+    assert_eq!(form(&app).field, Field::Address);
     key(&mut app, KeyCode::Backspace);
     type_str(&mut app, "10");
     assert_eq!(form(&app).address, "10.0.0.0");
@@ -1229,4 +1229,263 @@ fn drag_events_without_a_grab_do_nothing() {
     release(&mut app, 30, 10);
     assert_eq!(app.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
     assert_eq!(app.sidebar_split, 0.5);
+}
+
+// ---- TLS ----
+
+/// Opens the new-workspace form with TLS picked, bound to 127.0.0.1 on an
+/// OS-chosen port. Leaves focus on the address field.
+fn open_tls_form(app: &mut App) {
+    prefix(app, 'N');
+    for _ in 0..4 {
+        key(app, KeyCode::Backspace);
+    }
+    type_str(app, "0");
+    key(app, KeyCode::Tab); // -> protocol
+    key(app, KeyCode::Left); // tcp wraps round to tls
+    key(app, KeyCode::Tab); // -> address
+    for _ in 0..7 {
+        key(app, KeyCode::Backspace);
+    }
+    type_str(app, "127.0.0.1");
+}
+
+async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Event {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("listener reported in time")
+        .expect("event")
+}
+
+fn fingerprint(app: &App) -> String {
+    app.workspaces[0]
+        .tls
+        .as_ref()
+        .expect("TLS workspace has a certificate")
+        .fingerprint
+        .clone()
+}
+
+#[test]
+fn protocol_arrows_cycle_through_tls() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    key(&mut app, KeyCode::Tab); // -> protocol
+    for want in [Protocol::Udp, Protocol::Tls, Protocol::Tcp] {
+        key(&mut app, KeyCode::Right);
+        assert_eq!(form(&app).protocol, want);
+    }
+    key(&mut app, KeyCode::Left);
+    assert_eq!(form(&app).protocol, Protocol::Tls);
+}
+
+#[test]
+fn tls_adds_cert_and_alpn_fields_to_the_tab_order() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    key(&mut app, KeyCode::Tab); // -> protocol
+    use Field::*;
+    assert_eq!(form(&app).fields(), [Protocol, Address, Port]);
+    key(&mut app, KeyCode::Left); // -> tls
+    assert_eq!(form(&app).fields(), [Protocol, Address, Port, Cert, Alpn]);
+
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Tab);
+    }
+    assert_eq!(form(&app).field, Cert);
+    key(&mut app, KeyCode::Right);
+    assert_eq!(form(&app).cert, CertKind::Files);
+    assert_eq!(
+        form(&app).fields(),
+        [Protocol, Address, Port, Cert, CertFile, KeyFile, Alpn]
+    );
+
+    key(&mut app, KeyCode::Tab);
+    type_str(&mut app, "~/certs/a b.pem");
+    key(&mut app, KeyCode::Tab);
+    type_str(&mut app, "key.pem");
+    key(&mut app, KeyCode::Tab);
+    type_str(&mut app, "h2, http/1.1");
+    assert_eq!(
+        form(&app).cert_file,
+        "~/certs/a b.pem",
+        "paths take any text"
+    );
+    assert_eq!(form(&app).key_file, "key.pem");
+    assert_eq!(form(&app).alpn, "h2, http/1.1");
+
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(form(&app).field, Protocol, "wraps to the top");
+    key(&mut app, KeyCode::BackTab);
+    assert_eq!(form(&app).field, Alpn);
+}
+
+#[test]
+fn cert_files_are_required_and_must_exist() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    key(&mut app, KeyCode::Tab); // -> protocol
+    key(&mut app, KeyCode::Left); // -> tls
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Tab); // -> cert
+    }
+    key(&mut app, KeyCode::Right); // -> files
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(form(&app).error.as_deref(), Some("cert file is required"));
+
+    key(&mut app, KeyCode::Tab);
+    type_str(&mut app, "/nonexistent/outpost/cert.pem");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(form(&app).error.as_deref(), Some("key file is required"));
+
+    key(&mut app, KeyCode::Tab);
+    type_str(&mut app, "/nonexistent/outpost/key.pem");
+    key(&mut app, KeyCode::Enter);
+    let error = form(&app).error.clone().unwrap();
+    assert!(error.starts_with("cert file: "), "{error}");
+    assert!(app.workspaces.is_empty());
+}
+
+#[tokio::test]
+async fn submitting_a_tls_form_serves_a_self_signed_certificate() {
+    let (mut app, mut rx) = App::test_new();
+    open_tls_form(&mut app);
+    key(&mut app, KeyCode::Tab); // -> port
+    key(&mut app, KeyCode::Tab); // -> cert
+    key(&mut app, KeyCode::Tab); // -> alpn
+    type_str(&mut app, " h2 ,, http/1.1 ");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+
+    let ws = &app.workspaces[0];
+    assert_eq!(ws.config.protocol, Protocol::Tls);
+    assert_eq!(
+        ws.config.tls,
+        TlsConfig {
+            cert: CertSource::SelfSigned,
+            alpn: vec!["h2".into(), "http/1.1".into()],
+        }
+    );
+    let tls = ws.tls.as_ref().unwrap();
+    assert_eq!(
+        tls.config.alpn_protocols,
+        [b"h2".to_vec(), b"http/1.1".to_vec()]
+    );
+    assert_eq!(tls.fingerprint.len(), 64);
+
+    let ev = next_event(&mut rx).await;
+    app.handle(ev);
+    let ws = &app.workspaces[0];
+    assert!(matches!(ws.state, ListenState::Listening));
+    assert!(ws.endpoint().starts_with("tls :"), "{}", ws.endpoint());
+}
+
+#[tokio::test]
+async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
+    let (mut app, mut rx) = App::test_new();
+    open_tls_form(&mut app);
+    key(&mut app, KeyCode::Enter);
+    let ev = next_event(&mut rx).await;
+    app.handle(ev);
+    let original = fingerprint(&app);
+
+    // A new port restarts the listener on the same certificate.
+    prefix(&mut app, 's');
+    key(&mut app, KeyCode::Tab); // -> address
+    key(&mut app, KeyCode::Tab); // -> port
+    for _ in 0..5 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "0");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.workspaces[0].state, ListenState::Binding));
+    let ev = next_event(&mut rx).await;
+    app.handle(ev);
+    assert_eq!(fingerprint(&app), original);
+
+    // Changing ALPN builds a new one.
+    prefix(&mut app, 's');
+    for _ in 0..4 {
+        key(&mut app, KeyCode::Tab); // -> alpn
+    }
+    type_str(&mut app, "h2");
+    key(&mut app, KeyCode::Enter);
+    assert_ne!(fingerprint(&app), original);
+}
+
+#[test]
+fn settings_show_a_tls_workspace_as_configured() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_workspace(Protocol::Tls, "0.0.0.0:8443");
+    app.workspaces[0].config.tls = TlsConfig {
+        cert: CertSource::Files {
+            cert: "/etc/outpost/cert.pem".into(),
+            key: "/etc/outpost/key.pem".into(),
+        },
+        alpn: vec!["h2".into(), "http/1.1".into()],
+    };
+    prefix(&mut app, 's');
+    let form = form(&app);
+    assert_eq!(form.protocol, Protocol::Tls);
+    assert_eq!(form.cert, CertKind::Files);
+    assert_eq!(form.cert_file, "/etc/outpost/cert.pem");
+    assert_eq!(form.key_file, "/etc/outpost/key.pem");
+    assert_eq!(form.alpn, "h2, http/1.1");
+}
+
+#[test]
+fn home_relative_cert_paths_expand() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let input = TextInput::from("~/certs/cert.pem".to_string());
+    assert_eq!(
+        form_path(&input),
+        Some(PathBuf::from(home).join("certs/cert.pem"))
+    );
+    assert_eq!(
+        form_path(&TextInput::from(" ./cert.pem ".to_string())),
+        Some(PathBuf::from("./cert.pem"))
+    );
+    assert_eq!(form_path(&TextInput::default()), None);
+}
+
+#[test]
+fn a_tls_handshake_adds_an_info_line() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Tls, "0.0.0.0:8443");
+    let (sess, _out) = app.add_test_session(ws, "10.0.0.5:1000");
+    app.handle(Event::Net(NetEvent::Secured {
+        sess,
+        summary: "tls1.3 · alpn h2".into(),
+    }));
+    assert_eq!(
+        transcript(&app, 0, 0).last(),
+        Some(&(Dir::Info, "tls1.3 · alpn h2".to_string()))
+    );
+}
+
+#[test]
+fn clicking_cert_buttons_and_path_fields() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    key(&mut app, KeyCode::Tab); // -> protocol
+    key(&mut app, KeyCode::Left); // -> tls
+    render_rows(&mut app, 120, 32);
+
+    let files = form_target(&app, |h| matches!(h, FormHit::Cert(CertKind::Files)));
+    click(&mut app, files);
+    assert_eq!(form(&app).cert, CertKind::Files);
+    assert_eq!(form(&app).field, Field::Cert);
+
+    render_rows(&mut app, 120, 32);
+    let cert_file = form_target(&app, |h| matches!(h, FormHit::Field(Field::CertFile)));
+    click(&mut app, cert_file);
+    assert_eq!(form(&app).field, Field::CertFile);
+    type_str(&mut app, "a.pem");
+    assert_eq!(form(&app).cert_file, "a.pem");
+
+    let self_signed = form_target(&app, |h| matches!(h, FormHit::Cert(CertKind::SelfSigned)));
+    click(&mut app, self_signed);
+    assert_eq!(form(&app).cert, CertKind::SelfSigned);
 }

@@ -7,7 +7,7 @@ goal is a TUI that feels almost identical to herdr.
 
 ## Vocabulary
 
-- **Workspace**: one listener on `IP:PORT`, TCP or UDP (herdr: workspace).
+- **Workspace**: one listener on `IP:PORT`, TCP, UDP, or TLS (herdr: workspace).
 - **Session**: one connection to a workspace. For UDP, each distinct peer
   address is a session. Each session is shown as a **tab** (herdr: agent / tab).
 - **Overlay**: any modal box (settings form, rename, menu, confirmation, help).
@@ -35,6 +35,10 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 - `src/net.rs`: listener and connection tasks (tokio). Talks to the app only
   through `NetEvent`s. A session's write side is an `Outlet`; dropping it
   closes a TCP connection.
+- `src/net/tls.rs`: TLS settings (`TlsConfig`), building the rustls server
+  config from a self-signed or PEM-file certificate, and the handshake
+  summary line. The app builds it when a form is applied, so certificate
+  errors show in the form.
 - `src/app.rs`: all state and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
   `Target` names what a menu, rename, or close acts on (workspace or tab).

@@ -1,15 +1,26 @@
 //! Listener and connection tasks. All results flow back to the UI as [`NetEvent`]s.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::AbortHandle;
+use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
 
 use crate::Event;
+
+pub mod tls;
+
+/// A client that connects but never finishes the handshake is dropped after this.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a hang-up waits to tell the peer (TLS close_notify) before dropping.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub type WsId = u64;
 pub type SessId = u64;
@@ -25,25 +36,31 @@ pub fn next_id() -> u64 {
 pub enum Protocol {
     Tcp,
     Udp,
+    /// TLS over TCP.
+    Tls,
 }
 
 impl Protocol {
+    /// In the order the settings form shows them.
+    pub const ALL: [Protocol; 3] = [Protocol::Tcp, Protocol::Udp, Protocol::Tls];
+
     pub fn label(self) -> &'static str {
         match self {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp",
+            Protocol::Tls => "tls",
         }
     }
 
-    pub fn toggled(self) -> Self {
-        match self {
-            Protocol::Tcp => Protocol::Udp,
-            Protocol::Udp => Protocol::Tcp,
-        }
+    /// The protocol `delta` places along in [`Protocol::ALL`], wrapping around.
+    pub fn cycled(self, delta: isize) -> Self {
+        let len = Self::ALL.len() as isize;
+        let index = Self::ALL.iter().position(|&p| p == self).unwrap_or(0) as isize;
+        Self::ALL[(index + delta).rem_euclid(len) as usize]
     }
 }
 
-/// Write side of a session. Dropping it closes a TCP connection.
+/// Write side of a session. Dropping it closes a TCP (or TLS) connection.
 pub enum Outlet {
     Tcp(UnboundedSender<Vec<u8>>),
     Udp { tx: UdpOut, peer: SocketAddr },
@@ -75,6 +92,11 @@ pub enum NetEvent {
         peer: SocketAddr,
         outlet: Outlet,
     },
+    /// A TLS session finished its handshake; `summary` says what was agreed.
+    Secured {
+        sess: SessId,
+        summary: String,
+    },
     Data {
         sess: SessId,
         bytes: Vec<u8>,
@@ -91,15 +113,33 @@ pub enum NetEvent {
     },
 }
 
+/// `tls` is the server config for [`Protocol::Tls`] and is ignored otherwise.
 pub fn spawn_listener(
     ws: WsId,
     protocol: Protocol,
     addr: SocketAddr,
+    tls: Option<Arc<ServerConfig>>,
     events: UnboundedSender<Event>,
 ) -> AbortHandle {
     match protocol {
-        Protocol::Tcp => tokio::spawn(tcp_listener(ws, addr, events)).abort_handle(),
+        Protocol::Tcp => tokio::spawn(tcp_listener(ws, addr, None, events)).abort_handle(),
         Protocol::Udp => tokio::spawn(udp_listener(ws, addr, events)).abort_handle(),
+        Protocol::Tls => match tls {
+            Some(config) => {
+                let acceptor = TlsAcceptor::from(config);
+                tokio::spawn(tcp_listener(ws, addr, Some(acceptor), events)).abort_handle()
+            }
+            None => tokio::spawn(async move {
+                emit(
+                    &events,
+                    NetEvent::ListenFailed {
+                        ws,
+                        error: "no TLS certificate".into(),
+                    },
+                );
+            })
+            .abort_handle(),
+        },
     }
 }
 
@@ -107,7 +147,13 @@ fn emit(events: &UnboundedSender<Event>, ev: NetEvent) -> bool {
     events.send(Event::Net(ev)).is_ok()
 }
 
-async fn tcp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>) {
+/// Accepts TCP connections, running a TLS handshake on each when `tls` is set.
+async fn tcp_listener(
+    ws: WsId,
+    addr: SocketAddr,
+    tls: Option<TlsAcceptor>,
+    events: UnboundedSender<Event>,
+) {
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -148,7 +194,16 @@ async fn tcp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
                 ) {
                     return;
                 }
-                tokio::spawn(tcp_session(sess, stream, rx, events.clone()));
+                match &tls {
+                    Some(acceptor) => tokio::spawn(tls_session(
+                        sess,
+                        stream,
+                        acceptor.clone(),
+                        rx,
+                        events.clone(),
+                    )),
+                    None => tokio::spawn(stream_session(sess, stream, rx, events.clone())),
+                };
             }
             // Usually transient (e.g. out of file descriptors); back off instead of spinning.
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -156,9 +211,38 @@ async fn tcp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
     }
 }
 
-async fn tcp_session(
+/// The session exists from the TCP accept, so a failed handshake shows up as
+/// a closed tab with the reason.
+async fn tls_session(
     sess: SessId,
-    mut stream: TcpStream,
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    outgoing: UnboundedReceiver<Vec<u8>>,
+    events: UnboundedSender<Event>,
+) {
+    let error = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+        Ok(Ok(stream)) => {
+            let summary = tls::summary(stream.get_ref().1);
+            if emit(&events, NetEvent::Secured { sess, summary }) {
+                stream_session(sess, stream, outgoing, events).await;
+            }
+            return;
+        }
+        Ok(Err(e)) => format!("tls handshake failed: {e}"),
+        Err(_) => "tls handshake timed out".into(),
+    };
+    emit(
+        &events,
+        NetEvent::Closed {
+            sess,
+            error: Some(error),
+        },
+    );
+}
+
+async fn stream_session<S: AsyncRead + AsyncWrite + Unpin>(
+    sess: SessId,
+    mut stream: S,
     mut outgoing: UnboundedReceiver<Vec<u8>>,
     events: UnboundedSender<Event>,
 ) {
@@ -176,12 +260,16 @@ async fn tcp_session(
             },
             msg = outgoing.recv() => match msg {
                 Some(bytes) => {
-                    if let Err(e) = stream.write_all(&bytes).await {
+                    // TLS buffers writes; flush so the peer sees them now.
+                    if let Err(e) = async { stream.write_all(&bytes).await?; stream.flush().await }.await {
                         break Some(e.to_string());
                     }
                 }
-                // The app dropped the outlet: close locally.
-                None => break None,
+                // The app dropped the outlet: close locally, telling a TLS peer first.
+                None => {
+                    let _ = timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+                    break None;
+                }
             },
         }
     };
@@ -237,7 +325,15 @@ async fn udp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
 mod tests {
     use super::*;
     use tokio::sync::mpsc::UnboundedReceiver;
-    use tokio::time::timeout;
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use tokio_rustls::rustls::crypto::{
+        CryptoProvider, verify_tls12_signature, verify_tls13_signature,
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{self, ClientConfig, DigitallySignedStruct, SignatureScheme};
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -260,7 +356,7 @@ mod tests {
         AbortHandle,
     ) {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = spawn_listener(1, protocol, "127.0.0.1:0".parse().unwrap(), tx);
+        let handle = spawn_listener(1, protocol, "127.0.0.1:0".parse().unwrap(), None, tx);
         let NetEvent::Listening { ws: 1, local, udp } = next(&mut rx).await else {
             panic!("expected Listening");
         };
@@ -332,7 +428,7 @@ mod tests {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = taken.local_addr().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_listener(7, Protocol::Tcp, addr, tx);
+        spawn_listener(7, Protocol::Tcp, addr, None, tx);
         let NetEvent::ListenFailed { ws: 7, error } = next(&mut rx).await else {
             panic!("expected ListenFailed");
         };
@@ -360,6 +456,151 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((&buf[..n], from), (b"pong".as_slice(), local));
+    }
+
+    /// A test client that trusts any certificate; tests check the fingerprint instead.
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer,
+            _intermediates: &[CertificateDer],
+            _server_name: &ServerName,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn tls_client(alpn: &[u8]) -> TlsConnector {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![alpn.to_vec()];
+        TlsConnector::from(Arc::new(config))
+    }
+
+    /// Starts a TLS listener with a self-signed certificate and the given ALPN.
+    async fn listen_tls(alpn: &str) -> (UnboundedReceiver<Event>, SocketAddr, tls::TlsServer) {
+        let server = tls::build(&tls::TlsConfig {
+            cert: tls::CertSource::SelfSigned,
+            alpn: vec![alpn.into()],
+        })
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let addr = "127.0.0.1:0".parse().unwrap();
+        spawn_listener(1, Protocol::Tls, addr, Some(server.config.clone()), tx);
+        let NetEvent::Listening { ws: 1, local, .. } = next(&mut rx).await else {
+            panic!("expected Listening");
+        };
+        (rx, local, server)
+    }
+
+    #[tokio::test]
+    async fn tls_session_handshakes_round_trips_and_hangs_up_cleanly() {
+        let (mut rx, local, server) = listen_tls("outpost-test").await;
+
+        let tcp = TcpStream::connect(local).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let connect = tls_client(b"outpost-test").connect(name, tcp);
+        let mut client = timeout(WAIT, connect).await.unwrap().unwrap();
+        let peer_cert = &client.get_ref().1.peer_certificates().unwrap()[0];
+        assert_eq!(tls::fingerprint(peer_cert), server.fingerprint);
+
+        let NetEvent::Accepted { sess, outlet, .. } = next(&mut rx).await else {
+            panic!("expected Accepted");
+        };
+        let NetEvent::Secured { sess: s, summary } = next(&mut rx).await else {
+            panic!("expected Secured");
+        };
+        assert_eq!(s, sess);
+        assert!(summary.starts_with("tls1.3 · TLS13_"), "{summary}");
+        assert!(
+            summary.ends_with(" · alpn outpost-test · sni localhost"),
+            "{summary}"
+        );
+
+        client.write_all(b"hello\n").await.unwrap();
+        client.flush().await.unwrap();
+        let NetEvent::Data { bytes, .. } = next(&mut rx).await else {
+            panic!("expected Data");
+        };
+        assert_eq!(bytes, b"hello\n");
+
+        assert!(outlet.send(b"hi back\n".to_vec()));
+        let mut buf = [0u8; 8];
+        timeout(WAIT, client.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"hi back\n");
+
+        // Hanging up sends close_notify: the client sees a clean EOF, not an error.
+        drop(outlet);
+        let read = timeout(WAIT, client.read(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(read, 0);
+        let NetEvent::Closed { error: None, .. } = next(&mut rx).await else {
+            panic!("expected a clean Closed");
+        };
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_closes_the_session_with_the_reason() {
+        let (mut rx, local, _server) = listen_tls("outpost-test").await;
+        let mut client = TcpStream::connect(local).await.unwrap();
+        let NetEvent::Accepted { sess, .. } = next(&mut rx).await else {
+            panic!("expected Accepted");
+        };
+
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let NetEvent::Closed {
+            sess: s,
+            error: Some(error),
+        } = next(&mut rx).await
+        else {
+            panic!("expected Closed with an error");
+        };
+        assert_eq!(s, sess);
+        assert!(error.starts_with("tls handshake failed: "), "{error}");
     }
 
     #[tokio::test]

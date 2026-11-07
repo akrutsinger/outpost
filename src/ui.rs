@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use crate::app::{
-    App, ContextMenu, Dir, ListenState, MENU_ITEMS, Mode, RenameForm, Session, SettingsForm,
-    Status, Target,
+    App, CertKind, ContextMenu, Dir, Field, ListenState, MENU_ITEMS, Mode, RenameForm, Session,
+    SettingsForm, Status, Target,
 };
 use crate::net::Protocol;
 use crate::text_input::TextInput;
@@ -22,8 +22,9 @@ const WORKSPACE_HEADER_ROWS: u16 = 2;
 #[derive(Clone, Copy)]
 pub enum FormHit {
     Protocol(Protocol),
-    /// Focus a field: 0 = protocol, 1 = address, 2 = port.
-    Field(usize),
+    Cert(CertKind),
+    /// Focus a field.
+    Field(Field),
 }
 
 /// A text field that a click can place the cursor in.
@@ -32,6 +33,9 @@ pub enum TextTarget {
     Session,
     Address,
     Port,
+    CertFile,
+    KeyFile,
+    Alpn,
     Rename,
 }
 
@@ -51,7 +55,7 @@ pub struct Hits {
     pub section_divider: Rect,
     /// Right-click menu rows: (row, index into `MENU_ITEMS`).
     pub menu_items: Vec<(Rect, usize)>,
-    /// Settings form targets; protocol buttons come before the rows they sit in.
+    /// Settings form targets; buttons come before the rows they sit in.
     pub form: Vec<(Rect, FormHit)>,
     /// Text fields: (area, field, index of the first visible char).
     pub text: Vec<(Rect, TextTarget, usize)>,
@@ -91,7 +95,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
     match &app.mode {
-        Mode::Settings(form) => cursor = render_settings(buf, area, form, &mut hits),
+        Mode::Settings(form) => {
+            let fingerprint = form
+                .target
+                .and_then(|id| app.workspaces.iter().find(|ws| ws.id == id))
+                .and_then(|ws| ws.tls.as_ref())
+                .map(|tls| tls.fingerprint.as_str());
+            cursor = render_settings(buf, area, form, fingerprint, &mut hits);
+        }
         Mode::Rename(form) => cursor = render_rename(buf, area, form, &mut hits),
         &Mode::ConfirmClose(target) => {
             render_confirm_close(buf, area, app, target, &mut hits);
@@ -765,13 +776,18 @@ fn overlay_block(title: &str) -> Block<'_> {
         ))
 }
 
+/// `fingerprint` is the running certificate's, shown for TLS workspaces.
 fn render_settings(
     buf: &mut Buffer,
     area: Rect,
     form: &SettingsForm,
+    fingerprint: Option<&str>,
     hits: &mut Hits,
 ) -> Option<Position> {
-    let rect = centered(area, 58, 9);
+    let fields = form.fields();
+    let fingerprint = fingerprint.filter(|_| form.protocol == Protocol::Tls);
+    let rows = fields.len() as u16 + if fingerprint.is_some() { 2 } else { 0 };
+    let rect = centered(area, 58, rows + 6);
     Clear.render(rect, buf);
     let title = if form.target.is_some() {
         "workspace settings"
@@ -781,11 +797,11 @@ fn render_settings(
     let block = overlay_block(title);
     let inner = block.inner(rect);
     block.render(rect, buf);
-    if inner.height < 7 {
+    if inner.height < rows + 4 {
         return None;
     }
 
-    let label_style = |field: usize| {
+    let label_style = |field: Field| {
         if form.field == field {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
@@ -796,48 +812,94 @@ fn render_settings(
     let right = inner.right();
     let mut cursor = None;
 
-    let y = inner.y + 1;
-    put(buf, inner.x + 1, y, right, "protocol", label_style(0));
-    let mut x = value_x;
-    for protocol in [Protocol::Tcp, Protocol::Udp] {
-        let style = if protocol == form.protocol {
-            Style::new().fg(PANEL_BG).bg(ACCENT)
-        } else {
-            Style::new().fg(OVERLAY0).bg(SURFACE0)
-        };
-        let end = put(buf, x, y, right, &format!(" {} ", protocol.label()), style);
-        hits.form
-            .push((Rect::new(x, y, end - x, 1), FormHit::Protocol(protocol)));
-        x = end + 1;
-    }
-    hits.form
-        .push((Rect::new(inner.x, y, inner.width, 1), FormHit::Field(0)));
-
-    for (field, label, value, target, y) in [
-        (
-            1,
-            "address",
-            &form.address,
-            TextTarget::Address,
-            inner.y + 2,
-        ),
-        (2, "port", &form.port, TextTarget::Port, inner.y + 3),
-    ] {
-        put(buf, inner.x + 1, y, right, label, label_style(field));
-        let at = render_input(
+    for (i, &field) in fields.iter().enumerate() {
+        let y = inner.y + 1 + i as u16;
+        put(
             buf,
-            value_x,
+            inner.x + 1,
             y,
             right,
-            value,
-            Style::new().fg(TEXT),
-            target,
-            hits,
+            field.label(),
+            label_style(field),
         );
+        let text = match field {
+            Field::Protocol => {
+                let mut x = value_x;
+                for protocol in Protocol::ALL {
+                    let hit = FormHit::Protocol(protocol);
+                    let selected = protocol == form.protocol;
+                    x = render_choice(buf, x, y, right, protocol.label(), selected, hit, hits);
+                }
+                None
+            }
+            Field::Cert => {
+                let mut x = value_x;
+                for cert in CertKind::ALL {
+                    let hit = FormHit::Cert(cert);
+                    let selected = cert == form.cert;
+                    x = render_choice(buf, x, y, right, cert.label(), selected, hit, hits);
+                }
+                None
+            }
+            Field::Address => Some((&form.address, TextTarget::Address, "")),
+            Field::Port => Some((&form.port, TextTarget::Port, "")),
+            Field::CertFile => Some((&form.cert_file, TextTarget::CertFile, "PEM file")),
+            Field::KeyFile => Some((&form.key_file, TextTarget::KeyFile, "PEM file")),
+            Field::Alpn => Some((&form.alpn, TextTarget::Alpn, "none")),
+        };
+        if let Some((input, target, placeholder)) = text {
+            let at = render_input(
+                buf,
+                value_x,
+                y,
+                right,
+                input,
+                Style::new().fg(TEXT),
+                target,
+                hits,
+            );
+            if form.field == field {
+                cursor = Some(at);
+            } else if input.len() == 0 {
+                put(
+                    buf,
+                    value_x,
+                    y,
+                    right,
+                    placeholder,
+                    Style::new().fg(OVERLAY0),
+                );
+            }
+        }
         hits.form
             .push((Rect::new(inner.x, y, inner.width, 1), FormHit::Field(field)));
-        if form.field == field {
-            cursor = Some(at);
+    }
+
+    if let Some(fingerprint) = fingerprint {
+        let y = inner.y + 1 + fields.len() as u16;
+        put(
+            buf,
+            inner.x + 1,
+            y,
+            right,
+            "sha256",
+            Style::new().fg(SUBTEXT0),
+        );
+        // Two rows of four 8-digit groups.
+        let groups: Vec<&str> = fingerprint
+            .as_bytes()
+            .chunks(8)
+            .map(|group| std::str::from_utf8(group).unwrap_or(""))
+            .collect();
+        for (row, line) in groups.chunks(4).take(2).enumerate() {
+            put(
+                buf,
+                value_x,
+                y + row as u16,
+                right,
+                &line.join(" "),
+                Style::new().fg(OVERLAY0),
+            );
         }
     }
 
@@ -845,7 +907,7 @@ fn render_settings(
         put(
             buf,
             inner.x + 1,
-            inner.y + 5,
+            inner.y + rows + 2,
             right,
             error,
             Style::new().fg(RED),
@@ -856,10 +918,32 @@ fn render_settings(
         inner.x + 1,
         inner.bottom() - 1,
         right,
-        "tab field · ←/→ protocol · enter apply · esc cancel",
+        "tab field · ←/→ choose · enter apply · esc cancel",
         Style::new().fg(OVERLAY0),
     );
     cursor
+}
+
+/// A form button, highlighted when selected. Returns where the next one goes.
+#[allow(clippy::too_many_arguments)]
+fn render_choice(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    right: u16,
+    label: &str,
+    selected: bool,
+    hit: FormHit,
+    hits: &mut Hits,
+) -> u16 {
+    let style = if selected {
+        Style::new().fg(PANEL_BG).bg(ACCENT)
+    } else {
+        Style::new().fg(OVERLAY0).bg(SURFACE0)
+    };
+    let end = put(buf, x, y, right, &format!(" {label} "), style);
+    hits.form.push((Rect::new(x, y, end - x, 1), hit));
+    end + 1
 }
 
 /// herdr-style menu: square accent border, opened at the click and kept on screen.
@@ -1227,7 +1311,11 @@ mod tests {
             protocol: Protocol::Udp,
             address: "0.0.0.0".into(),
             port: "4444".into(),
-            field: 2,
+            cert: CertKind::SelfSigned,
+            cert_file: "".into(),
+            key_file: "".into(),
+            alpn: "".into(),
+            field: Field::Port,
             error: Some("invalid port".into()),
         });
         let rows = render_rows(&mut app, W, H);
@@ -1237,6 +1325,52 @@ mod tests {
         row_with(&rows, "invalid port");
         let hint = row_with(&rows, "tab field");
         assert!(hint.contains("esc cancel"), "hint clipped: {hint:?}");
+    }
+
+    #[test]
+    fn tls_settings_show_every_row_and_the_fingerprint() {
+        use crate::net::tls::{self, CertSource, TlsConfig};
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tls, "0.0.0.0:8443");
+        let server = tls::build(&TlsConfig::default()).unwrap();
+        let fingerprint = server.fingerprint.clone();
+        app.workspaces[0].tls = Some(server);
+        app.workspaces[0].config.tls.cert = CertSource::Files {
+            cert: "/etc/outpost/server.pem".into(),
+            key: "/etc/outpost/server.key".into(),
+        };
+        app.mode = Mode::Settings(SettingsForm {
+            target: Some(ws),
+            protocol: Protocol::Tls,
+            address: "255.255.255.255".into(),
+            port: "65535".into(),
+            cert: CertKind::Files,
+            cert_file: "/etc/outpost/server.pem".into(),
+            key_file: "/etc/outpost/server.key".into(),
+            alpn: "".into(),
+            field: Field::Protocol,
+            error: Some("key file: no private key found".into()),
+        });
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "╭ workspace settings ");
+        row_with(&rows, "protocol    tcp   udp   tls ");
+        row_with(&rows, "cert        self-signed   files ");
+        row_with(&rows, "cert file  /etc/outpost/server.pem");
+        row_with(&rows, "key file   /etc/outpost/server.key");
+        row_with(&rows, "alpn       none");
+        let groups: Vec<&str> = (0..8).map(|i| &fingerprint[i * 8..i * 8 + 8]).collect();
+        row_with(&rows, &format!("sha256     {}", groups[..4].join(" ")));
+        row_with(&rows, &format!("            {}", groups[4..].join(" ")));
+        row_with(&rows, "key file: no private key found");
+        let hint = row_with(&rows, "tab field");
+        assert!(hint.contains("esc cancel"), "hint clipped: {hint:?}");
+
+        // Order: fields, then the fingerprint, then the error, then the hint.
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert!(at("protocol") < at("alpn"));
+        assert!(at("alpn") < at("sha256"));
+        assert!(at("sha256") < at("no private key"));
+        assert!(at("no private key") < at("tab field"));
     }
 
     #[test]

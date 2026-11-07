@@ -1,6 +1,7 @@
 //! Application state: workspaces (listeners), sessions (connections), and input handling.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -12,6 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
 
 use crate::Event;
+use crate::net::tls::{CertSource, TlsConfig, TlsServer};
 use crate::net::{self, NetEvent, Outlet, Protocol, SessId, UdpOut, WsId};
 use crate::text_input::TextInput;
 use crate::ui::{FormHit, Hits, TextTarget};
@@ -26,10 +28,12 @@ const MAX_SIDEBAR_WIDTH: u16 = 36;
 const DEFAULT_SIDEBAR_SPLIT: f32 = 0.5;
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub protocol: Protocol,
     pub addr: SocketAddr,
+    /// Only used by TLS workspaces; the default otherwise.
+    pub tls: TlsConfig,
 }
 
 pub enum ListenState {
@@ -68,6 +72,8 @@ pub struct Workspace {
     pub state: ListenState,
     pub sessions: Vec<Session>,
     pub active_tab: usize,
+    /// The certificate in use, built from `config.tls`. TLS workspaces only.
+    pub tls: Option<TlsServer>,
     listener: Option<AbortHandle>,
     udp_out: Option<UdpOut>,
 }
@@ -106,6 +112,7 @@ impl Workspace {
             self.id,
             self.config.protocol,
             self.config.addr,
+            self.tls.as_ref().map(|tls| tls.config.clone()),
             events.clone(),
         ));
     }
@@ -269,9 +276,152 @@ pub struct SettingsForm {
     pub protocol: Protocol,
     pub address: TextInput,
     pub port: TextInput,
-    /// 0 = protocol, 1 = address, 2 = port.
-    pub field: usize,
+    /// TLS only, like the fields below.
+    pub cert: CertKind,
+    pub cert_file: TextInput,
+    pub key_file: TextInput,
+    /// Comma-separated ALPN protocols.
+    pub alpn: TextInput,
+    pub field: Field,
     pub error: Option<String>,
+}
+
+/// A row of the settings form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Field {
+    Protocol,
+    Address,
+    Port,
+    Cert,
+    CertFile,
+    KeyFile,
+    Alpn,
+}
+
+impl Field {
+    pub fn label(self) -> &'static str {
+        match self {
+            Field::Protocol => "protocol",
+            Field::Address => "address",
+            Field::Port => "port",
+            Field::Cert => "cert",
+            Field::CertFile => "cert file",
+            Field::KeyFile => "key file",
+            Field::Alpn => "alpn",
+        }
+    }
+
+    /// The form field a text-field click belongs to.
+    fn for_text(target: TextTarget) -> Option<Field> {
+        match target {
+            TextTarget::Address => Some(Field::Address),
+            TextTarget::Port => Some(Field::Port),
+            TextTarget::CertFile => Some(Field::CertFile),
+            TextTarget::KeyFile => Some(Field::KeyFile),
+            TextTarget::Alpn => Some(Field::Alpn),
+            TextTarget::Session | TextTarget::Rename => None,
+        }
+    }
+}
+
+/// Where a TLS workspace's certificate comes from, as chosen in the form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CertKind {
+    SelfSigned,
+    Files,
+}
+
+impl CertKind {
+    pub const ALL: [CertKind; 2] = [CertKind::SelfSigned, CertKind::Files];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CertKind::SelfSigned => "self-signed",
+            CertKind::Files => "files",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            CertKind::SelfSigned => CertKind::Files,
+            CertKind::Files => CertKind::SelfSigned,
+        }
+    }
+}
+
+impl SettingsForm {
+    /// The rows shown for the current choices, top to bottom.
+    pub fn fields(&self) -> Vec<Field> {
+        let mut fields = vec![Field::Protocol, Field::Address, Field::Port];
+        if self.protocol == Protocol::Tls {
+            fields.push(Field::Cert);
+            if self.cert == CertKind::Files {
+                fields.extend([Field::CertFile, Field::KeyFile]);
+            }
+            fields.push(Field::Alpn);
+        }
+        fields
+    }
+
+    fn focus_next(&mut self, delta: isize) {
+        let fields = self.fields();
+        let index = fields.iter().position(|&f| f == self.field).unwrap_or(0) as isize;
+        self.field = fields[(index + delta).rem_euclid(fields.len() as isize) as usize];
+    }
+
+    fn input_mut(&mut self) -> Option<&mut TextInput> {
+        match self.field {
+            Field::Address => Some(&mut self.address),
+            Field::Port => Some(&mut self.port),
+            Field::CertFile => Some(&mut self.cert_file),
+            Field::KeyFile => Some(&mut self.key_file),
+            Field::Alpn => Some(&mut self.alpn),
+            Field::Protocol | Field::Cert => None,
+        }
+    }
+
+    /// Whether typing `c` adds it to the focused field.
+    fn accepts(&self, c: char) -> bool {
+        match self.field {
+            Field::Address => c.is_ascii_hexdigit() || c == '.' || c == ':',
+            Field::Port => c.is_ascii_digit() && self.port.len() < 5,
+            Field::CertFile | Field::KeyFile | Field::Alpn => true,
+            Field::Protocol | Field::Cert => false,
+        }
+    }
+
+    fn tls_config(&self) -> Result<TlsConfig, String> {
+        let cert = match self.cert {
+            CertKind::SelfSigned => CertSource::SelfSigned,
+            CertKind::Files => CertSource::Files {
+                cert: form_path(&self.cert_file).ok_or("cert file is required")?,
+                key: form_path(&self.key_file).ok_or("key file is required")?,
+            },
+        };
+        let alpn = self
+            .alpn
+            .as_str()
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect();
+        Ok(TlsConfig { cert, alpn })
+    }
+}
+
+/// A path typed into the form; a leading `~/` means the home directory.
+fn form_path(input: &TextInput) -> Option<PathBuf> {
+    let text = input.as_str().trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Some(PathBuf::from(home).join(rest));
+    }
+    Some(PathBuf::from(text))
 }
 
 /// What a right-click menu or rename acts on.
@@ -404,6 +554,11 @@ impl App {
                     w.sessions.push(Session::new(sess, peer, outlet));
                 }
             }
+            NetEvent::Secured { sess, summary } => {
+                if let Some(s) = self.session_mut(sess) {
+                    s.push(Dir::Info, summary);
+                }
+            }
             NetEvent::Data { sess, bytes } => {
                 if let Some(s) = self.session_mut(sess) {
                     s.receive(&bytes);
@@ -521,20 +676,27 @@ impl App {
                 Ok(()) => return,
                 Err(e) => form.error = Some(e),
             },
-            KeyCode::Tab | KeyCode::Down => form.field = (form.field + 1) % 3,
-            KeyCode::BackTab | KeyCode::Up => form.field = (form.field + 2) % 3,
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
-                form.protocol = form.protocol.toggled()
+            KeyCode::Tab | KeyCode::Down => form.focus_next(1),
+            KeyCode::BackTab | KeyCode::Up => form.focus_next(-1),
+            KeyCode::Left if form.field == Field::Protocol => {
+                form.protocol = form.protocol.cycled(-1)
             }
-            _ if form.field == 1 && form.address.edit(&key) => {}
-            _ if form.field == 2 && form.port.edit(&key) => {}
+            KeyCode::Right | KeyCode::Char(' ') if form.field == Field::Protocol => {
+                form.protocol = form.protocol.cycled(1)
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == Field::Cert => {
+                form.cert = form.cert.toggled()
+            }
+            _ if form.input_mut().is_some_and(|input| input.edit(&key)) => {}
             KeyCode::Char(c)
-                if form.field == 1 && (c.is_ascii_hexdigit() || c == '.' || c == ':') =>
+                if form.accepts(c)
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                form.address.insert(c)
-            }
-            KeyCode::Char(c) if form.field == 2 && c.is_ascii_digit() && form.port.len() < 5 => {
-                form.port.insert(c)
+                if let Some(input) = form.input_mut() {
+                    input.insert(c);
+                }
             }
             _ => {}
         }
@@ -641,24 +803,23 @@ impl App {
                 if !left_click {
                     return;
                 }
-                match text_hit {
-                    Some((TextTarget::Address, cursor)) => {
-                        form.field = 1;
-                        form.address.set_cursor(cursor);
+                if let Some((target, cursor)) = text_hit {
+                    if let Some(field) = Field::for_text(target) {
+                        form.field = field;
+                        if let Some(input) = form.input_mut() {
+                            input.set_cursor(cursor);
+                        }
                     }
-                    Some((TextTarget::Port, cursor)) => {
-                        form.field = 2;
-                        form.port.set_cursor(cursor);
-                    }
-                    _ => {}
-                }
-                if text_hit.is_none()
-                    && let Some(&(_, hit)) = self.hits.form.iter().find(|(r, _)| r.contains(pos))
+                } else if let Some(&(_, hit)) = self.hits.form.iter().find(|(r, _)| r.contains(pos))
                 {
                     match hit {
                         FormHit::Protocol(protocol) => {
                             form.protocol = protocol;
-                            form.field = 0;
+                            form.field = Field::Protocol;
+                        }
+                        FormHit::Cert(cert) => {
+                            form.cert = cert;
+                            form.field = Field::Cert;
                         }
                         FormHit::Field(field) => form.field = field,
                     }
@@ -837,7 +998,11 @@ impl App {
             protocol: Protocol::Tcp,
             address: Ipv4Addr::UNSPECIFIED.to_string().into(),
             port: port.to_string().into(),
-            field: 2,
+            cert: CertKind::SelfSigned,
+            cert_file: TextInput::default(),
+            key_file: TextInput::default(),
+            alpn: TextInput::default(),
+            field: Field::Port,
             error: None,
         });
     }
@@ -847,12 +1012,24 @@ impl App {
             self.open_new_form();
             return;
         };
+        let (cert, cert_file, key_file) = match &ws.config.tls.cert {
+            CertSource::SelfSigned => (CertKind::SelfSigned, String::new(), String::new()),
+            CertSource::Files { cert, key } => (
+                CertKind::Files,
+                cert.display().to_string(),
+                key.display().to_string(),
+            ),
+        };
         self.mode = Mode::Settings(SettingsForm {
             target: Some(ws.id),
             protocol: ws.config.protocol,
             address: ws.config.addr.ip().to_string().into(),
             port: ws.config.addr.port().to_string().into(),
-            field: 0,
+            cert,
+            cert_file: cert_file.into(),
+            key_file: key_file.into(),
+            alpn: ws.config.tls.alpn.join(", ").into(),
+            field: Field::Protocol,
             error: None,
         });
     }
@@ -872,14 +1049,33 @@ impl App {
         let config = ListenerConfig {
             protocol: form.protocol,
             addr: SocketAddr::new(ip, port),
+            tls: match form.protocol {
+                Protocol::Tls => form.tls_config()?,
+                Protocol::Tcp | Protocol::Udp => TlsConfig::default(),
+            },
         };
-        if self
-            .workspaces
-            .iter()
-            .any(|ws| Some(ws.id) != form.target && ws.config == config)
-        {
+        if self.workspaces.iter().any(|ws| {
+            Some(ws.id) != form.target
+                && ws.config.protocol == config.protocol
+                && ws.config.addr == config.addr
+        }) {
             return Err("a workspace already uses that address".into());
         }
+        // Keep the certificate while its settings are unchanged, so a
+        // self-signed fingerprint survives edits to the address or port.
+        let current = form
+            .target
+            .and_then(|id| self.workspaces.iter().find(|ws| ws.id == id));
+        let tls = match current {
+            _ if config.protocol != Protocol::Tls => None,
+            Some(ws) if ws.config.protocol == Protocol::Tls && ws.config.tls == config.tls => {
+                match &ws.tls {
+                    Some(tls) => Some(tls.clone()),
+                    None => Some(net::tls::build(&config.tls)?),
+                }
+            }
+            _ => Some(net::tls::build(&config.tls)?),
+        };
 
         match form.target {
             None => {
@@ -890,6 +1086,7 @@ impl App {
                     state: ListenState::Binding,
                     sessions: Vec::new(),
                     active_tab: 0,
+                    tls,
                     listener: None,
                     udp_out: None,
                 };
@@ -906,6 +1103,7 @@ impl App {
                 if ws.config != config || failed {
                     ws.stop();
                     ws.config = config;
+                    ws.tls = tls;
                     ws.start(&events);
                 }
             }
@@ -1023,10 +1221,12 @@ impl App {
             config: ListenerConfig {
                 protocol,
                 addr: addr.parse().expect("test address"),
+                tls: TlsConfig::default(),
             },
             state: ListenState::Listening,
             sessions: Vec::new(),
             active_tab: 0,
+            tls: None,
             listener: None,
             udp_out: None,
         });
