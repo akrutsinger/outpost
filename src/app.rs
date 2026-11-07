@@ -12,7 +12,8 @@ use tokio::task::AbortHandle;
 
 use crate::Event;
 use crate::net::{self, NetEvent, Outlet, Protocol, SessId, UdpOut, WsId};
-use crate::ui::Hits;
+use crate::text_input::TextInput;
+use crate::ui::{FormHit, Hits, TextTarget};
 
 const MAX_LINES: usize = 10_000;
 const DEFAULT_PORT: u16 = 4444;
@@ -53,6 +54,8 @@ impl Status {
 
 pub struct Workspace {
     pub id: WsId,
+    /// User-chosen name; `None` shows the endpoint.
+    pub name: Option<String>,
     pub config: ListenerConfig,
     pub state: ListenState,
     pub sessions: Vec<Session>,
@@ -63,6 +66,11 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.endpoint())
+    }
+
+    /// Protocol and port, e.g. `tcp :4444`.
+    pub fn endpoint(&self) -> String {
         format!(
             "{} :{}",
             self.config.protocol.label(),
@@ -130,6 +138,8 @@ pub struct Line {
 
 pub struct Session {
     pub id: SessId,
+    /// User-chosen name; `None` shows the peer address.
+    pub name: Option<String>,
     pub peer: SocketAddr,
     outlet: Option<Outlet>,
     pub lines: Vec<Line>,
@@ -138,7 +148,7 @@ pub struct Session {
     pub unread: bool,
     pub bytes_in: u64,
     pub bytes_out: u64,
-    pub input: String,
+    pub input: TextInput,
     /// Rows scrolled up from the bottom of the transcript.
     pub scroll: usize,
 }
@@ -147,6 +157,7 @@ impl Session {
     fn new(id: SessId, peer: SocketAddr, outlet: Outlet) -> Self {
         Self {
             id,
+            name: None,
             peer,
             outlet: Some(outlet),
             lines: vec![Line {
@@ -157,13 +168,17 @@ impl Session {
             unread: true,
             bytes_in: 0,
             bytes_out: 0,
-            input: String::new(),
+            input: TextInput::default(),
             scroll: 0,
         }
     }
 
     pub fn is_open(&self) -> bool {
         self.outlet.is_some()
+    }
+
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.peer.to_string())
     }
 
     pub fn status(&self) -> Status {
@@ -213,7 +228,7 @@ impl Session {
 
     fn submit(&mut self) {
         let Some(outlet) = &self.outlet else { return };
-        let text = std::mem::take(&mut self.input);
+        let text = self.input.take();
         let mut bytes = text.clone().into_bytes();
         bytes.push(b'\n');
         let len = bytes.len() as u64;
@@ -244,11 +259,35 @@ pub struct SettingsForm {
     /// `None` creates a new workspace.
     pub target: Option<WsId>,
     pub protocol: Protocol,
-    pub address: String,
-    pub port: String,
+    pub address: TextInput,
+    pub port: TextInput,
     /// 0 = protocol, 1 = address, 2 = port.
     pub field: usize,
     pub error: Option<String>,
+}
+
+/// What a right-click menu or rename acts on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    Workspace(WsId),
+    /// A tab.
+    Session(SessId),
+}
+
+/// Items in the right-click menu, in display order.
+pub const MENU_ITEMS: [&str; 2] = ["Rename", "Close"];
+
+pub struct ContextMenu {
+    pub target: Target,
+    /// Where the click happened; the menu opens there.
+    pub x: u16,
+    pub y: u16,
+    pub highlighted: usize,
+}
+
+pub struct RenameForm {
+    pub target: Target,
+    pub input: TextInput,
 }
 
 pub enum Mode {
@@ -256,6 +295,10 @@ pub enum Mode {
     Prefix,
     Help,
     Settings(SettingsForm),
+    Menu(ContextMenu),
+    Rename(RenameForm),
+    /// Asks before closing a workspace or tab that would drop live connections.
+    ConfirmClose(Target),
 }
 
 pub struct App {
@@ -374,6 +417,13 @@ impl App {
             Mode::Prefix => self.prefix_key(key),
             Mode::Help => {}
             Mode::Settings(form) => self.settings_key(form, key),
+            Mode::Menu(menu) => self.menu_key(menu, key),
+            Mode::Rename(form) => self.rename_key(form, key),
+            Mode::ConfirmClose(target) => match key.code {
+                KeyCode::Enter => self.close_target(target),
+                KeyCode::Esc => {}
+                _ => self.mode = Mode::ConfirmClose(target),
+            },
         }
     }
 
@@ -386,14 +436,14 @@ impl App {
         let Some(s) = self.focused_session_mut() else {
             return;
         };
+        if s.is_open() && s.input.edit(&key) {
+            return;
+        }
         match key.code {
             KeyCode::Char(c)
                 if s.is_open() && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                s.input.push(c)
-            }
-            KeyCode::Backspace => {
-                s.input.pop();
+                s.input.insert(c)
             }
             KeyCode::Enter => s.submit(),
             KeyCode::PageUp => s.scroll += 10,
@@ -411,8 +461,28 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => self.select_tab(c as usize - '1' as usize),
             KeyCode::Char('j') | KeyCode::Down => self.cycle_workspace(1),
             KeyCode::Char('k') | KeyCode::Up => self.cycle_workspace(-1),
-            KeyCode::Char('X') => self.close_tab(),
-            KeyCode::Char('D') => self.close_workspace(),
+            KeyCode::Char('X') => {
+                if let Some(s) = self.focused_session_mut() {
+                    let id = s.id;
+                    self.request_close(Target::Session(id));
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some(ws) = self.workspaces.get(self.active) {
+                    self.request_close(Target::Workspace(ws.id));
+                }
+            }
+            KeyCode::Char('W') => {
+                if let Some(ws) = self.workspaces.get(self.active) {
+                    self.open_rename(Target::Workspace(ws.id));
+                }
+            }
+            KeyCode::Char('T') => {
+                if let Some(s) = self.focused_session_mut() {
+                    let id = s.id;
+                    self.open_rename(Target::Session(id));
+                }
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('q') => self.quit = true,
             _ => {}
@@ -431,33 +501,182 @@ impl App {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
                 form.protocol = form.protocol.toggled()
             }
-            KeyCode::Backspace => {
-                match form.field {
-                    1 => form.address.pop(),
-                    2 => form.port.pop(),
-                    _ => None,
-                };
-            }
+            _ if form.field == 1 && form.address.edit(&key) => {}
+            _ if form.field == 2 && form.port.edit(&key) => {}
             KeyCode::Char(c)
                 if form.field == 1 && (c.is_ascii_hexdigit() || c == '.' || c == ':') =>
             {
-                form.address.push(c)
+                form.address.insert(c)
             }
             KeyCode::Char(c) if form.field == 2 && c.is_ascii_digit() && form.port.len() < 5 => {
-                form.port.push(c)
+                form.port.insert(c)
             }
             _ => {}
         }
         self.mode = Mode::Settings(form);
     }
 
+    fn menu_key(&mut self, mut menu: ContextMenu, key: KeyEvent) {
+        let len = MENU_ITEMS.len();
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                self.activate_menu_item(menu.target, menu.highlighted);
+                return;
+            }
+            KeyCode::Down => menu.highlighted = (menu.highlighted + 1) % len,
+            KeyCode::Up => menu.highlighted = (menu.highlighted + len - 1) % len,
+            _ => {}
+        }
+        self.mode = Mode::Menu(menu);
+    }
+
+    fn rename_key(&mut self, mut form: RenameForm, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                // Empty, or the default label, means "no custom name".
+                let name = form.input.as_str().trim();
+                let custom = |default: String| {
+                    (!name.is_empty() && name != default).then(|| name.to_string())
+                };
+                match form.target {
+                    Target::Workspace(id) => {
+                        if let Some(ws) = self.workspace_mut(id) {
+                            ws.name = custom(ws.endpoint());
+                        }
+                    }
+                    Target::Session(id) => {
+                        if let Some(s) = self.session_mut(id) {
+                            s.name = custom(s.peer.to_string());
+                        }
+                    }
+                }
+                return;
+            }
+            _ if form.input.edit(&key) => {}
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                form.input.insert(c)
+            }
+            _ => {}
+        }
+        self.mode = Mode::Rename(form);
+    }
+
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let pos = Position::new(mouse.column, mouse.row);
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if matches!(self.mode, Mode::Settings(_) | Mode::Help) {
+        let left_click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+        // Where a click lands inside a text field, as (field, cursor position).
+        let text_hit = self
+            .hits
+            .text
+            .iter()
+            .find(|(r, ..)| r.contains(pos))
+            .map(|&(r, target, scroll)| (target, scroll + (pos.x - r.x) as usize));
+        // Overlays capture the mouse while open.
+        match &mut self.mode {
+            Mode::Help => return,
+            Mode::Rename(form) => {
+                if left_click && let Some((TextTarget::Rename, cursor)) = text_hit {
+                    form.input.set_cursor(cursor);
+                }
+                return;
+            }
+            &mut Mode::ConfirmClose(target) => {
+                if left_click && self.hits.confirm.contains(pos) {
+                    self.mode = Mode::Normal;
+                    self.close_target(target);
+                } else if left_click && self.hits.cancel.contains(pos) {
+                    self.mode = Mode::Normal;
+                }
+                return;
+            }
+            Mode::Settings(form) => {
+                if !left_click {
                     return;
                 }
+                match text_hit {
+                    Some((TextTarget::Address, cursor)) => {
+                        form.field = 1;
+                        form.address.set_cursor(cursor);
+                    }
+                    Some((TextTarget::Port, cursor)) => {
+                        form.field = 2;
+                        form.port.set_cursor(cursor);
+                    }
+                    _ => {}
+                }
+                if text_hit.is_none()
+                    && let Some(&(_, hit)) = self.hits.form.iter().find(|(r, _)| r.contains(pos))
+                {
+                    match hit {
+                        FormHit::Protocol(protocol) => {
+                            form.protocol = protocol;
+                            form.field = 0;
+                        }
+                        FormHit::Field(field) => form.field = field,
+                    }
+                }
+                return;
+            }
+            Mode::Menu(menu) => {
+                let item = self
+                    .hits
+                    .menu_items
+                    .iter()
+                    .find(|(r, _)| r.contains(pos))
+                    .map(|&(_, item)| item);
+                match mouse.kind {
+                    MouseEventKind::Moved => {
+                        if let Some(item) = item {
+                            menu.highlighted = item;
+                        }
+                    }
+                    // Any click picks the item under it, or dismisses the menu.
+                    MouseEventKind::Down(_) => {
+                        let target = menu.target;
+                        self.mode = Mode::Normal;
+                        if let Some(item) = item {
+                            self.activate_menu_item(target, item);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Mode::Normal | Mode::Prefix => {}
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.mode = Mode::Normal;
+                // Workspace rows and tabs have menus; the sessions list doesn't.
+                let target = if let Some(&(_, ws)) =
+                    self.hits.workspaces.iter().find(|(r, _)| r.contains(pos))
+                {
+                    Some(Target::Workspace(self.workspaces[ws].id))
+                } else if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(pos))
+                {
+                    self.workspaces
+                        .get(self.active)
+                        .and_then(|ws| ws.sessions.get(tab))
+                        .map(|s| Target::Session(s.id))
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    self.mode = Mode::Menu(ContextMenu {
+                        target,
+                        x: mouse.column,
+                        y: mouse.row,
+                        highlighted: 0,
+                    });
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
                 self.mode = Mode::Normal;
                 if self.hits.new_workspace.contains(pos) {
                     self.open_new_form();
@@ -475,6 +694,10 @@ impl App {
                 } else if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(pos))
                 {
                     self.select_tab(tab);
+                } else if let Some((TextTarget::Session, cursor)) = text_hit
+                    && let Some(s) = self.focused_session_mut()
+                {
+                    s.input.set_cursor(cursor);
                 }
             }
             MouseEventKind::ScrollUp if self.hits.pane.contains(pos) => {
@@ -491,6 +714,43 @@ impl App {
         }
     }
 
+    fn activate_menu_item(&mut self, target: Target, item: usize) {
+        match (MENU_ITEMS.get(item), target) {
+            (Some(&"Rename"), _) => self.open_rename(target),
+            (Some(&"Close"), _) => self.request_close(target),
+            _ => {}
+        }
+    }
+
+    fn open_rename(&mut self, target: Target) {
+        let label = match target {
+            Target::Workspace(id) => self
+                .workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .map(Workspace::label),
+            Target::Session(id) => self
+                .locate_session(id)
+                .map(|(ws, index)| self.workspaces[ws].sessions[index].label()),
+        };
+        if let Some(label) = label {
+            self.mode = Mode::Rename(RenameForm {
+                target,
+                input: label.into(),
+            });
+        }
+    }
+
+    /// (workspace index, tab index) of a session.
+    fn locate_session(&self, id: SessId) -> Option<(usize, usize)> {
+        self.workspaces.iter().enumerate().find_map(|(wi, ws)| {
+            ws.sessions
+                .iter()
+                .position(|s| s.id == id)
+                .map(|si| (wi, si))
+        })
+    }
+
     fn open_new_form(&mut self) {
         // Suggest the next port not already used by a workspace.
         let mut port = DEFAULT_PORT;
@@ -504,8 +764,8 @@ impl App {
         self.mode = Mode::Settings(SettingsForm {
             target: None,
             protocol: Protocol::Tcp,
-            address: Ipv4Addr::UNSPECIFIED.to_string(),
-            port: port.to_string(),
+            address: Ipv4Addr::UNSPECIFIED.to_string().into(),
+            port: port.to_string().into(),
             field: 2,
             error: None,
         });
@@ -519,8 +779,8 @@ impl App {
         self.mode = Mode::Settings(SettingsForm {
             target: Some(ws.id),
             protocol: ws.config.protocol,
-            address: ws.config.addr.ip().to_string(),
-            port: ws.config.addr.port().to_string(),
+            address: ws.config.addr.ip().to_string().into(),
+            port: ws.config.addr.port().to_string().into(),
             field: 0,
             error: None,
         });
@@ -529,10 +789,15 @@ impl App {
     fn apply_form(&mut self, form: &SettingsForm) -> Result<(), String> {
         let ip: IpAddr = form
             .address
+            .as_str()
             .trim()
             .parse()
             .map_err(|_| "invalid address".to_string())?;
-        let port: u16 = form.port.parse().map_err(|_| "invalid port".to_string())?;
+        let port: u16 = form
+            .port
+            .as_str()
+            .parse()
+            .map_err(|_| "invalid port".to_string())?;
         let config = ListenerConfig {
             protocol: form.protocol,
             addr: SocketAddr::new(ip, port),
@@ -549,6 +814,7 @@ impl App {
             None => {
                 let mut ws = Workspace {
                     id: net::next_id(),
+                    name: None,
                     config,
                     state: ListenState::Binding,
                     sessions: Vec::new(),
@@ -601,23 +867,68 @@ impl App {
         }
     }
 
-    /// Disconnects (if still open) and removes the focused session.
-    fn close_tab(&mut self) {
-        let Some(ws) = self.workspaces.get_mut(self.active) else {
+    /// Disconnects (if still open) and removes a session, keeping focus on
+    /// the same tab when another one is removed.
+    fn remove_session(&mut self, ws: usize, index: usize) {
+        let Some(ws) = self.workspaces.get_mut(ws) else {
             return;
         };
-        if ws.active_tab < ws.sessions.len() {
-            ws.sessions.remove(ws.active_tab);
-            ws.active_tab = ws.active_tab.min(ws.sessions.len().saturating_sub(1));
+        if index >= ws.sessions.len() {
+            return;
+        }
+        ws.sessions.remove(index);
+        if index < ws.active_tab {
+            ws.active_tab -= 1;
+        }
+        ws.active_tab = ws.active_tab.min(ws.sessions.len().saturating_sub(1));
+    }
+
+    /// Closes a workspace or tab, asking first if that would drop live connections.
+    fn request_close(&mut self, target: Target) {
+        let live = match target {
+            Target::Workspace(id) => self
+                .workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .is_some_and(|w| w.open_count() > 0),
+            Target::Session(id) => self
+                .locate_session(id)
+                .is_some_and(|(ws, index)| self.workspaces[ws].sessions[index].is_open()),
+        };
+        if live {
+            self.mode = Mode::ConfirmClose(target);
+        } else {
+            self.close_target(target);
         }
     }
 
-    /// Stops the listener and drops every session in the focused workspace.
-    fn close_workspace(&mut self) {
-        if self.active < self.workspaces.len() {
-            self.workspaces.remove(self.active);
-            self.active = self.active.min(self.workspaces.len().saturating_sub(1));
+    /// Closes without asking, dropping any connections.
+    fn close_target(&mut self, target: Target) {
+        match target {
+            Target::Workspace(id) => {
+                if let Some(index) = self.workspaces.iter().position(|w| w.id == id) {
+                    self.remove_workspace(index);
+                }
+            }
+            Target::Session(id) => {
+                if let Some((ws, index)) = self.locate_session(id) {
+                    self.remove_session(ws, index);
+                }
+            }
         }
+    }
+
+    /// Removes a workspace (stopping its listener and sessions), keeping focus
+    /// on the same workspace when another one is removed.
+    fn remove_workspace(&mut self, index: usize) {
+        if index >= self.workspaces.len() {
+            return;
+        }
+        self.workspaces.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.workspaces.len().saturating_sub(1));
     }
 }
 
@@ -637,6 +948,7 @@ impl App {
         let id = net::next_id();
         self.workspaces.push(Workspace {
             id,
+            name: None,
             config: ListenerConfig {
                 protocol,
                 addr: addr.parse().expect("test address"),

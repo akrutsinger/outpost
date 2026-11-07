@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
-use crate::ui::render_rows;
+use crate::ui::{TextTarget, render_rows};
 
 fn key(app: &mut App, code: KeyCode) {
     app.handle(Event::Input(TermEvent::Key(KeyEvent::new(
@@ -32,13 +32,21 @@ fn prefix(app: &mut App, c: char) {
     key(app, KeyCode::Char(c));
 }
 
-fn click(app: &mut App, rect: Rect) {
+fn mouse(app: &mut App, kind: MouseEventKind, rect: Rect) {
     app.handle(Event::Input(TermEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
+        kind,
         column: rect.x,
         row: rect.y,
         modifiers: KeyModifiers::NONE,
     })));
+}
+
+fn click(app: &mut App, rect: Rect) {
+    mouse(app, MouseEventKind::Down(MouseButton::Left), rect);
+}
+
+fn right_click(app: &mut App, rect: Rect) {
+    mouse(app, MouseEventKind::Down(MouseButton::Right), rect);
 }
 
 fn data(app: &mut App, sess: SessId, bytes: &[u8]) {
@@ -235,6 +243,13 @@ fn close_tab_disconnects_and_keeps_a_valid_focus() {
     prefix(&mut app, 'n');
 
     prefix(&mut app, 'X');
+    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Session(b)));
+    assert_eq!(
+        out_b.try_recv(),
+        Err(TryRecvError::Empty),
+        "still connected"
+    );
+    key(&mut app, KeyCode::Enter);
     // Dropping the outlet is what tells the connection task to hang up.
     assert_eq!(out_b.try_recv(), Err(TryRecvError::Disconnected));
     assert_eq!(app.workspaces[0].sessions.len(), 1);
@@ -254,6 +269,12 @@ fn close_workspace_drops_its_sessions() {
     prefix(&mut app, 'j');
 
     prefix(&mut app, 'D');
+    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Workspace(ws)));
+    assert!(
+        out.try_recv().is_err_and(|e| e == TryRecvError::Empty),
+        "still connected"
+    );
+    key(&mut app, KeyCode::Enter);
     assert_eq!(out.try_recv(), Err(TryRecvError::Disconnected));
     assert_eq!(app.workspaces.len(), 1);
     assert_eq!(app.active, 0);
@@ -497,4 +518,589 @@ fn clicks_are_ignored_while_a_modal_is_open() {
     click(&mut app, rect);
     assert_eq!(app.active, 0);
     assert!(matches!(app.mode, Mode::Help));
+}
+
+// ---- workspace right-click menu ----
+
+fn three_workspaces() -> (App, [WsId; 3]) {
+    let (mut app, _rx) = App::test_new();
+    let ids = [
+        app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444"),
+        app.add_test_workspace(Protocol::Tcp, "0.0.0.0:5555"),
+        app.add_test_workspace(Protocol::Udp, "0.0.0.0:6666"),
+    ];
+    render_rows(&mut app, 120, 32);
+    (app, ids)
+}
+
+fn menu(app: &App) -> &ContextMenu {
+    match &app.mode {
+        Mode::Menu(menu) => menu,
+        _ => panic!("context menu is not open"),
+    }
+}
+
+fn rename_input(app: &App) -> &str {
+    match &app.mode {
+        Mode::Rename(form) => form.input.as_str(),
+        _ => panic!("rename overlay is not open"),
+    }
+}
+
+/// Right-clicks workspace `index`, renders the menu, and clicks `item`.
+fn menu_pick(app: &mut App, index: usize, item: &str) {
+    let (row, _) = app.hits.workspaces[index];
+    right_click(app, row);
+    render_rows(app, 120, 32);
+    let pos = MENU_ITEMS.iter().position(|i| *i == item).unwrap();
+    let (rect, _) = app.hits.menu_items[pos];
+    click(app, rect);
+}
+
+#[test]
+fn right_click_opens_menu_for_that_workspace_without_focusing_it() {
+    let (mut app, ids) = three_workspaces();
+    let (row, _) = app.hits.workspaces[1];
+    right_click(&mut app, row);
+    assert_eq!(menu(&app).target, Target::Workspace(ids[1]));
+    assert_eq!((menu(&app).x, menu(&app).y), (row.x, row.y));
+    assert_eq!(app.active, 0);
+}
+
+#[test]
+fn right_click_elsewhere_does_nothing() {
+    let (mut app, _ids) = three_workspaces();
+    let pane = app.hits.pane;
+    right_click(&mut app, pane);
+    assert!(matches!(app.mode, Mode::Normal));
+}
+
+#[test]
+fn rename_from_menu_sets_a_custom_name() {
+    let (mut app, _ids) = three_workspaces();
+    menu_pick(&mut app, 1, "Rename");
+    assert_eq!(
+        rename_input(&app),
+        "tcp :5555",
+        "prefilled with the current label"
+    );
+
+    for _ in 0.."tcp :5555".len() {
+        key(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "  web server ");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[1].name.as_deref(), Some("web server"));
+    assert_eq!(app.workspaces[1].label(), "web server");
+    assert_eq!(app.active, 0);
+}
+
+#[test]
+fn renaming_to_empty_or_the_default_clears_the_name() {
+    let (mut app, _ids) = three_workspaces();
+    app.workspaces[0].name = Some("old".into());
+
+    prefix(&mut app, 'W');
+    assert_eq!(rename_input(&app), "old");
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.workspaces[0].name, None);
+
+    prefix(&mut app, 'W');
+    key(&mut app, KeyCode::Enter); // Unchanged default label.
+    assert_eq!(app.workspaces[0].name, None);
+}
+
+#[test]
+fn escape_cancels_a_rename() {
+    let (mut app, _ids) = three_workspaces();
+    prefix(&mut app, 'W');
+    type_str(&mut app, "!!!");
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[0].name, None);
+}
+
+#[test]
+fn close_from_menu_removes_that_workspace_and_keeps_focus() {
+    let (mut app, ids) = three_workspaces();
+    let (_sess, mut out) = app.add_test_session(ids[0], "10.0.0.5:1000");
+    prefix(&mut app, 'j');
+    prefix(&mut app, 'j');
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.workspaces[app.active].id, ids[2]);
+
+    menu_pick(&mut app, 0, "Close");
+    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Workspace(ids[0])));
+    render_rows(&mut app, 120, 32);
+    let confirm = app.hits.confirm;
+    click(&mut app, confirm);
+    assert!(matches!(app.mode, Mode::Normal));
+    let remaining: Vec<WsId> = app.workspaces.iter().map(|w| w.id).collect();
+    assert_eq!(remaining, [ids[1], ids[2]]);
+    assert_eq!(app.workspaces[app.active].id, ids[2], "focus stays put");
+    assert_eq!(out.try_recv(), Err(TryRecvError::Disconnected));
+}
+
+#[test]
+fn closing_the_focused_workspace_from_the_menu() {
+    let (mut app, ids) = three_workspaces();
+    prefix(&mut app, 'j');
+    render_rows(&mut app, 120, 32);
+    menu_pick(&mut app, 1, "Close");
+    assert_eq!(app.workspaces.len(), 2);
+    assert_eq!(app.workspaces[app.active].id, ids[2]);
+}
+
+#[test]
+fn menu_works_from_the_keyboard() {
+    let (mut app, ids) = three_workspaces();
+    let (row, _) = app.hits.workspaces[2];
+    right_click(&mut app, row);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(menu(&app).highlighted, 1);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(menu(&app).highlighted, 0, "wraps");
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Enter); // Close
+    assert!(app.workspaces.iter().all(|w| w.id != ids[2]));
+
+    let (row, _) = app.hits.workspaces[0];
+    right_click(&mut app, row);
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces.len(), 2);
+}
+
+#[test]
+fn hovering_highlights_menu_items() {
+    let (mut app, _ids) = three_workspaces();
+    let (row, _) = app.hits.workspaces[0];
+    right_click(&mut app, row);
+    render_rows(&mut app, 120, 32);
+    let (close, _) = app.hits.menu_items[1];
+    mouse(&mut app, MouseEventKind::Moved, close);
+    assert_eq!(menu(&app).highlighted, 1);
+}
+
+#[test]
+fn clicking_outside_the_menu_only_dismisses_it() {
+    let (mut app, _ids) = three_workspaces();
+    let (row, _) = app.hits.workspaces[0];
+    right_click(&mut app, row);
+    render_rows(&mut app, 120, 32);
+    // The click lands on another workspace row but must not focus it.
+    let (other, _) = app.hits.workspaces[2];
+    click(&mut app, other);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.active, 0);
+    assert_eq!(app.workspaces.len(), 3);
+}
+
+// ---- clicking in the settings form ----
+
+fn form_target(app: &App, want: impl Fn(FormHit) -> bool) -> Rect {
+    app.hits
+        .form
+        .iter()
+        .find(|(_, hit)| want(*hit))
+        .map(|(rect, _)| *rect)
+        .expect("form target rendered")
+}
+
+#[test]
+fn clicking_protocol_buttons_selects_the_protocol() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    render_rows(&mut app, 120, 32);
+
+    let udp = form_target(&app, |h| matches!(h, FormHit::Protocol(Protocol::Udp)));
+    // Click the last cell of the button, not just its first.
+    click(
+        &mut app,
+        Rect {
+            x: udp.right() - 1,
+            ..udp
+        },
+    );
+    assert_eq!(form(&app).protocol, Protocol::Udp);
+    assert_eq!(form(&app).field, 0);
+
+    let tcp = form_target(&app, |h| matches!(h, FormHit::Protocol(Protocol::Tcp)));
+    click(&mut app, tcp);
+    assert_eq!(form(&app).protocol, Protocol::Tcp);
+}
+
+#[test]
+fn clicking_a_field_lets_you_type_into_it() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    render_rows(&mut app, 120, 32);
+
+    let address = form_target(&app, |h| matches!(h, FormHit::Field(1)));
+    // Anywhere on the row works, including well right of the text.
+    click(
+        &mut app,
+        Rect {
+            x: address.right() - 2,
+            ..address
+        },
+    );
+    assert_eq!(form(&app).field, 1);
+    for _ in 0..7 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "127.0.0.1");
+    assert_eq!(form(&app).address, "127.0.0.1");
+
+    let port = form_target(&app, |h| matches!(h, FormHit::Field(2)));
+    click(&mut app, port);
+    assert_eq!(form(&app).field, 2);
+    key(&mut app, KeyCode::Backspace);
+    type_str(&mut app, "9");
+    assert_eq!(form(&app).port, "4449");
+    assert_eq!(form(&app).address, "127.0.0.1", "address untouched");
+}
+
+#[test]
+fn clicks_outside_the_form_are_ignored() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    render_rows(&mut app, 120, 32);
+    prefix(&mut app, 's');
+    render_rows(&mut app, 120, 32);
+    let new = app.hits.new_workspace;
+    click(&mut app, new);
+    assert_eq!(form(&app).target, Some(app.workspaces[0].id));
+}
+
+// ---- close confirmation ----
+
+#[test]
+fn closing_a_workspace_without_open_connections_skips_confirmation() {
+    let (mut app, ids) = three_workspaces();
+    let (sess, _out) = app.add_test_session(ids[0], "10.0.0.5:1000");
+    app.handle(Event::Net(NetEvent::Closed { sess, error: None }));
+    prefix(&mut app, 'D');
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces.len(), 2);
+}
+
+#[test]
+fn cancelling_the_confirmation_keeps_everything() {
+    let (mut app, ids) = three_workspaces();
+    let (_sess, mut out) = app.add_test_session(ids[0], "10.0.0.5:1000");
+
+    // Escape, other keys, and clicks off the buttons don't close anything.
+    prefix(&mut app, 'D');
+    type_str(&mut app, "yq");
+    assert!(
+        matches!(app.mode, Mode::ConfirmClose(_)),
+        "other keys are ignored"
+    );
+    render_rows(&mut app, 120, 32);
+    let pane = app.hits.pane;
+    click(&mut app, pane);
+    assert!(
+        matches!(app.mode, Mode::ConfirmClose(_)),
+        "stray clicks are ignored"
+    );
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(!app.quit);
+
+    // The cancel button too.
+    prefix(&mut app, 'D');
+    render_rows(&mut app, 120, 32);
+    let cancel = app.hits.cancel;
+    click(&mut app, cancel);
+    assert!(matches!(app.mode, Mode::Normal));
+
+    assert_eq!(app.workspaces.len(), 3);
+    assert_eq!(out.try_recv(), Err(TryRecvError::Empty));
+}
+
+// ---- cursor movement in text fields ----
+
+#[test]
+fn session_input_supports_cursor_movement() {
+    let (mut app, _sess, mut out) = one_session();
+    type_str(&mut app, "helo");
+    key(&mut app, KeyCode::Left);
+    type_str(&mut app, "l");
+    key(&mut app, KeyCode::Home);
+    key(&mut app, KeyCode::Delete);
+    type_str(&mut app, "H");
+    key(&mut app, KeyCode::End);
+    type_str(&mut app, "!");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(out.try_recv().unwrap(), b"Hello!\n");
+}
+
+#[test]
+fn clicking_in_the_session_input_moves_the_cursor() {
+    let (mut app, _sess, mut out) = one_session();
+    type_str(&mut app, "abcd");
+    render_rows(&mut app, 120, 32);
+    let (field, target, _) = app.hits.text[0];
+    assert_eq!(target, TextTarget::Session);
+
+    click(
+        &mut app,
+        Rect {
+            x: field.x + 2,
+            ..field
+        },
+    );
+    type_str(&mut app, "X");
+    // Past the end of the text clamps to the end.
+    click(
+        &mut app,
+        Rect {
+            x: field.right() - 1,
+            ..field
+        },
+    );
+    type_str(&mut app, "Y");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(out.try_recv().unwrap(), b"abXcdY\n");
+}
+
+#[test]
+fn form_fields_edit_mid_text() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    // Port starts focused at "4444": change the second digit.
+    key(&mut app, KeyCode::Home);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Delete);
+    type_str(&mut app, "3");
+    assert_eq!(form(&app).port, "4344");
+
+    // Left/Right still toggle the protocol on the protocol row.
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Right);
+    assert_eq!(form(&app).protocol, Protocol::Udp);
+    assert_eq!(form(&app).port, "4344");
+}
+
+#[test]
+fn clicking_inside_the_address_places_the_cursor() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    render_rows(&mut app, 120, 32);
+    let (field, ..) = *app
+        .hits
+        .text
+        .iter()
+        .find(|(_, t, _)| *t == TextTarget::Address)
+        .unwrap();
+
+    // "0.0.0.0": click just after the first "0", swap it for "10".
+    click(
+        &mut app,
+        Rect {
+            x: field.x + 1,
+            ..field
+        },
+    );
+    assert_eq!(form(&app).field, 1);
+    key(&mut app, KeyCode::Backspace);
+    type_str(&mut app, "10");
+    assert_eq!(form(&app).address, "10.0.0.0");
+    assert_eq!(form(&app).port, "4444", "port untouched");
+}
+
+#[test]
+fn rename_supports_cursor_movement_and_clicks() {
+    let (mut app, _ids) = three_workspaces();
+    prefix(&mut app, 'W');
+    key(&mut app, KeyCode::Home);
+    type_str(&mut app, "my ");
+    assert_eq!(rename_input(&app), "my tcp :4444");
+
+    render_rows(&mut app, 120, 32);
+    let (field, target, _) = app.hits.text[0];
+    assert_eq!(target, TextTarget::Rename);
+    click(&mut app, field); // Start of the text.
+    key(&mut app, KeyCode::Delete);
+    type_str(&mut app, "M");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.workspaces[0].name.as_deref(), Some("My tcp :4444"));
+}
+
+// ---- tab right-click menu ----
+
+/// One workspace with three sessions; returns their ids and peer receivers.
+fn three_tabs() -> (
+    App,
+    Vec<SessId>,
+    Vec<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+) {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    let (ids, outs) = (1..=3)
+        .map(|i| app.add_test_session(ws, &format!("10.0.0.{i}:1000")))
+        .unzip();
+    render_rows(&mut app, 120, 32);
+    (app, ids, outs)
+}
+
+/// Right-clicks tab `index`, renders the menu, and clicks `item`.
+fn tab_menu_pick(app: &mut App, index: usize, item: &str) {
+    let (tab, _) = app.hits.tabs[index];
+    right_click(app, tab);
+    render_rows(app, 120, 32);
+    let pos = MENU_ITEMS.iter().position(|i| *i == item).unwrap();
+    let (rect, _) = app.hits.menu_items[pos];
+    click(app, rect);
+}
+
+#[test]
+fn right_click_opens_menu_for_that_tab_without_focusing_it() {
+    let (mut app, ids, _outs) = three_tabs();
+    let (tab, _) = app.hits.tabs[2];
+    right_click(&mut app, tab);
+    assert_eq!(menu(&app).target, Target::Session(ids[2]));
+    assert_eq!(app.workspaces[0].active_tab, 0);
+}
+
+#[test]
+fn close_tab_from_menu_disconnects_that_session_and_keeps_focus() {
+    let (mut app, ids, mut outs) = three_tabs();
+    prefix(&mut app, '3');
+    render_rows(&mut app, 120, 32);
+
+    tab_menu_pick(&mut app, 0, "Close");
+    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Session(ids[0])));
+    assert_eq!(
+        outs[0].try_recv(),
+        Err(TryRecvError::Empty),
+        "still connected"
+    );
+    render_rows(&mut app, 120, 32);
+    let confirm = app.hits.confirm;
+    click(&mut app, confirm);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(outs[0].try_recv(), Err(TryRecvError::Disconnected));
+    let remaining: Vec<SessId> = app.workspaces[0].sessions.iter().map(|s| s.id).collect();
+    assert_eq!(remaining, [ids[1], ids[2]]);
+    let ws = &app.workspaces[0];
+    assert_eq!(ws.sessions[ws.active_tab].id, ids[2], "focus stays put");
+    assert_eq!(outs[2].try_recv(), Err(TryRecvError::Empty));
+}
+
+#[test]
+fn closing_the_last_tab_from_the_menu_moves_focus_left() {
+    let (mut app, ids, _outs) = three_tabs();
+    prefix(&mut app, '3');
+    render_rows(&mut app, 120, 32);
+    tab_menu_pick(&mut app, 2, "Close");
+    key(&mut app, KeyCode::Enter);
+    let ws = &app.workspaces[0];
+    assert_eq!(ws.sessions.len(), 2);
+    assert_eq!(ws.sessions[ws.active_tab].id, ids[1]);
+}
+
+#[test]
+fn rename_tab_from_menu_sets_a_custom_name() {
+    let (mut app, _ids, _outs) = three_tabs();
+    tab_menu_pick(&mut app, 1, "Rename");
+    assert_eq!(
+        rename_input(&app),
+        "10.0.0.2:1000",
+        "prefilled with the peer"
+    );
+
+    key(&mut app, KeyCode::Home);
+    type_str(&mut app, "db ");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.workspaces[0].sessions[1].name.as_deref(),
+        Some("db 10.0.0.2:1000")
+    );
+    assert_eq!(app.workspaces[0].active_tab, 0);
+}
+
+#[test]
+fn renaming_a_tab_to_empty_or_its_peer_clears_the_name() {
+    let (mut app, _ids, _outs) = three_tabs();
+    app.workspaces[0].sessions[0].name = Some("db".into());
+
+    prefix(&mut app, 'T');
+    assert_eq!(rename_input(&app), "db");
+    key(&mut app, KeyCode::Backspace);
+    key(&mut app, KeyCode::Backspace);
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.workspaces[0].sessions[0].name, None);
+
+    prefix(&mut app, 'T');
+    key(&mut app, KeyCode::Enter); // Unchanged peer address.
+    assert_eq!(app.workspaces[0].sessions[0].name, None);
+}
+
+#[test]
+fn sessions_list_has_no_right_click_menu() {
+    let (mut app, _ids, _outs) = three_tabs();
+    let (row, ..) = app.hits.sessions[1];
+    right_click(&mut app, row);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[0].active_tab, 0, "right-click doesn't focus");
+
+    click(&mut app, row);
+    assert_eq!(app.workspaces[0].active_tab, 1, "left-click does");
+}
+
+#[test]
+fn closing_a_disconnected_tab_skips_confirmation() {
+    let (mut app, ids, _outs) = three_tabs();
+    app.handle(Event::Net(NetEvent::Closed {
+        sess: ids[0],
+        error: None,
+    }));
+    prefix(&mut app, 'X');
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[0].sessions.len(), 2);
+
+    app.handle(Event::Net(NetEvent::Closed {
+        sess: ids[2],
+        error: None,
+    }));
+    render_rows(&mut app, 120, 32);
+    tab_menu_pick(&mut app, 1, "Close");
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[0].sessions.len(), 1);
+}
+
+#[test]
+fn cancelling_a_tab_close_keeps_the_connection() {
+    let (mut app, ids, mut outs) = three_tabs();
+    prefix(&mut app, 'X');
+    key(&mut app, KeyCode::Esc);
+    tab_menu_pick(&mut app, 1, "Close");
+    render_rows(&mut app, 120, 32);
+    let cancel = app.hits.cancel;
+    click(&mut app, cancel);
+
+    assert!(matches!(app.mode, Mode::Normal));
+    let remaining: Vec<SessId> = app.workspaces[0].sessions.iter().map(|s| s.id).collect();
+    assert_eq!(remaining, ids);
+    for out in &mut outs {
+        assert_eq!(out.try_recv(), Err(TryRecvError::Empty));
+    }
+}
+
+#[test]
+fn a_tab_that_disconnects_while_asking_still_closes_on_confirm() {
+    let (mut app, ids, _outs) = three_tabs();
+    prefix(&mut app, 'X');
+    app.handle(Event::Net(NetEvent::Closed {
+        sess: ids[0],
+        error: None,
+    }));
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.workspaces[0].sessions.len(), 2);
 }

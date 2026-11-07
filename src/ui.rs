@@ -7,13 +7,34 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
-use crate::app::{App, Dir, ListenState, Mode, Session, SettingsForm, Status};
+use crate::app::{
+    App, ContextMenu, Dir, ListenState, MENU_ITEMS, Mode, RenameForm, Session, SettingsForm,
+    Status, Target,
+};
 use crate::net::Protocol;
+use crate::text_input::TextInput;
 use crate::theme::*;
 
 const SIDEBAR_WIDTH: u16 = 26;
 const MIN_TAB_WIDTH: u16 = 8;
 const WORKSPACE_HEADER_ROWS: u16 = 2;
+
+/// A clickable part of the settings form.
+#[derive(Clone, Copy)]
+pub enum FormHit {
+    Protocol(Protocol),
+    /// Focus a field: 0 = protocol, 1 = address, 2 = port.
+    Field(usize),
+}
+
+/// A text field that a click can place the cursor in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextTarget {
+    Session,
+    Address,
+    Port,
+    Rename,
+}
 
 /// Clickable regions from the last frame.
 #[derive(Default)]
@@ -25,6 +46,15 @@ pub struct Hits {
     pub new_workspace: Rect,
     pub settings: Rect,
     pub pane: Rect,
+    /// Right-click menu rows: (row, index into `MENU_ITEMS`).
+    pub menu_items: Vec<(Rect, usize)>,
+    /// Settings form targets; protocol buttons come before the rows they sit in.
+    pub form: Vec<(Rect, FormHit)>,
+    /// Text fields: (area, field, index of the first visible char).
+    pub text: Vec<(Rect, TextTarget, usize)>,
+    /// Close-confirmation buttons.
+    pub confirm: Rect,
+    pub cancel: Rect,
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -58,12 +88,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
     match &app.mode {
-        Mode::Settings(form) => cursor = render_settings(buf, area, form),
+        Mode::Settings(form) => cursor = render_settings(buf, area, form, &mut hits),
+        Mode::Rename(form) => cursor = render_rename(buf, area, form, &mut hits),
+        &Mode::ConfirmClose(target) => {
+            render_confirm_close(buf, area, app, target, &mut hits);
+            cursor = None;
+        }
+        Mode::Menu(menu) => {
+            render_menu(buf, area, menu, &mut hits);
+            cursor = None;
+        }
         Mode::Help => {
             render_help(buf, area);
             cursor = None;
         }
-        _ => {}
+        Mode::Normal | Mode::Prefix => {}
     }
     if let Some(cursor) = cursor {
         frame.set_cursor_position(cursor);
@@ -82,6 +121,32 @@ fn put(buf: &mut Buffer, x: u16, y: u16, right: u16, text: &str, style: Style) -
 fn put_right(buf: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
     let width = (text.chars().count() as u16).min(area.width);
     put(buf, area.right() - width, y, area.right(), text, style);
+}
+
+/// Draws `input` between `x` and `right`, scrolled so its cursor is visible.
+/// Records the field as a click target and returns where the cursor goes.
+#[allow(clippy::too_many_arguments)]
+fn render_input(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    right: u16,
+    input: &TextInput,
+    style: Style,
+    target: TextTarget,
+    hits: &mut Hits,
+) -> Position {
+    let width = right.saturating_sub(x);
+    let start = input.scroll(width as usize);
+    let visible: String = input
+        .as_str()
+        .chars()
+        .skip(start)
+        .take(width as usize)
+        .collect();
+    put(buf, x, y, right, &visible, style);
+    hits.text.push((Rect::new(x, y, width, 1), target, start));
+    Position::new(x + (input.cursor() - start) as u16, y)
 }
 
 fn status_glyph(status: Status) -> (&'static str, Color) {
@@ -182,7 +247,15 @@ fn render_workspaces(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         }
         let rect = Rect::new(body.x, y, body.width, 2);
         let focused = index == app.active;
-        if focused {
+        // The workspace a menu or rename is acting on stands out like a selection.
+        let targeted = match &app.mode {
+            Mode::Menu(menu) => menu.target == Target::Workspace(ws.id),
+            Mode::Rename(form) => form.target == Target::Workspace(ws.id),
+            _ => false,
+        };
+        if targeted {
+            buf.set_style(rect, Style::new().bg(SURFACE0));
+        } else if focused {
             buf.set_style(rect, Style::new().bg(ACTIVE_ROW_BG));
         }
         let right = rect.right().saturating_sub(1);
@@ -214,6 +287,11 @@ fn render_workspaces(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         let (detail, style) = match &ws.state {
             ListenState::Failed(error) => (error.clone(), Style::new().fg(RED)),
             ListenState::Binding => ("binding…".to_string(), secondary),
+            // A custom name hides the port, so show it here instead of the IP.
+            ListenState::Listening if ws.name.is_some() => (
+                format!("{} · {} open", ws.endpoint(), ws.open_count()),
+                secondary,
+            ),
             ListenState::Listening => (
                 format!("{} · {} open", ws.config.addr.ip(), ws.open_count()),
                 secondary,
@@ -323,7 +401,7 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
                 &format!("{icon} "),
                 Style::new().fg(color),
             );
-            put(buf, x, y, right, &s.peer.to_string(), name_style);
+            put(buf, x, y, right, &s.label(), name_style);
             // Status sits on the second row: a full IPv4 peer barely fits the first.
             let state_x = right.saturating_sub(state.len() as u16);
             put(
@@ -343,9 +421,9 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
 
 fn tab_label(s: &Session) -> String {
     if s.unread {
-        format!("● {}", s.peer)
+        format!("● {}", s.label())
     } else {
-        s.peer.to_string()
+        s.label()
     }
 }
 
@@ -392,8 +470,19 @@ fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             break;
         }
         let s = &ws.sessions[index];
+        // The tab a menu or rename is acting on stands out like a selection.
+        let targeted = match &app.mode {
+            Mode::Menu(menu) => menu.target == Target::Session(s.id),
+            Mode::Rename(form) => form.target == Target::Session(s.id),
+            _ => false,
+        };
         let style = if index == ws.active_tab {
             Style::new().fg(PANEL_BG).bg(ACCENT)
+        } else if targeted {
+            Style::new()
+                .fg(TEXT)
+                .bg(SURFACE1)
+                .add_modifier(Modifier::BOLD)
         } else if !s.is_open() {
             Style::new()
                 .fg(OVERLAY0)
@@ -487,7 +576,10 @@ fn render_pane(buf: &mut Buffer, area: Rect, app: &mut App, hits: &mut Hits) -> 
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
         .title(Span::styled(
-            format!(" {} ", s.peer),
+            match &s.name {
+                Some(name) => format!(" {name} · {} ", s.peer),
+                None => format!(" {} ", s.peer),
+            },
             Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         ))
         .title_top(
@@ -543,19 +635,17 @@ fn render_pane(buf: &mut Buffer, area: Rect, app: &mut App, hits: &mut Hits) -> 
         "❯ ",
         Style::new().fg(ACCENT),
     );
-    // Show the tail of long input so the cursor stays visible.
-    let room = inner.right().saturating_sub(x + 1) as usize;
-    let count = s.input.chars().count();
-    let visible: String = s.input.chars().skip(count.saturating_sub(room)).collect();
-    let end = put(
+    let cursor = render_input(
         buf,
         x,
         input_y,
         inner.right(),
-        &visible,
+        &s.input,
         Style::new().fg(TEXT),
+        TextTarget::Session,
+        hits,
     );
-    matches!(app.mode, Mode::Normal).then_some(Position::new(end, input_y))
+    matches!(app.mode, Mode::Normal).then_some(cursor)
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -668,7 +758,12 @@ fn overlay_block(title: &str) -> Block<'_> {
         ))
 }
 
-fn render_settings(buf: &mut Buffer, area: Rect, form: &SettingsForm) -> Option<Position> {
+fn render_settings(
+    buf: &mut Buffer,
+    area: Rect,
+    form: &SettingsForm,
+    hits: &mut Hits,
+) -> Option<Position> {
     let rect = centered(area, 58, 9);
     Clear.render(rect, buf);
     let title = if form.target.is_some() {
@@ -703,17 +798,39 @@ fn render_settings(buf: &mut Buffer, area: Rect, form: &SettingsForm) -> Option<
         } else {
             Style::new().fg(OVERLAY0).bg(SURFACE0)
         };
-        x = put(buf, x, y, right, &format!(" {} ", protocol.label()), style) + 1;
+        let end = put(buf, x, y, right, &format!(" {} ", protocol.label()), style);
+        hits.form
+            .push((Rect::new(x, y, end - x, 1), FormHit::Protocol(protocol)));
+        x = end + 1;
     }
+    hits.form
+        .push((Rect::new(inner.x, y, inner.width, 1), FormHit::Field(0)));
 
-    for (field, label, value, y) in [
-        (1, "address", &form.address, inner.y + 2),
-        (2, "port", &form.port, inner.y + 3),
+    for (field, label, value, target, y) in [
+        (
+            1,
+            "address",
+            &form.address,
+            TextTarget::Address,
+            inner.y + 2,
+        ),
+        (2, "port", &form.port, TextTarget::Port, inner.y + 3),
     ] {
         put(buf, inner.x + 1, y, right, label, label_style(field));
-        let end = put(buf, value_x, y, right, value, Style::new().fg(TEXT));
+        let at = render_input(
+            buf,
+            value_x,
+            y,
+            right,
+            value,
+            Style::new().fg(TEXT),
+            target,
+            hits,
+        );
+        hits.form
+            .push((Rect::new(inner.x, y, inner.width, 1), FormHit::Field(field)));
         if form.field == field {
-            cursor = Some(Position::new(end, y));
+            cursor = Some(at);
         }
     }
 
@@ -738,6 +855,179 @@ fn render_settings(buf: &mut Buffer, area: Rect, form: &SettingsForm) -> Option<
     cursor
 }
 
+/// herdr-style menu: square accent border, opened at the click and kept on screen.
+fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits: &mut Hits) {
+    let label_width = MENU_ITEMS.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
+    let width = (label_width + 4).max(14).min(area.width);
+    let height = (MENU_ITEMS.len() as u16 + 2).min(area.height);
+    let x = menu.x.min(area.right().saturating_sub(width));
+    let y = menu.y.min(area.bottom().saturating_sub(height));
+    let rect = Rect::new(x, y, width, height);
+    Clear.render(rect, buf);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(ACCENT))
+        .style(Style::new().bg(PANEL_BG));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+
+    for (index, label) in MENU_ITEMS.iter().enumerate() {
+        let row_y = inner.y + index as u16;
+        if row_y >= inner.bottom() {
+            break;
+        }
+        let row = Rect::new(inner.x, row_y, inner.width, 1);
+        let style = if index == menu.highlighted {
+            Style::new()
+                .fg(PANEL_BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(TEXT).bg(PANEL_BG)
+        };
+        buf.set_style(row, style);
+        put(buf, row.x, row.y, row.right(), &format!(" {label}"), style);
+        hits.menu_items.push((row, index));
+    }
+}
+
+fn render_rename(
+    buf: &mut Buffer,
+    area: Rect,
+    form: &RenameForm,
+    hits: &mut Hits,
+) -> Option<Position> {
+    let rect = centered(area, 46, 7);
+    Clear.render(rect, buf);
+    let block = overlay_block(match form.target {
+        Target::Workspace(_) => "rename workspace",
+        Target::Session(_) => "rename tab",
+    });
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    if inner.height < 4 || inner.width < 4 {
+        return None;
+    }
+
+    let input = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
+    buf.set_style(input, Style::new().fg(TEXT).bg(SURFACE0));
+    let cursor = render_input(
+        buf,
+        input.x + 1,
+        input.y,
+        input.right() - 1,
+        &form.input,
+        Style::new().fg(TEXT).bg(SURFACE0),
+        TextTarget::Rename,
+        hits,
+    );
+    put(
+        buf,
+        inner.x + 1,
+        inner.bottom() - 1,
+        inner.right(),
+        "enter save · esc cancel · empty resets",
+        Style::new().fg(OVERLAY0),
+    );
+    Some(cursor)
+}
+
+/// herdr-style confirmation: red square panel, title, detail, two buttons.
+fn render_confirm_close(buf: &mut Buffer, area: Rect, app: &App, target: Target, hits: &mut Hits) {
+    let text = match target {
+        Target::Workspace(id) => app.workspaces.iter().find(|w| w.id == id).map(|ws| {
+            let who = match &ws.name {
+                Some(name) => format!("{name} ({})", ws.endpoint()),
+                None => ws.endpoint(),
+            };
+            let open = ws.open_count();
+            let plural = if open == 1 { "" } else { "s" };
+            (
+                " Close workspace?",
+                format!(" {who} has {open} open connection{plural}."),
+            )
+        }),
+        Target::Session(id) => app
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.sessions)
+            .find(|s| s.id == id)
+            .map(|s| {
+                let who = match &s.name {
+                    Some(name) => format!("{name} ({})", s.peer),
+                    None => s.peer.to_string(),
+                };
+                (" Close tab?", format!(" {who} is still connected."))
+            }),
+    };
+    let Some((title, detail)) = text else {
+        return;
+    };
+    let rect = centered(area, 64, 6);
+    Clear.render(rect, buf);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(RED))
+        .style(Style::new().bg(PANEL_BG));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    if inner.height < 4 {
+        return;
+    }
+
+    put(
+        buf,
+        inner.x,
+        inner.y,
+        inner.right(),
+        title,
+        Style::new().fg(RED).add_modifier(Modifier::BOLD),
+    );
+    put(
+        buf,
+        inner.x,
+        inner.y + 1,
+        inner.right(),
+        &detail,
+        Style::new().fg(TEXT),
+    );
+
+    let (confirm, cancel) = (" ↵ confirm ", " esc cancel ");
+    let (confirm_w, cancel_w) = (13, 12);
+    let gap = 2;
+    let x = inner.x + inner.width.saturating_sub(confirm_w + gap + cancel_w) / 2;
+    let y = inner.y + 3;
+    hits.confirm = Rect::new(x, y, confirm_w, 1);
+    hits.cancel = Rect::new(x + confirm_w + gap, y, cancel_w, 1);
+    for (rect, label, style) in [
+        (
+            hits.confirm,
+            confirm,
+            Style::new()
+                .fg(PANEL_BG)
+                .bg(RED)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (
+            hits.cancel,
+            cancel,
+            Style::new()
+                .fg(TEXT)
+                .bg(SURFACE0)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ] {
+        buf.set_style(rect, style);
+        let width = (label.chars().count() as u16).min(rect.width);
+        put(
+            buf,
+            rect.x + (rect.width - width) / 2,
+            y,
+            rect.right(),
+            label,
+            style,
+        );
+    }
+}
+
 fn render_help(buf: &mut Buffer, area: Rect) {
     const KEYS: &[(&str, &str)] = &[
         ("ctrl+b", "prefix"),
@@ -748,6 +1038,9 @@ fn render_help(buf: &mut Buffer, area: Rect) {
         ("prefix 1..9", "jump to tab"),
         ("prefix X", "close tab (disconnects)"),
         ("prefix D", "close workspace"),
+        ("prefix W", "rename workspace"),
+        ("prefix T", "rename tab"),
+        ("right-click", "rename / close menu"),
         ("prefix q", "quit"),
         ("enter", "send input line"),
         ("pgup / pgdn", "scroll transcript"),
@@ -957,6 +1250,142 @@ mod tests {
         assert!(text.contains("more "), "scroll indicator shown");
         // Overscroll is clamped to the top of the transcript.
         assert!(app.workspaces[0].sessions[0].scroll < 1_000);
+    }
+
+    #[test]
+    fn renamed_workspace_shows_name_and_endpoint() {
+        let (mut app, _rx) = App::test_new();
+        app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.workspaces[0].name = Some("web".into());
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, " 1 web ○");
+        row_with(&rows, "   tcp :4444 · 0 open");
+    }
+
+    #[test]
+    fn context_menu_opens_at_the_click_and_stays_on_screen() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.mode = Mode::Menu(ContextMenu {
+            target: Target::Workspace(ws),
+            x: 3,
+            y: 2,
+            highlighted: 0,
+        });
+        let rows = render_rows(&mut app, W, H);
+        assert_eq!(
+            rows[2].chars().nth(3),
+            Some('┌'),
+            "top-left at the click: {:?}",
+            rows[2]
+        );
+        assert!(rows[3].contains("│ Rename"));
+        assert!(rows[4].contains("│ Close"));
+
+        // Near the bottom-right corner it shifts up and left to fit.
+        app.mode = Mode::Menu(ContextMenu {
+            target: Target::Workspace(ws),
+            x: W - 1,
+            y: H - 1,
+            highlighted: 1,
+        });
+        let rows = render_rows(&mut app, W, H);
+        let last = rows.last().unwrap();
+        assert!(
+            last.ends_with("┘"),
+            "bottom-right corner on screen: {last:?}"
+        );
+        assert!(rows[rows.len() - 2].contains("│ Close"));
+    }
+
+    #[test]
+    fn rename_overlay_shows_the_input() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.mode = Mode::Rename(RenameForm {
+            target: Target::Workspace(ws),
+            input: "web".into(),
+        });
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "╭ rename workspace ");
+        row_with(&rows, "│  web ");
+        row_with(&rows, "enter save · esc cancel · empty resets");
+    }
+
+    #[test]
+    fn confirm_close_names_the_workspace_and_its_connections() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.workspaces[0].name = Some("web".into());
+        let _a = app.add_test_session(ws, "10.0.0.5:1000");
+        let _b = app.add_test_session(ws, "10.0.0.6:1000");
+        app.mode = Mode::ConfirmClose(Target::Workspace(ws));
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "│ Close workspace?");
+        row_with(&rows, " web (tcp :4444) has 2 open connections.");
+        let buttons = row_with(&rows, "↵ confirm");
+        assert!(buttons.contains("esc cancel"));
+    }
+
+    #[test]
+    fn long_input_scrolls_to_keep_the_cursor_visible() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.add_test_session(ws, "10.0.0.5:51234");
+        let text: String = ('a'..='z').cycle().take(200).collect();
+        app.workspaces[0].sessions[0].input = text.as_str().into();
+        let rows = render_rows(&mut app, W, H);
+        // The end is visible while typing at the end...
+        assert!(row_with(&rows, "❯ ").contains(&text[190..]));
+
+        // ...and the start once the cursor moves home.
+        app.workspaces[0].sessions[0].input.set_cursor(0);
+        let rows = render_rows(&mut app, W, H);
+        assert!(row_with(&rows, "❯ ").contains("❯ abcdefgh"));
+    }
+
+    #[test]
+    fn renamed_tab_shows_its_name_everywhere() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.add_test_session(ws, "10.0.0.5:51234");
+        app.workspaces[0].sessions[0].name = Some("db".into());
+        let rows = render_rows(&mut app, W, H);
+        assert!(rows[0].contains(" db "), "tab bar: {:?}", rows[0]);
+        assert!(
+            rows[1].contains("╭ db · 10.0.0.5:51234 "),
+            "pane title keeps the peer"
+        );
+        assert!(
+            row_with(&rows, " ● db").starts_with(" ● db"),
+            "sessions list"
+        );
+    }
+
+    #[test]
+    fn rename_overlay_title_matches_its_target() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+        app.mode = Mode::Rename(RenameForm {
+            target: Target::Session(sess),
+            input: "db".into(),
+        });
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "╭ rename tab ");
+    }
+
+    #[test]
+    fn confirm_close_for_a_tab_names_the_peer() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        let (sess, _out) = app.add_test_session(ws, "255.255.255.255:65535");
+        app.workspaces[0].sessions[0].name = Some("db".into());
+        app.mode = Mode::ConfirmClose(Target::Session(sess));
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "│ Close tab?");
+        row_with(&rows, " db (255.255.255.255:65535) is still connected.");
+        row_with(&rows, "↵ confirm");
     }
 
     #[test]

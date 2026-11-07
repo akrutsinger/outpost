@@ -1,5 +1,6 @@
 mod app;
 mod net;
+mod text_input;
 mod theme;
 mod ui;
 

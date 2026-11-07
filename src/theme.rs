@@ -6,6 +6,7 @@ pub const ACCENT: Color = Color::Rgb(137, 180, 250);
 pub const PANEL_BG: Color = Color::Rgb(24, 24, 37);
 pub const ACTIVE_ROW_BG: Color = Color::Rgb(30, 30, 46);
 pub const SURFACE0: Color = Color::Rgb(49, 50, 68);
+pub const SURFACE1: Color = Color::Rgb(69, 71, 90);
 pub const SURFACE_DIM: Color = Color::Rgb(30, 30, 46);
 pub const OVERLAY0: Color = Color::Rgb(108, 112, 134);
 pub const OVERLAY1: Color = Color::Rgb(127, 132, 156);
