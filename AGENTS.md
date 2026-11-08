@@ -53,8 +53,13 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
     QUIC session's `Streams`.
   - `app/settings.rs`: `SettingsForm`: building it, editing rules per field,
     and `check`, which validates it into an `Applied` config.
-- `src/ui.rs`: rendering. Records clickable regions in `Hits`, which the next
-  mouse event resolves against.
+- `src/ui.rs`: rendering entry point and shared drawing helpers. Records
+  clickable regions in `Hits`, which the next mouse event resolves against.
+  Split like herdr's shell:
+  - `ui/sidebar.rs`: workspaces over sessions, and the dividers.
+  - `ui/tabs.rs`: the tab bar and the focused tab's transcript and input.
+  - `ui/overlays.rs`: settings form, menu, rename, confirmation, help
+    (`render_help`).
 - `src/text_input.rs`: single-line text with a movable cursor, used by every
   editable field.
 
@@ -100,7 +105,7 @@ in-process without spawning the binary.
   `add_test_workspace()`, `add_test_session()` (no real sockets; the returned
   receiver shows what the app sent to the peer). Drive it with the `key`,
   `type_str`, `prefix`, `click`, `right_click`, and `data` helpers.
-- **Rendering** (`src/ui.rs` tests): `render_rows(app, 120, 32)` draws to
+- **Rendering** (`src/ui/tests.rs`): `render_rows(app, 120, 32)` draws to
   ratatui's `TestBackend` and returns rows as strings. It also fills `app.hits`,
   so render first, then click a recorded rect.
 - **Networking** (`src/net.rs` tests): real sockets on `127.0.0.1:0`, with
