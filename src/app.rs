@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
 
@@ -212,8 +212,8 @@ impl Streams {
             .map(Some)
             .chain([None])
             .collect();
-        let index = options.iter().position(|&o| o == self.send_to).unwrap_or(0) as isize;
-        self.send_to = options[(index + delta).rem_euclid(options.len() as isize) as usize];
+        let index = options.iter().position(|&o| o == self.send_to).unwrap_or(0);
+        self.send_to = options[wrap(index, delta, options.len())];
     }
 
     /// We can't send on `stream` any more; target the newest one left instead.
@@ -519,8 +519,14 @@ impl SettingsForm {
 
     fn focus_next(&mut self, delta: isize) {
         let fields = self.fields();
-        let index = fields.iter().position(|&f| f == self.field).unwrap_or(0) as isize;
-        self.field = fields[(index + delta).rem_euclid(fields.len() as isize) as usize];
+        let index = fields.iter().position(|&f| f == self.field).unwrap_or(0);
+        self.field = fields[wrap(index, delta, fields.len())];
+    }
+
+    fn cycle_protocol(&mut self, delta: isize) {
+        let all = Protocol::ALL;
+        let index = all.iter().position(|&p| p == self.protocol).unwrap_or(0);
+        self.protocol = all[wrap(index, delta, all.len())];
     }
 
     fn input_mut(&mut self) -> Option<&mut TextInput> {
@@ -578,6 +584,20 @@ fn form_path(input: &TextInput) -> Option<PathBuf> {
     Some(PathBuf::from(text))
 }
 
+/// The index `delta` steps from `index` in a list of `len` items, wrapping
+/// around. `len` must not be zero.
+fn wrap(index: usize, delta: isize, len: usize) -> usize {
+    (index as isize + delta).rem_euclid(len as isize) as usize
+}
+
+/// The value recorded for the clickable region at `pos`.
+fn hit<T: Copy>(targets: &[(Rect, T)], pos: Position) -> Option<T> {
+    targets
+        .iter()
+        .find(|(r, _)| r.contains(pos))
+        .map(|&(_, value)| value)
+}
+
 /// What a right-click menu or rename acts on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
@@ -586,8 +606,23 @@ pub enum Target {
     Session(SessId),
 }
 
-/// Items in the right-click menu, in display order.
-pub const MENU_ITEMS: [&str; 2] = ["Rename", "Close"];
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuItem {
+    Rename,
+    Close,
+}
+
+impl MenuItem {
+    /// In display order.
+    pub const ALL: [MenuItem; 2] = [MenuItem::Rename, MenuItem::Close];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuItem::Rename => "Rename",
+            MenuItem::Close => "Close",
+        }
+    }
+}
 
 pub struct ContextMenu {
     pub target: Target,
@@ -611,6 +646,23 @@ pub enum Mode {
     Rename(RenameForm),
     /// Asks before an action that would drop live connections.
     Confirm(Confirm),
+}
+
+impl Mode {
+    /// The workspace or tab the open overlay acts on, highlighted while it's open.
+    pub fn target(&self) -> Option<Target> {
+        match self {
+            Mode::Menu(menu) => Some(menu.target),
+            Mode::Rename(form) => Some(form.target),
+            Mode::Confirm(Confirm::Close(target)) => Some(*target),
+            Mode::Confirm(Confirm::Restart(form, _)) => form.target.map(Target::Workspace),
+            Mode::Normal
+            | Mode::Prefix
+            | Mode::Help
+            | Mode::Settings(_)
+            | Mode::Confirm(Confirm::Quit) => None,
+        }
+    }
 }
 
 /// An action waiting on a confirmation, because it drops live connections.
@@ -688,6 +740,17 @@ impl App {
     fn focused_session_mut(&mut self) -> Option<&mut Session> {
         let ws = self.workspaces.get_mut(self.active)?;
         ws.sessions.get_mut(ws.active_tab)
+    }
+
+    pub fn workspace(&self, id: WsId) -> Option<&Workspace> {
+        self.workspaces.iter().find(|ws| ws.id == id)
+    }
+
+    pub fn session(&self, id: SessId) -> Option<&Session> {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| &ws.sessions)
+            .find(|s| s.id == id)
     }
 
     fn session_mut(&mut self, id: SessId) -> Option<&mut Session> {
@@ -887,11 +950,9 @@ impl App {
             },
             KeyCode::Tab | KeyCode::Down => form.focus_next(1),
             KeyCode::BackTab | KeyCode::Up => form.focus_next(-1),
-            KeyCode::Left if form.field == Field::Protocol => {
-                form.protocol = form.protocol.cycled(-1)
-            }
+            KeyCode::Left if form.field == Field::Protocol => form.cycle_protocol(-1),
             KeyCode::Right | KeyCode::Char(' ') if form.field == Field::Protocol => {
-                form.protocol = form.protocol.cycled(1)
+                form.cycle_protocol(1)
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == Field::Cert => {
                 form.cert = form.cert.toggled()
@@ -913,15 +974,15 @@ impl App {
     }
 
     fn menu_key(&mut self, mut menu: ContextMenu, key: KeyEvent) {
-        let len = MENU_ITEMS.len();
+        let len = MenuItem::ALL.len();
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Enter => {
                 self.activate_menu_item(menu.target, menu.highlighted);
                 return;
             }
-            KeyCode::Down => menu.highlighted = (menu.highlighted + 1) % len,
-            KeyCode::Up => menu.highlighted = (menu.highlighted + len - 1) % len,
+            KeyCode::Down => menu.highlighted = wrap(menu.highlighted, 1, len),
+            KeyCode::Up => menu.highlighted = wrap(menu.highlighted, -1, len),
             _ => {}
         }
         self.mode = Mode::Menu(menu);
@@ -965,21 +1026,13 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let pos = Position::new(mouse.column, mouse.row);
-        let left_click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
-        // Where a click lands inside a text field, as (field, cursor position).
-        let text_hit = self
-            .hits
-            .text
-            .iter()
-            .find(|(r, ..)| r.contains(pos))
-            .map(|&(r, target, scroll)| (target, scroll + (pos.x - r.x) as usize));
         // A divider drag follows the mouse until the button is released.
         if let Some(drag) = self.drag {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Left) => {
                     match drag {
-                        Drag::SidebarWidth => self.set_sidebar_width(mouse.column),
-                        Drag::SidebarSplit => self.set_sidebar_split(mouse.row),
+                        Drag::SidebarWidth => self.set_sidebar_width(pos.x),
+                        Drag::SidebarSplit => self.set_sidebar_split(pos.y),
                     }
                     return;
                 }
@@ -991,161 +1044,105 @@ impl App {
             }
         }
         // Overlays capture the mouse while open.
-        match &mut self.mode {
-            Mode::Help => return,
-            Mode::Rename(form) => {
-                if left_click && let Some((TextTarget::Rename, cursor)) = text_hit {
+        let left_click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+        match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Help => self.mode = Mode::Help,
+            Mode::Rename(mut form) => {
+                if left_click && let Some((TextTarget::Rename, cursor)) = self.text_hit(pos) {
                     form.input.set_cursor(cursor);
                 }
-                return;
+                self.mode = Mode::Rename(form);
             }
-            Mode::Confirm(_) => {
-                let button = if !left_click {
-                    None
-                } else if self.hits.confirm.contains(pos) {
-                    Some(true)
-                } else if self.hits.cancel.contains(pos) {
-                    Some(false)
-                } else {
-                    None
-                };
-                if let Some(confirm) = button
-                    && let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Normal)
-                {
-                    if confirm {
-                        self.confirmed(c);
-                    } else {
-                        self.cancelled(c);
-                    }
-                }
-                return;
+            Mode::Confirm(confirm) if left_click && self.hits.confirm.contains(pos) => {
+                self.confirmed(confirm)
             }
-            Mode::Settings(form) => {
-                if !left_click {
-                    return;
-                }
-                if let Some((target, cursor)) = text_hit {
-                    if let Some(field) = Field::for_text(target) {
-                        form.field = field;
-                        if let Some(input) = form.input_mut() {
-                            input.set_cursor(cursor);
-                        }
-                    }
-                } else if let Some(&(_, hit)) = self.hits.form.iter().find(|(r, _)| r.contains(pos))
-                {
-                    match hit {
-                        FormHit::Protocol(protocol) => {
-                            form.protocol = protocol;
-                            form.field = Field::Protocol;
-                        }
-                        FormHit::Cert(cert) => {
-                            form.cert = cert;
-                            form.field = Field::Cert;
-                        }
-                        FormHit::Field(field) => form.field = field,
-                    }
-                }
-                return;
+            Mode::Confirm(confirm) if left_click && self.hits.cancel.contains(pos) => {
+                self.cancelled(confirm)
             }
-            Mode::Menu(menu) => {
-                let item = self
-                    .hits
-                    .menu_items
-                    .iter()
-                    .find(|(r, _)| r.contains(pos))
-                    .map(|&(_, item)| item);
-                match mouse.kind {
-                    MouseEventKind::Moved => {
-                        if let Some(item) = item {
-                            menu.highlighted = item;
-                        }
-                    }
-                    // Any click picks the item under it, or dismisses the menu.
-                    MouseEventKind::Down(_) => {
-                        let target = menu.target;
-                        self.mode = Mode::Normal;
-                        if let Some(item) = item {
-                            self.activate_menu_item(target, item);
-                        }
-                    }
-                    _ => {}
+            Mode::Confirm(confirm) => self.mode = Mode::Confirm(confirm),
+            Mode::Settings(mut form) => {
+                if left_click {
+                    self.settings_click(&mut form, pos);
                 }
-                return;
+                self.mode = Mode::Settings(form);
             }
-            Mode::Normal | Mode::Prefix => {}
+            Mode::Menu(menu) => self.menu_mouse(menu, mouse.kind, pos),
+            mode @ (Mode::Normal | Mode::Prefix) => {
+                self.mode = mode;
+                self.normal_mouse(mouse.kind, pos);
+            }
         }
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Right) => {
-                self.mode = Mode::Normal;
-                // Workspace rows and tabs have menus; the sessions list doesn't.
-                let target = if let Some(&(_, ws)) =
-                    self.hits.workspaces.iter().find(|(r, _)| r.contains(pos))
-                {
-                    Some(Target::Workspace(self.workspaces[ws].id))
-                } else if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(pos))
-                {
-                    self.workspaces
-                        .get(self.active)
-                        .and_then(|ws| ws.sessions.get(tab))
-                        .map(|s| Target::Session(s.id))
-                } else {
-                    None
-                };
-                if let Some(target) = target {
-                    self.mode = Mode::Menu(ContextMenu {
-                        target,
-                        x: mouse.column,
-                        y: mouse.row,
-                        highlighted: 0,
-                    });
+    }
+
+    /// The text field at `pos`, and where a click there puts the cursor.
+    fn text_hit(&self, pos: Position) -> Option<(TextTarget, usize)> {
+        self.hits
+            .text
+            .iter()
+            .find(|(r, ..)| r.contains(pos))
+            .map(|&(r, target, scroll)| (target, scroll + (pos.x - r.x) as usize))
+    }
+
+    fn settings_click(&self, form: &mut SettingsForm, pos: Position) {
+        if let Some((target, cursor)) = self.text_hit(pos) {
+            if let Some(field) = Field::for_text(target) {
+                form.field = field;
+                if let Some(input) = form.input_mut() {
+                    input.set_cursor(cursor);
                 }
+            }
+            return;
+        }
+        match hit(&self.hits.form, pos) {
+            Some(FormHit::Protocol(protocol)) => {
+                form.protocol = protocol;
+                form.field = Field::Protocol;
+            }
+            Some(FormHit::Cert(cert)) => {
+                form.cert = cert;
+                form.field = Field::Cert;
+            }
+            Some(FormHit::Field(field)) => form.field = field,
+            None => {}
+        }
+    }
+
+    fn menu_mouse(&mut self, mut menu: ContextMenu, kind: MouseEventKind, pos: Position) {
+        let item = hit(&self.hits.menu_items, pos);
+        match kind {
+            // Any click picks the item under it, or dismisses the menu.
+            MouseEventKind::Down(_) => {
+                if let Some(item) = item {
+                    self.activate_menu_item(menu.target, item);
+                }
+                return;
+            }
+            MouseEventKind::Moved => {
+                if let Some(item) = item {
+                    menu.highlighted = item;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Menu(menu);
+    }
+
+    fn normal_mouse(&mut self, kind: MouseEventKind, pos: Position) {
+        match kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.mode = match self.menu_target(pos) {
+                    Some(target) => Mode::Menu(ContextMenu {
+                        target,
+                        x: pos.x,
+                        y: pos.y,
+                        highlighted: 0,
+                    }),
+                    None => Mode::Normal,
+                };
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mode = Mode::Normal;
-                if self.hits.sidebar_divider.contains(pos) {
-                    let now = Instant::now();
-                    let double = self
-                        .last_divider_click
-                        .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
-                    self.last_divider_click = Some(now);
-                    if double {
-                        self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
-                    } else {
-                        self.drag = Some(Drag::SidebarWidth);
-                        self.set_sidebar_width(mouse.column);
-                    }
-                } else if self.hits.section_divider.contains(pos) {
-                    self.drag = Some(Drag::SidebarSplit);
-                    self.set_sidebar_split(mouse.row);
-                } else if self.hits.new_workspace.contains(pos) {
-                    self.open_new_form();
-                } else if self.hits.settings.contains(pos) {
-                    self.open_settings_form();
-                } else if let Some(&(_, ws)) =
-                    self.hits.workspaces.iter().find(|(r, _)| r.contains(pos))
-                {
-                    self.active = ws;
-                } else if let Some(&(_, ws, tab)) =
-                    self.hits.sessions.iter().find(|(r, ..)| r.contains(pos))
-                {
-                    self.active = ws;
-                    self.workspaces[ws].active_tab = tab;
-                } else if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(pos))
-                {
-                    self.select_tab(tab);
-                } else if self.hits.send_stream.contains(pos) {
-                    if let Some(s) = self.focused_session_mut() {
-                        s.cycle_stream(1);
-                    }
-                } else if self.hits.finish_stream.contains(pos) {
-                    if let Some(s) = self.focused_session_mut() {
-                        s.finish_stream();
-                    }
-                } else if let Some((TextTarget::Session, cursor)) = text_hit
-                    && let Some(s) = self.focused_session_mut()
-                {
-                    s.input.set_cursor(cursor);
-                }
+                self.left_click(pos);
             }
             MouseEventKind::ScrollUp if self.hits.pane.contains(pos) => {
                 if let Some(s) = self.focused_session_mut() {
@@ -1158,6 +1155,65 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// What right-clicking at `pos` opens a menu for. Workspace rows and tabs
+    /// have menus; the sessions list doesn't.
+    fn menu_target(&self, pos: Position) -> Option<Target> {
+        if let Some(ws) = hit(&self.hits.workspaces, pos) {
+            return self.workspaces.get(ws).map(|ws| Target::Workspace(ws.id));
+        }
+        let tab = hit(&self.hits.tabs, pos)?;
+        let s = self.workspaces.get(self.active)?.sessions.get(tab)?;
+        Some(Target::Session(s.id))
+    }
+
+    fn left_click(&mut self, pos: Position) {
+        if self.hits.sidebar_divider.contains(pos) {
+            let now = Instant::now();
+            let double = self
+                .last_divider_click
+                .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
+            self.last_divider_click = Some(now);
+            if double {
+                self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+            } else {
+                self.drag = Some(Drag::SidebarWidth);
+                self.set_sidebar_width(pos.x);
+            }
+        } else if self.hits.section_divider.contains(pos) {
+            self.drag = Some(Drag::SidebarSplit);
+            self.set_sidebar_split(pos.y);
+        } else if self.hits.new_workspace.contains(pos) {
+            self.open_new_form();
+        } else if self.hits.settings.contains(pos) {
+            self.open_settings_form();
+        } else if let Some(ws) = hit(&self.hits.workspaces, pos) {
+            if ws < self.workspaces.len() {
+                self.active = ws;
+            }
+        } else if let Some((ws, tab)) = hit(&self.hits.sessions, pos) {
+            if let Some(w) = self.workspaces.get_mut(ws)
+                && tab < w.sessions.len()
+            {
+                w.active_tab = tab;
+                self.active = ws;
+            }
+        } else if let Some(tab) = hit(&self.hits.tabs, pos) {
+            self.select_tab(tab);
+        } else if self.hits.send_stream.contains(pos) {
+            if let Some(s) = self.focused_session_mut() {
+                s.cycle_stream(1);
+            }
+        } else if self.hits.finish_stream.contains(pos) {
+            if let Some(s) = self.focused_session_mut() {
+                s.finish_stream();
+            }
+        } else if let Some((TextTarget::Session, cursor)) = self.text_hit(pos)
+            && let Some(s) = self.focused_session_mut()
+        {
+            s.input.set_cursor(cursor);
         }
     }
 
@@ -1175,24 +1231,19 @@ impl App {
         }
     }
 
-    fn activate_menu_item(&mut self, target: Target, item: usize) {
-        match (MENU_ITEMS.get(item), target) {
-            (Some(&"Rename"), _) => self.open_rename(target),
-            (Some(&"Close"), _) => self.request_close(target),
-            _ => {}
+    /// `index` is into [`MenuItem::ALL`].
+    fn activate_menu_item(&mut self, target: Target, index: usize) {
+        match MenuItem::ALL.get(index) {
+            Some(MenuItem::Rename) => self.open_rename(target),
+            Some(MenuItem::Close) => self.request_close(target),
+            None => {}
         }
     }
 
     fn open_rename(&mut self, target: Target) {
         let label = match target {
-            Target::Workspace(id) => self
-                .workspaces
-                .iter()
-                .find(|w| w.id == id)
-                .map(Workspace::label),
-            Target::Session(id) => self
-                .locate_session(id)
-                .map(|(ws, index)| self.workspaces[ws].sessions[index].label()),
+            Target::Workspace(id) => self.workspace(id).map(Workspace::label),
+            Target::Session(id) => self.session(id).map(Session::label),
         };
         if let Some(label) = label {
             self.mode = Mode::Rename(RenameForm {
@@ -1298,10 +1349,7 @@ impl App {
         }
         // Keep the certificate while its settings are unchanged, so a
         // self-signed fingerprint survives edits to the address or port.
-        let current = form
-            .target
-            .and_then(|id| self.workspaces.iter().find(|ws| ws.id == id));
-        let tls = match current {
+        let tls = match form.target.and_then(|id| self.workspace(id)) {
             _ if !config.protocol.uses_tls() => None,
             Some(ws) if ws.config.protocol.uses_tls() && ws.config.tls == config.tls => {
                 match &ws.tls {
@@ -1317,7 +1365,7 @@ impl App {
     /// Whether applying `config` to workspace `target` would drop open sessions.
     fn restart_drops_sessions(&self, target: Option<WsId>, config: &ListenerConfig) -> bool {
         target
-            .and_then(|id| self.workspaces.iter().find(|ws| ws.id == id))
+            .and_then(|id| self.workspace(id))
             .is_some_and(|ws| ws.restart_drops_sessions(config))
     }
 
@@ -1357,12 +1405,10 @@ impl App {
     }
 
     fn cycle_tab(&mut self, delta: isize) {
-        let Some(ws) = self.workspaces.get_mut(self.active) else {
-            return;
-        };
-        let len = ws.sessions.len() as isize;
-        if len > 0 {
-            ws.active_tab = (ws.active_tab as isize + delta).rem_euclid(len) as usize;
+        if let Some(ws) = self.workspaces.get_mut(self.active)
+            && !ws.sessions.is_empty()
+        {
+            ws.active_tab = wrap(ws.active_tab, delta, ws.sessions.len());
         }
     }
 
@@ -1375,9 +1421,8 @@ impl App {
     }
 
     fn cycle_workspace(&mut self, delta: isize) {
-        let len = self.workspaces.len() as isize;
-        if len > 0 {
-            self.active = (self.active as isize + delta).rem_euclid(len) as usize;
+        if !self.workspaces.is_empty() {
+            self.active = wrap(self.active, delta, self.workspaces.len());
         }
     }
 
@@ -1400,14 +1445,8 @@ impl App {
     /// Closes a workspace or tab, asking first if that would drop live connections.
     fn request_close(&mut self, target: Target) {
         let live = match target {
-            Target::Workspace(id) => self
-                .workspaces
-                .iter()
-                .find(|w| w.id == id)
-                .is_some_and(|w| w.open_count() > 0),
-            Target::Session(id) => self
-                .locate_session(id)
-                .is_some_and(|(ws, index)| self.workspaces[ws].sessions[index].is_open()),
+            Target::Workspace(id) => self.workspace(id).is_some_and(|w| w.open_count() > 0),
+            Target::Session(id) => self.session(id).is_some_and(Session::is_open),
         };
         if live {
             self.mode = Mode::Confirm(Confirm::Close(target));

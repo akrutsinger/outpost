@@ -60,13 +60,6 @@ impl Protocol {
     pub fn uses_tls(self) -> bool {
         matches!(self, Protocol::Tls | Protocol::Quic)
     }
-
-    /// The protocol `delta` places along in [`Protocol::ALL`], wrapping around.
-    pub fn cycled(self, delta: isize) -> Self {
-        let len = Self::ALL.len() as isize;
-        let index = Self::ALL.iter().position(|&p| p == self).unwrap_or(0) as isize;
-        Self::ALL[(index + delta).rem_euclid(len) as usize]
-    }
 }
 
 /// Write side of a session. Dropping it closes a TCP (or TLS) connection.

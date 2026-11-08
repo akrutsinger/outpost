@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Dir, Field, ListenState, MENU_ITEMS, Mode, RenameForm,
+    App, CertKind, Confirm, ContextMenu, Dir, Field, ListenState, MenuItem, Mode, RenameForm,
     Session, SettingsForm, Status, Target, Workspace,
 };
 use crate::net::{Protocol, WsId};
@@ -43,8 +43,8 @@ pub enum TextTarget {
 #[derive(Default)]
 pub struct Hits {
     pub workspaces: Vec<(Rect, usize)>,
-    /// (row, workspace index, tab index)
-    pub sessions: Vec<(Rect, usize, usize)>,
+    /// (row, (workspace index, tab index))
+    pub sessions: Vec<(Rect, (usize, usize))>,
     pub tabs: Vec<(Rect, usize)>,
     pub new_workspace: Rect,
     pub settings: Rect,
@@ -53,7 +53,7 @@ pub struct Hits {
     pub sidebar_divider: Rect,
     /// The line between the workspaces and sessions sections.
     pub section_divider: Rect,
-    /// Right-click menu rows: (row, index into `MENU_ITEMS`).
+    /// Right-click menu rows: (row, index into `MenuItem::ALL`).
     pub menu_items: Vec<(Rect, usize)>,
     /// Settings form targets; buttons come before the rows they sit in.
     pub form: Vec<(Rect, FormHit)>,
@@ -102,7 +102,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::Settings(form) => {
             let fingerprint = form
                 .target
-                .and_then(|id| app.workspaces.iter().find(|ws| ws.id == id))
+                .and_then(|id| app.workspace(id))
                 .and_then(|ws| ws.tls.as_ref())
                 .map(|tls| tls.fingerprint.as_str());
             cursor = render_settings(buf, area, form, fingerprint, &mut hits);
@@ -262,6 +262,7 @@ fn render_workspaces(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         );
     }
 
+    let target = app.mode.target();
     let mut y = body.y;
     for (index, ws) in app.workspaces.iter().enumerate() {
         if y + 2 > body.bottom() {
@@ -269,15 +270,8 @@ fn render_workspaces(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         }
         let rect = Rect::new(body.x, y, body.width, 2);
         let focused = index == app.active;
-        // The workspace a menu or rename is acting on stands out like a selection.
-        let targeted = match &app.mode {
-            Mode::Menu(menu) => menu.target == Target::Workspace(ws.id),
-            Mode::Rename(form) => form.target == Target::Workspace(ws.id),
-            Mode::Confirm(Confirm::Close(target)) => *target == Target::Workspace(ws.id),
-            Mode::Confirm(Confirm::Restart(form, _)) => form.target == Some(ws.id),
-            _ => false,
-        };
-        if targeted {
+        // The workspace an overlay is acting on stands out like a selection.
+        if target == Some(Target::Workspace(ws.id)) {
             buf.set_style(rect, Style::new().bg(SURFACE0));
         } else if focused {
             buf.set_style(rect, Style::new().bg(ACTIVE_ROW_BG));
@@ -442,7 +436,7 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
                 Style::new().fg(OVERLAY0),
             );
             put(buf, state_x, y + 1, right, state, Style::new().fg(color));
-            hits.sessions.push((rect, ws_index, tab));
+            hits.sessions.push((rect, (ws_index, tab)));
             y += 2;
         }
     }
@@ -503,6 +497,7 @@ fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         start += 1;
     }
 
+    let target = app.mode.target();
     let mut x = area.x;
     for (index, label) in labels.iter().enumerate().skip(start) {
         let desired = widths[index];
@@ -511,16 +506,10 @@ fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             break;
         }
         let s = &ws.sessions[index];
-        // The tab a menu or rename is acting on stands out like a selection.
-        let targeted = match &app.mode {
-            Mode::Menu(menu) => menu.target == Target::Session(s.id),
-            Mode::Rename(form) => form.target == Target::Session(s.id),
-            Mode::Confirm(Confirm::Close(target)) => *target == Target::Session(s.id),
-            _ => false,
-        };
         let style = if index == ws.active_tab {
             Style::new().fg(PANEL_BG).bg(ACCENT)
-        } else if targeted {
+        } else if target == Some(Target::Session(s.id)) {
+            // The tab an overlay is acting on stands out like a selection.
             Style::new()
                 .fg(TEXT)
                 .bg(SURFACE1)
@@ -1013,9 +1002,13 @@ fn render_choice(
 
 /// herdr-style menu: square accent border, opened at the click and kept on screen.
 fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits: &mut Hits) {
-    let label_width = MENU_ITEMS.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
+    let label_width = MenuItem::ALL
+        .iter()
+        .map(|item| item.label().len())
+        .max()
+        .unwrap_or(0) as u16;
     let width = (label_width + 4).max(14).min(area.width);
-    let height = (MENU_ITEMS.len() as u16 + 2).min(area.height);
+    let height = (MenuItem::ALL.len() as u16 + 2).min(area.height);
     let x = menu.x.min(area.right().saturating_sub(width));
     let y = menu.y.min(area.bottom().saturating_sub(height));
     let rect = Rect::new(x, y, width, height);
@@ -1026,7 +1019,7 @@ fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits: &mut Hits
     let inner = block.inner(rect);
     block.render(rect, buf);
 
-    for (index, label) in MENU_ITEMS.iter().enumerate() {
+    for (index, item) in MenuItem::ALL.iter().enumerate() {
         let row_y = inner.y + index as u16;
         if row_y >= inner.bottom() {
             break;
@@ -1041,7 +1034,14 @@ fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits: &mut Hits
             Style::new().fg(TEXT).bg(PANEL_BG)
         };
         buf.set_style(row, style);
-        put(buf, row.x, row.y, row.right(), &format!(" {label}"), style);
+        put(
+            buf,
+            row.x,
+            row.y,
+            row.right(),
+            &format!(" {}", item.label()),
+            style,
+        );
         hits.menu_items.push((row, index));
     }
 }
@@ -1098,7 +1098,7 @@ fn render_confirm(buf: &mut Buffer, area: Rect, app: &App, confirm: &Confirm, hi
         };
         (who, count(ws.open_count(), "open connection"))
     };
-    let workspace = |id: WsId| app.workspaces.iter().find(|w| w.id == id).map(describe);
+    let workspace = |id: WsId| app.workspace(id).map(describe);
     let text = match *confirm {
         Confirm::Close(Target::Workspace(id)) => {
             workspace(id).map(|(who, open)| (" Close workspace?", format!(" {who} has {open}.")))
@@ -1131,18 +1131,13 @@ fn render_confirm(buf: &mut Buffer, area: Rect, app: &App, confirm: &Confirm, hi
             };
             Some((" Quit outpost?", detail))
         }
-        Confirm::Close(Target::Session(id)) => app
-            .workspaces
-            .iter()
-            .flat_map(|ws| &ws.sessions)
-            .find(|s| s.id == id)
-            .map(|s| {
-                let who = match &s.name {
-                    Some(name) => format!("{name} ({})", s.peer),
-                    None => s.peer.to_string(),
-                };
-                (" Close tab?", format!(" {who} is still connected."))
-            }),
+        Confirm::Close(Target::Session(id)) => app.session(id).map(|s| {
+            let who = match &s.name {
+                Some(name) => format!("{name} ({})", s.peer),
+                None => s.peer.to_string(),
+            };
+            (" Close tab?", format!(" {who} is still connected."))
+        }),
     };
     let Some((title, detail)) = text else {
         return;

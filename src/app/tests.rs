@@ -522,6 +522,30 @@ fn clicking_tabs_and_workspace_rows() {
     assert_eq!(app.active, 1);
 }
 
+/// Input arriving in one burst is handled before the next redraw, so a click
+/// can land on a row that an earlier key in the burst removed.
+#[test]
+fn clicks_on_rows_removed_since_the_last_frame_are_ignored() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:5555");
+    let _sessions: Vec<_> = (0..2)
+        .map(|i| app.add_test_session(ws, &format!("10.0.0.{i}:1000")))
+        .collect();
+    prefix(&mut app, 'j');
+    render_rows(&mut app, 120, 32);
+    let (last_row, _) = app.hits.workspaces[1];
+    let (last_session, ..) = app.hits.sessions[1];
+
+    app.close_target(Target::Workspace(ws));
+    click(&mut app, last_row);
+    right_click(&mut app, last_row);
+    click(&mut app, last_session);
+
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.active, 0);
+}
+
 #[test]
 fn clicking_new_and_settings_open_the_form() {
     let (mut app, _rx) = App::test_new();
@@ -580,11 +604,11 @@ fn rename_input(app: &App) -> &str {
 }
 
 /// Right-clicks workspace `index`, renders the menu, and clicks `item`.
-fn menu_pick(app: &mut App, index: usize, item: &str) {
+fn menu_pick(app: &mut App, index: usize, item: MenuItem) {
     let (row, _) = app.hits.workspaces[index];
     right_click(app, row);
     render_rows(app, 120, 32);
-    let pos = MENU_ITEMS.iter().position(|i| *i == item).unwrap();
+    let pos = MenuItem::ALL.iter().position(|&i| i == item).unwrap();
     let (rect, _) = app.hits.menu_items[pos];
     click(app, rect);
 }
@@ -610,7 +634,7 @@ fn right_click_elsewhere_does_nothing() {
 #[test]
 fn rename_from_menu_sets_a_custom_name() {
     let (mut app, _ids) = three_workspaces();
-    menu_pick(&mut app, 1, "Rename");
+    menu_pick(&mut app, 1, MenuItem::Rename);
     assert_eq!(
         rename_input(&app),
         "tcp :5555",
@@ -665,7 +689,7 @@ fn close_from_menu_removes_that_workspace_and_keeps_focus() {
     render_rows(&mut app, 120, 32);
     assert_eq!(app.workspaces[app.active].id, ids[2]);
 
-    menu_pick(&mut app, 0, "Close");
+    menu_pick(&mut app, 0, MenuItem::Close);
     assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Workspace(ids[0])));
     render_rows(&mut app, 120, 32);
     let confirm = app.hits.confirm;
@@ -682,7 +706,7 @@ fn closing_the_focused_workspace_from_the_menu() {
     let (mut app, ids) = three_workspaces();
     prefix(&mut app, 'j');
     render_rows(&mut app, 120, 32);
-    menu_pick(&mut app, 1, "Close");
+    menu_pick(&mut app, 1, MenuItem::Close);
     assert_eq!(app.workspaces.len(), 2);
     assert_eq!(app.workspaces[app.active].id, ids[2]);
 }
@@ -1079,11 +1103,11 @@ fn three_tabs() -> (
 }
 
 /// Right-clicks tab `index`, renders the menu, and clicks `item`.
-fn tab_menu_pick(app: &mut App, index: usize, item: &str) {
+fn tab_menu_pick(app: &mut App, index: usize, item: MenuItem) {
     let (tab, _) = app.hits.tabs[index];
     right_click(app, tab);
     render_rows(app, 120, 32);
-    let pos = MENU_ITEMS.iter().position(|i| *i == item).unwrap();
+    let pos = MenuItem::ALL.iter().position(|&i| i == item).unwrap();
     let (rect, _) = app.hits.menu_items[pos];
     click(app, rect);
 }
@@ -1103,7 +1127,7 @@ fn close_tab_from_menu_disconnects_that_session_and_keeps_focus() {
     prefix(&mut app, '3');
     render_rows(&mut app, 120, 32);
 
-    tab_menu_pick(&mut app, 0, "Close");
+    tab_menu_pick(&mut app, 0, MenuItem::Close);
     assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Session(ids[0])));
     assert_eq!(
         outs[0].try_recv(),
@@ -1127,7 +1151,7 @@ fn closing_the_last_tab_from_the_menu_moves_focus_left() {
     let (mut app, ids, _outs) = three_tabs();
     prefix(&mut app, '3');
     render_rows(&mut app, 120, 32);
-    tab_menu_pick(&mut app, 2, "Close");
+    tab_menu_pick(&mut app, 2, MenuItem::Close);
     key(&mut app, KeyCode::Enter);
     let ws = &app.workspaces[0];
     assert_eq!(ws.sessions.len(), 2);
@@ -1137,7 +1161,7 @@ fn closing_the_last_tab_from_the_menu_moves_focus_left() {
 #[test]
 fn rename_tab_from_menu_sets_a_custom_name() {
     let (mut app, _ids, _outs) = three_tabs();
-    tab_menu_pick(&mut app, 1, "Rename");
+    tab_menu_pick(&mut app, 1, MenuItem::Rename);
     assert_eq!(
         rename_input(&app),
         "10.0.0.2:1000",
@@ -1199,7 +1223,7 @@ fn closing_a_disconnected_tab_skips_confirmation() {
         error: None,
     }));
     render_rows(&mut app, 120, 32);
-    tab_menu_pick(&mut app, 1, "Close");
+    tab_menu_pick(&mut app, 1, MenuItem::Close);
     assert!(matches!(app.mode, Mode::Normal));
     assert_eq!(app.workspaces[0].sessions.len(), 1);
 }
@@ -1209,7 +1233,7 @@ fn cancelling_a_tab_close_keeps_the_connection() {
     let (mut app, ids, mut outs) = three_tabs();
     prefix(&mut app, 'X');
     key(&mut app, KeyCode::Esc);
-    tab_menu_pick(&mut app, 1, "Close");
+    tab_menu_pick(&mut app, 1, MenuItem::Close);
     render_rows(&mut app, 120, 32);
     let cancel = app.hits.cancel;
     click(&mut app, cancel);
