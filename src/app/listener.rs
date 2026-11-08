@@ -1,4 +1,5 @@
-//! Workspaces: one listener each, and the sessions it accepted.
+//! Listeners: one bound socket each, its listening task, and the sessions it
+//! accepted.
 
 use std::net::SocketAddr;
 
@@ -8,13 +9,13 @@ use tokio::task::AbortHandle;
 use super::Session;
 use crate::Event;
 use crate::net::tls::{TlsConfig, TlsServer};
-use crate::net::{self, Protocol, UdpOut, WsId};
+use crate::net::{self, ListenerId, Protocol, UdpOut};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub protocol: Protocol,
     pub addr: SocketAddr,
-    /// Only used by TLS workspaces; the default otherwise.
+    /// Only used by TLS listeners; the default otherwise.
     pub tls: TlsConfig,
 }
 
@@ -24,7 +25,7 @@ pub enum ListenState {
     Failed(String),
 }
 
-/// Drives the sidebar icon/color for both workspaces and sessions.
+/// Drives the sidebar icon/color for both listeners and sessions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Unread,
@@ -46,22 +47,22 @@ impl Status {
     }
 }
 
-pub struct Workspace {
-    pub id: WsId,
+pub struct Listener {
+    pub id: ListenerId,
     /// User-chosen name; `None` shows the endpoint.
     pub name: Option<String>,
     pub config: ListenerConfig,
     pub state: ListenState,
     pub sessions: Vec<Session>,
     pub active_tab: usize,
-    /// The certificate in use, built from `config.tls`. TLS workspaces only.
+    /// The certificate in use, built from `config.tls`. TLS listeners only.
     pub tls: Option<TlsServer>,
-    pub(super) listener: Option<AbortHandle>,
+    pub(super) task: Option<AbortHandle>,
     pub(super) udp_out: Option<UdpOut>,
 }
 
-impl Workspace {
-    /// A workspace that isn't listening yet; [`Workspace::start`] binds it.
+impl Listener {
+    /// A listener that isn't listening yet; [`Listener::start`] binds it.
     pub(super) fn new(config: ListenerConfig, tls: Option<TlsServer>) -> Self {
         Self {
             id: net::next_id(),
@@ -71,7 +72,7 @@ impl Workspace {
             sessions: Vec::new(),
             active_tab: 0,
             tls,
-            listener: None,
+            task: None,
             udp_out: None,
         }
     }
@@ -105,7 +106,7 @@ impl Workspace {
 
     pub(super) fn start(&mut self, events: &UnboundedSender<Event>) {
         self.state = ListenState::Binding;
-        self.listener = Some(net::spawn_listener(
+        self.task = Some(net::spawn_listener(
             self.id,
             self.config.protocol,
             self.config.addr,
@@ -114,7 +115,7 @@ impl Workspace {
         ));
     }
 
-    /// Whether applying `config` stops and restarts the listener.
+    /// Whether applying `config` stops and restarts the listening task.
     pub(super) fn restarts_for(&self, config: &ListenerConfig) -> bool {
         self.config != *config || matches!(self.state, ListenState::Failed(_))
     }
@@ -124,13 +125,13 @@ impl Workspace {
         self.restarts_for(config) && self.sessions_share_socket() && self.open_count() > 0
     }
 
-    /// TCP connections outlive their listener; UDP and QUIC sessions share its socket.
+    /// TCP connections outlive the listening task; UDP and QUIC sessions share its socket.
     fn sessions_share_socket(&self) -> bool {
         matches!(self.config.protocol, Protocol::Udp | Protocol::Quic)
     }
 
     pub(super) fn stop(&mut self) {
-        if let Some(handle) = self.listener.take() {
+        if let Some(handle) = self.task.take() {
             handle.abort();
         }
         self.udp_out = None;
@@ -142,9 +143,9 @@ impl Workspace {
     }
 }
 
-impl Drop for Workspace {
+impl Drop for Listener {
     fn drop(&mut self) {
-        if let Some(handle) = self.listener.take() {
+        if let Some(handle) = self.task.take() {
             handle.abort();
         }
     }

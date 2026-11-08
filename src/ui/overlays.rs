@@ -8,10 +8,10 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use super::{FormHit, Hits, TextTarget, put, render_input};
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Field, MenuItem, RenameForm, SettingsForm, Target,
-    Workspace,
+    App, CertKind, Confirm, ContextMenu, Field, Listener, MenuItem, RenameForm, SettingsForm,
+    Target,
 };
-use crate::net::{Protocol, WsId};
+use crate::net::{ListenerId, Protocol};
 use crate::theme::*;
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -36,7 +36,7 @@ fn overlay_block(title: &str) -> Block<'_> {
         ))
 }
 
-/// `fingerprint` is the running certificate's, shown for TLS workspaces.
+/// `fingerprint` is the running certificate's, shown for TLS listeners.
 pub(super) fn render_settings(
     buf: &mut Buffer,
     area: Rect,
@@ -259,7 +259,7 @@ pub(super) fn render_rename(
     let rect = centered(area, 46, 7);
     Clear.render(rect, buf);
     let block = overlay_block(match form.target {
-        Target::Workspace(_) => "rename listener",
+        Target::Listener(_) => "rename listener",
         Target::Session(_) => "rename tab",
     });
     let inner = block.inner(rect);
@@ -299,19 +299,19 @@ pub(super) fn render_confirm(
 ) {
     let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
     // e.g. `web (tcp :4444)` and `2 open connections`.
-    let describe = |ws: &Workspace| {
-        let who = match &ws.name {
-            Some(name) => format!("{name} ({})", ws.endpoint()),
-            None => ws.endpoint(),
+    let describe = |listener: &Listener| {
+        let who = match &listener.name {
+            Some(name) => format!("{name} ({})", listener.endpoint()),
+            None => listener.endpoint(),
         };
-        (who, count(ws.open_count(), "open connection"))
+        (who, count(listener.open_count(), "open connection"))
     };
-    let workspace = |id: WsId| app.workspace(id).map(describe);
+    let listener = |id: ListenerId| app.listener(id).map(describe);
     let text = match *confirm {
-        Confirm::Close(Target::Workspace(id)) => {
-            workspace(id).map(|(who, open)| (" Close listener?", format!(" {who} has {open}.")))
+        Confirm::Close(Target::Listener(id)) => {
+            listener(id).map(|(who, open)| (" Close listener?", format!(" {who} has {open}.")))
         }
-        Confirm::Restart(ref form, _) => form.target.and_then(workspace).map(|(who, open)| {
+        Confirm::Restart(ref form, _) => form.target.and_then(listener).map(|(who, open)| {
             (
                 " Apply settings?",
                 format!(" Restarting {who} drops its {open}."),
@@ -319,17 +319,17 @@ pub(super) fn render_confirm(
         }),
         Confirm::Quit => {
             let live: Vec<_> = app
-                .workspaces
+                .listeners
                 .iter()
-                .filter(|w| w.open_count() > 0)
+                .filter(|listener| listener.open_count() > 0)
                 .collect();
             let detail = match live[..] {
-                [ws] => {
-                    let (who, open) = describe(ws);
+                [listener] => {
+                    let (who, open) = describe(listener);
                     format!(" {who} has {open}.")
                 }
                 _ => {
-                    let open = live.iter().map(|w| w.open_count()).sum();
+                    let open = live.iter().map(|listener| listener.open_count()).sum();
                     format!(
                         " {} across {}.",
                         count(open, "open connection"),

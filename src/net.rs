@@ -23,7 +23,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a hang-up waits to tell the peer (TLS close_notify) before dropping.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub type WsId = u64;
+pub type ListenerId = u64;
 pub type SessId = u64;
 pub type UdpOut = UnboundedSender<(SocketAddr, Vec<u8>)>;
 
@@ -94,16 +94,16 @@ impl Outlet {
 pub enum NetEvent {
     /// Listener bound. UDP listeners hand back the channel used to send datagrams.
     Listening {
-        ws: WsId,
+        listener: ListenerId,
         local: SocketAddr,
         udp: Option<UdpOut>,
     },
     ListenFailed {
-        ws: WsId,
+        listener: ListenerId,
         error: String,
     },
     Accepted {
-        ws: WsId,
+        listener: ListenerId,
         sess: SessId,
         peer: SocketAddr,
         outlet: Outlet,
@@ -134,7 +134,7 @@ pub enum NetEvent {
     },
     /// UDP has no connections; the app maps peers to sessions.
     Datagram {
-        ws: WsId,
+        listener: ListenerId,
         peer: SocketAddr,
         bytes: Vec<u8>,
     },
@@ -142,28 +142,28 @@ pub enum NetEvent {
 
 /// `tls` is the server config for TLS and QUIC, and is ignored otherwise.
 pub fn spawn_listener(
-    ws: WsId,
+    id: ListenerId,
     protocol: Protocol,
     addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
     events: UnboundedSender<Event>,
 ) -> AbortHandle {
     match protocol {
-        Protocol::Tcp => tokio::spawn(tcp_listener(ws, addr, None, events)).abort_handle(),
-        Protocol::Udp => tokio::spawn(udp_listener(ws, addr, events)).abort_handle(),
+        Protocol::Tcp => tokio::spawn(tcp_listener(id, addr, None, events)).abort_handle(),
+        Protocol::Udp => tokio::spawn(udp_listener(id, addr, events)).abort_handle(),
         Protocol::Tls | Protocol::Quic => match tls {
             Some(config) if protocol == Protocol::Quic => {
-                tokio::spawn(quic::listener(ws, addr, config, events)).abort_handle()
+                tokio::spawn(quic::listener(id, addr, config, events)).abort_handle()
             }
             Some(config) => {
                 let acceptor = TlsAcceptor::from(config);
-                tokio::spawn(tcp_listener(ws, addr, Some(acceptor), events)).abort_handle()
+                tokio::spawn(tcp_listener(id, addr, Some(acceptor), events)).abort_handle()
             }
             None => tokio::spawn(async move {
                 emit(
                     &events,
                     NetEvent::ListenFailed {
-                        ws,
+                        listener: id,
                         error: "no TLS certificate".into(),
                     },
                 );
@@ -179,7 +179,7 @@ fn emit(events: &UnboundedSender<Event>, ev: NetEvent) -> bool {
 
 /// Accepts TCP connections, running a TLS handshake on each when `tls` is set.
 async fn tcp_listener(
-    ws: WsId,
+    id: ListenerId,
     addr: SocketAddr,
     tls: Option<TlsAcceptor>,
     events: UnboundedSender<Event>,
@@ -190,7 +190,7 @@ async fn tcp_listener(
             emit(
                 &events,
                 NetEvent::ListenFailed {
-                    ws,
+                    listener: id,
                     error: e.to_string(),
                 },
             );
@@ -201,7 +201,7 @@ async fn tcp_listener(
     emit(
         &events,
         NetEvent::Listening {
-            ws,
+            listener: id,
             local,
             udp: None,
         },
@@ -216,7 +216,7 @@ async fn tcp_listener(
                 if !emit(
                     &events,
                     NetEvent::Accepted {
-                        ws,
+                        listener: id,
                         sess,
                         peer,
                         outlet,
@@ -306,14 +306,14 @@ async fn stream_session<S: AsyncRead + AsyncWrite + Unpin>(
     emit(&events, NetEvent::Closed { sess, error });
 }
 
-async fn udp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>) {
+async fn udp_listener(id: ListenerId, addr: SocketAddr, events: UnboundedSender<Event>) {
     let socket = match UdpSocket::bind(addr).await {
         Ok(socket) => socket,
         Err(e) => {
             emit(
                 &events,
                 NetEvent::ListenFailed {
-                    ws,
+                    listener: id,
                     error: e.to_string(),
                 },
             );
@@ -325,7 +325,7 @@ async fn udp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
     emit(
         &events,
         NetEvent::Listening {
-            ws,
+            listener: id,
             local,
             udp: Some(tx),
         },
@@ -336,7 +336,7 @@ async fn udp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
         tokio::select! {
             // Errors (e.g. ICMP port unreachable from an earlier send) aren't fatal for the socket.
             recv = socket.recv_from(&mut buf) => if let Ok((n, peer)) = recv
-                && !emit(&events, NetEvent::Datagram { ws, peer, bytes: buf[..n].to_vec() })
+                && !emit(&events, NetEvent::Datagram { listener: id, peer, bytes: buf[..n].to_vec() })
             {
                 return;
             },
@@ -388,7 +388,12 @@ mod tests {
     ) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = spawn_listener(1, protocol, "127.0.0.1:0".parse().unwrap(), None, tx);
-        let NetEvent::Listening { ws: 1, local, udp } = next(&mut rx).await else {
+        let NetEvent::Listening {
+            listener: 1,
+            local,
+            udp,
+        } = next(&mut rx).await
+        else {
             panic!("expected Listening");
         };
         (rx, local, udp, handle)
@@ -401,7 +406,7 @@ mod tests {
 
         let mut client = TcpStream::connect(local).await.unwrap();
         let NetEvent::Accepted {
-            ws: 1,
+            listener: 1,
             sess,
             peer,
             outlet,
@@ -460,7 +465,7 @@ mod tests {
         let addr = taken.local_addr().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         spawn_listener(7, Protocol::Tcp, addr, None, tx);
-        let NetEvent::ListenFailed { ws: 7, error } = next(&mut rx).await else {
+        let NetEvent::ListenFailed { listener: 7, error } = next(&mut rx).await else {
             panic!("expected ListenFailed");
         };
         assert!(!error.is_empty());
@@ -473,7 +478,12 @@ mod tests {
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.send_to(b"ping", local).await.unwrap();
-        let NetEvent::Datagram { ws: 1, peer, bytes } = next(&mut rx).await else {
+        let NetEvent::Datagram {
+            listener: 1,
+            peer,
+            bytes,
+        } = next(&mut rx).await
+        else {
             panic!("expected Datagram");
         };
         assert_eq!(peer, client.local_addr().unwrap());
@@ -564,7 +574,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let addr = "127.0.0.1:0".parse().unwrap();
         spawn_listener(1, Protocol::Tls, addr, Some(server.config.clone()), tx);
-        let NetEvent::Listening { ws: 1, local, .. } = next(&mut rx).await else {
+        let NetEvent::Listening {
+            listener: 1, local, ..
+        } = next(&mut rx).await
+        else {
             panic!("expected Listening");
         };
         (rx, local, server)
@@ -648,7 +661,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let addr = "127.0.0.1:0".parse().unwrap();
         let handle = spawn_listener(1, Protocol::Quic, addr, Some(server.config), tx);
-        let NetEvent::Listening { ws: 1, local, .. } = next(&mut rx).await else {
+        let NetEvent::Listening {
+            listener: 1, local, ..
+        } = next(&mut rx).await
+        else {
             panic!("expected Listening");
         };
         (rx, local, handle)

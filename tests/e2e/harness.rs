@@ -186,15 +186,15 @@ impl Outpost {
         self.click(at);
     }
 
-    /// Creates a workspace on 127.0.0.1 with an OS-picked port, and returns
+    /// Creates a listener on 127.0.0.1 with an OS-picked port, and returns
     /// that port once it is listening. `choose` picks the protocol from tcp
     /// with arrow keys; `alpn` fills the TLS/QUIC row.
-    pub async fn new_workspace(&mut self, label: &str, choose: &str, alpn: Option<&str>) -> u16 {
+    pub async fn new_listener(&mut self, label: &str, choose: &str, alpn: Option<&str>) -> u16 {
         self.prefix("N");
         self.fill_form(label, choose, alpn).await
     }
 
-    /// [`Outpost::new_workspace`] once the form is opened some other way.
+    /// [`Outpost::new_listener`] once the form is opened some other way.
     pub async fn fill_form(&mut self, label: &str, choose: &str, alpn: Option<&str>) -> u16 {
         self.wait_for("protocol").await;
         // The form opens on the port.
@@ -214,7 +214,7 @@ impl Outpost {
         self.listening_port(label).await
     }
 
-    /// The port shown for the workspace `label`, once it is bound.
+    /// The port shown for the listener `label`, once it is bound.
     pub async fn listening_port(&self, label: &str) -> u16 {
         let prefix = format!("{label} :");
         self.wait_until(&format!("{label} to listen"), |s| {

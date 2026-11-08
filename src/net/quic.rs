@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 use tokio_rustls::rustls::ServerConfig;
 
-use super::{HANDSHAKE_TIMEOUT, NetEvent, Outlet, SessId, WsId, emit, next_id};
+use super::{HANDSHAKE_TIMEOUT, ListenerId, NetEvent, Outlet, SessId, emit, next_id};
 use crate::Event;
 
 /// Keeps a quiet connection open while the user types a reply.
@@ -53,7 +53,7 @@ pub enum StreamEnd {
 }
 
 pub async fn listener(
-    ws: WsId,
+    id: ListenerId,
     addr: SocketAddr,
     tls: Arc<ServerConfig>,
     events: UnboundedSender<Event>,
@@ -61,18 +61,24 @@ pub async fn listener(
     let endpoint = match bind(addr, tls) {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            emit(&events, NetEvent::ListenFailed { ws, error });
+            emit(
+                &events,
+                NetEvent::ListenFailed {
+                    listener: id,
+                    error,
+                },
+            );
             return;
         }
     };
-    // Stopping a workspace aborts this task. Closing here frees the port and
+    // Stopping a listener aborts this task. Closing here frees the port and
     // ends its connections, which share the socket.
     let _close = CloseOnDrop(endpoint.clone());
     let local = endpoint.local_addr().unwrap_or(addr);
     emit(
         &events,
         NetEvent::Listening {
-            ws,
+            listener: id,
             local,
             udp: None,
         },
@@ -82,7 +88,7 @@ pub async fn listener(
         let sess = next_id();
         let (tx, rx) = mpsc::unbounded_channel();
         let accepted = NetEvent::Accepted {
-            ws,
+            listener: id,
             sess,
             peer: incoming.remote_address(),
             outlet: Outlet::Quic(tx),

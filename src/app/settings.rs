@@ -1,19 +1,19 @@
-//! The settings form, for new workspaces and existing ones.
+//! The settings form, for new listeners and existing ones.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use super::{ListenerConfig, Workspace, wrap};
+use super::{Listener, ListenerConfig, wrap};
 use crate::net::tls::{self, CertSource, TlsConfig, TlsServer};
-use crate::net::{Protocol, WsId};
+use crate::net::{ListenerId, Protocol};
 use crate::text_input::TextInput;
 use crate::ui::TextTarget;
 
 const DEFAULT_PORT: u16 = 4444;
 
 pub struct SettingsForm {
-    /// `None` creates a new workspace.
-    pub target: Option<WsId>,
+    /// `None` creates a new listener.
+    pub target: Option<ListenerId>,
     pub protocol: Protocol,
     pub address: TextInput,
     pub port: TextInput,
@@ -65,7 +65,7 @@ impl Field {
     }
 }
 
-/// Where a TLS workspace's certificate comes from, as chosen in the form.
+/// Where a TLS listener's certificate comes from, as chosen in the form.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CertKind {
     SelfSigned,
@@ -97,10 +97,13 @@ pub struct Applied {
 }
 
 impl SettingsForm {
-    /// A form for a new workspace, suggesting the next port none of `workspaces` uses.
-    pub(super) fn new(workspaces: &[Workspace]) -> Self {
+    /// A form for a new listener, suggesting the next port none of `listeners` uses.
+    pub(super) fn new(listeners: &[Listener]) -> Self {
         let mut port = DEFAULT_PORT;
-        while workspaces.iter().any(|ws| ws.config.addr.port() == port) {
+        while listeners
+            .iter()
+            .any(|listener| listener.config.addr.port() == port)
+        {
             port = port.wrapping_add(1);
         }
         Self {
@@ -117,9 +120,9 @@ impl SettingsForm {
         }
     }
 
-    /// A form showing `ws`'s current settings.
-    pub(super) fn edit(ws: &Workspace) -> Self {
-        let (cert, cert_file, key_file) = match &ws.config.tls.cert {
+    /// A form showing `listener`'s current settings.
+    pub(super) fn edit(listener: &Listener) -> Self {
+        let (cert, cert_file, key_file) = match &listener.config.tls.cert {
             CertSource::SelfSigned => (CertKind::SelfSigned, String::new(), String::new()),
             CertSource::Files { cert, key } => (
                 CertKind::Files,
@@ -128,22 +131,22 @@ impl SettingsForm {
             ),
         };
         Self {
-            target: Some(ws.id),
-            protocol: ws.config.protocol,
-            address: ws.config.addr.ip().to_string().into(),
-            port: ws.config.addr.port().to_string().into(),
+            target: Some(listener.id),
+            protocol: listener.config.protocol,
+            address: listener.config.addr.ip().to_string().into(),
+            port: listener.config.addr.port().to_string().into(),
             cert,
             cert_file: cert_file.into(),
             key_file: key_file.into(),
-            alpn: ws.config.tls.alpn.join(", ").into(),
+            alpn: listener.config.tls.alpn.join(", ").into(),
             field: Field::Protocol,
             error: None,
         }
     }
 
-    /// Validates the form against the other `workspaces` and builds its
+    /// Validates the form against the other `listeners` and builds its
     /// certificate, without changing anything.
-    pub(super) fn check(&self, workspaces: &[Workspace]) -> Result<Applied, String> {
+    pub(super) fn check(&self, listeners: &[Listener]) -> Result<Applied, String> {
         let ip: IpAddr = self
             .address
             .as_str()
@@ -168,19 +171,24 @@ impl SettingsForm {
         if config.protocol == Protocol::Quic && config.tls.alpn.is_empty() {
             return Err("quic needs an alpn protocol, e.g. h3".into());
         }
-        if workspaces.iter().any(|ws| {
-            Some(ws.id) != self.target
-                && ws.config.protocol == config.protocol
-                && ws.config.addr == config.addr
+        if listeners.iter().any(|listener| {
+            Some(listener.id) != self.target
+                && listener.config.protocol == config.protocol
+                && listener.config.addr == config.addr
         }) {
             return Err("a listener already uses that address".into());
         }
         // Keep the certificate while its settings are unchanged, so a
         // self-signed fingerprint survives edits to the address or port.
-        let tls = match workspaces.iter().find(|ws| Some(ws.id) == self.target) {
+        let tls = match listeners
+            .iter()
+            .find(|listener| Some(listener.id) == self.target)
+        {
             _ if !config.protocol.uses_tls() => None,
-            Some(ws) if ws.config.protocol.uses_tls() && ws.config.tls == config.tls => {
-                match &ws.tls {
+            Some(listener)
+                if listener.config.protocol.uses_tls() && listener.config.tls == config.tls =>
+            {
+                match &listener.tls {
                     Some(tls) => Some(tls.clone()),
                     None => Some(tls::build(&config.tls)?),
                 }

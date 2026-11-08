@@ -8,7 +8,7 @@ goal is a TUI that feels almost identical to herdr.
 ## Vocabulary
 
 - **Listener**: one socket bound to `IP:PORT`: TCP, UDP, TLS, or QUIC
-  (herdr: workspace). The code still calls it `Workspace`.
+  (herdr: workspace).
 - **Session**: one connection to a listener. For UDP, each distinct peer
   address is a session. Each session is shown as a **tab** (herdr: agent / tab).
 - **Stream**: QUIC only. One session carries many; its transcript tags lines
@@ -47,9 +47,9 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
   `QuicOut::Write` to a new ID opens that stream.
 - `src/app.rs`: `App` and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
-  `Target` names what a menu, rename, or close acts on (workspace or tab).
-  - `app/workspace.rs`: `Workspace` (one listener and its sessions) and
-    starting/stopping its listener task.
+  `Target` names what a menu, rename, or close acts on (listener or tab).
+  - `app/listener.rs`: `Listener` (one bound socket and its sessions) and
+    starting/stopping its listening task.
   - `app/session.rs`: `Session` (transcript, input line, byte counts) and a
     QUIC session's `Streams`.
   - `app/settings.rs`: `SettingsForm`: building it, editing rules per field,
@@ -103,7 +103,7 @@ Follow herdr's approach: tests live next to the code, and behavior is tested
 in-process without spawning the binary.
 
 - **Behavior** (`src/app/tests.rs`): build state with `App::test_new()`,
-  `add_test_workspace()`, `add_test_session()` (no real sockets; the returned
+  `add_test_listener()`, `add_test_session()` (no real sockets; the returned
   receiver shows what the app sent to the peer). Drive it with the `key`,
   `type_str`, `prefix`, `click`, `right_click`, and `data` helpers.
 - **Rendering** (`src/ui/tests.rs`): `render_rows(app, 120, 32)` draws to
@@ -115,7 +115,7 @@ in-process without spawning the binary.
   delivers input (mouse buttons, drags, escape sequences) or on real
   listeners: add a case to `tests/e2e/main.rs`. `Outpost::start()` runs the
   binary in a 120×32 pty and reads its screen through `vt100`; drive it with
-  `keys`, `prefix`, `click`, `right_click`, `drag`, and `new_workspace`. Check
+  `keys`, `prefix`, `click`, `right_click`, `drag`, and `new_listener`. Check
   the network side too (what a client receives, whether a port is bound);
   `clients.rs` has TLS and QUIC clients. Before each step, wait for what it
   acts on (`wait_for`, `wait_until`, `eventually`), never sleep: keys sent

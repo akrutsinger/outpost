@@ -1,4 +1,4 @@
-//! Rendering, laid out after herdr: sidebar (workspaces over sessions), tab bar, pane.
+//! Rendering, laid out after herdr: sidebar (listeners over sessions), tab bar, pane.
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -43,16 +43,16 @@ pub enum TextTarget {
 /// Clickable regions from the last frame.
 #[derive(Default)]
 pub struct Hits {
-    pub workspaces: Vec<(Rect, usize)>,
-    /// (row, (workspace index, tab index))
+    pub listeners: Vec<(Rect, usize)>,
+    /// (row, (listener index, tab index))
     pub sessions: Vec<(Rect, (usize, usize))>,
     pub tabs: Vec<(Rect, usize)>,
-    pub new_workspace: Rect,
+    pub new_listener: Rect,
     pub settings: Rect,
     pub pane: Rect,
     /// The sidebar's vertical separator (full sidebar height).
     pub sidebar_divider: Rect,
-    /// The line between the workspaces and sessions sections.
+    /// The line between the listeners and sessions sections.
     pub section_divider: Rect,
     /// Right-click menu rows: (row, index into `MenuItem::ALL`).
     pub menu_items: Vec<(Rect, usize)>,
@@ -103,8 +103,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::Settings(form) => {
             let fingerprint = form
                 .target
-                .and_then(|id| app.workspace(id))
-                .and_then(|ws| ws.tls.as_ref())
+                .and_then(|id| app.listener(id))
+                .and_then(|listener| listener.tls.as_ref())
                 .map(|tls| tls.fingerprint.as_str());
             cursor = render_settings(buf, area, form, fingerprint, &mut hits);
         }

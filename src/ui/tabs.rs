@@ -22,11 +22,15 @@ fn tab_label(s: &Session) -> String {
 
 pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     buf.set_style(area, Style::new().bg(PANEL_BG));
-    let Some(ws) = app.workspaces.get(app.active) else {
+    let Some(listener) = app.listeners.get(app.active) else {
         return;
     };
 
-    let status = format!("{} {}", ws.config.protocol.label(), ws.config.addr);
+    let status = format!(
+        "{} {}",
+        listener.config.protocol.label(),
+        listener.config.addr
+    );
     let status_width = status.chars().count() as u16;
     let mut tabs_right = area.right();
     if area.width >= status_width + 1 + MIN_TAB_WIDTH * 2 {
@@ -40,7 +44,7 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         tabs_right = area.right() - status_width - 1;
     }
 
-    let labels: Vec<String> = ws.sessions.iter().map(tab_label).collect();
+    let labels: Vec<String> = listener.sessions.iter().map(tab_label).collect();
     let widths: Vec<u16> = labels
         .iter()
         .map(|label| (label.chars().count() as u16 + 4).max(MIN_TAB_WIDTH))
@@ -51,7 +55,7 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         widths[from..=to].iter().sum::<u16>() + (to - from) as u16
     };
     let mut start = 0;
-    while start < ws.active_tab && span(start, ws.active_tab) > available {
+    while start < listener.active_tab && span(start, listener.active_tab) > available {
         start += 1;
     }
 
@@ -63,8 +67,8 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         if width == 0 {
             break;
         }
-        let s = &ws.sessions[index];
-        let style = if index == ws.active_tab {
+        let s = &listener.sessions[index];
+        let style = if index == listener.active_tab {
             Style::new().fg(PANEL_BG).bg(ACCENT)
         } else if target == Some(Target::Session(s.id)) {
             // The tab an overlay is acting on stands out like a selection.
@@ -135,7 +139,7 @@ pub(super) fn render_pane(
     if area.width < 4 || area.height < 3 {
         return None;
     }
-    let Some(ws) = app.workspaces.get_mut(app.active) else {
+    let Some(listener) = app.listeners.get_mut(app.active) else {
         render_empty(
             buf,
             area,
@@ -146,9 +150,13 @@ pub(super) fn render_pane(
         );
         return None;
     };
-    let listen = format!("{} {}", ws.config.protocol.label(), ws.config.addr);
-    let Some(s) = ws.sessions.get_mut(ws.active_tab) else {
-        let lines = match &ws.state {
+    let listen = format!(
+        "{} {}",
+        listener.config.protocol.label(),
+        listener.config.addr
+    );
+    let Some(s) = listener.sessions.get_mut(listener.active_tab) else {
+        let lines = match &listener.state {
             ListenState::Listening => vec![
                 format!("listening on {listen}"),
                 "waiting for connections…".into(),

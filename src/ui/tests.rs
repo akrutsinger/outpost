@@ -30,9 +30,9 @@ fn empty_app_explains_how_to_start() {
 }
 
 #[test]
-fn listening_workspace_without_sessions_says_waiting() {
+fn listener_without_sessions_says_waiting() {
     let (mut app, _rx) = App::test_new();
-    app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     let rows = render_rows(&mut app, W, H);
     assert!(row_with(&rows, "1 tcp :4444").contains('○'));
     assert!(row_with(&rows, "0.0.0.0 · 0 open").starts_with("   0.0.0.0"));
@@ -43,8 +43,8 @@ fn listening_workspace_without_sessions_says_waiting() {
 #[test]
 fn session_shows_in_sidebar_tab_bar_and_pane() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (sess, _out) = app.add_test_session(listener, "10.0.0.5:51234");
     app.handle(Event::Net(NetEvent::Data {
         sess,
         bytes: b"hello there\n".to_vec(),
@@ -69,8 +69,8 @@ fn session_shows_in_sidebar_tab_bar_and_pane() {
 #[test]
 fn full_ipv4_peer_is_not_truncated_in_sidebar() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.add_test_session(ws, "255.255.255.255:65535");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.add_test_session(listener, "255.255.255.255:65535");
     let rows = render_rows(&mut app, W, H);
     let sidebar: Vec<String> = rows
         .iter()
@@ -86,9 +86,9 @@ fn full_ipv4_peer_is_not_truncated_in_sidebar() {
 #[test]
 fn failed_listener_shows_error_in_sidebar_and_pane() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.handle(Event::Net(NetEvent::ListenFailed {
-        ws,
+        listener,
         error: "Address already in use (os error 98)".into(),
     }));
     let rows = render_rows(&mut app, W, H);
@@ -100,8 +100,8 @@ fn failed_listener_shows_error_in_sidebar_and_pane() {
 #[test]
 fn closed_session_replaces_input_with_hint() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (sess, _out) = app.add_test_session(listener, "10.0.0.5:51234");
     app.handle(Event::Net(NetEvent::Closed { sess, error: None }));
     let rows = render_rows(&mut app, W, H);
     assert!(rows[1].contains(" closed · "));
@@ -150,16 +150,16 @@ fn settings_modal_fits_its_hint_line() {
 fn tls_settings_show_every_row_and_the_fingerprint() {
     use crate::net::tls::{self, CertSource, TlsConfig};
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tls, "0.0.0.0:8443");
+    let listener = app.add_test_listener(Protocol::Tls, "0.0.0.0:8443");
     let server = tls::build(&TlsConfig::default()).unwrap();
     let fingerprint = server.fingerprint.clone();
-    app.workspaces[0].tls = Some(server);
-    app.workspaces[0].config.tls.cert = CertSource::Files {
+    app.listeners[0].tls = Some(server);
+    app.listeners[0].config.tls.cert = CertSource::Files {
         cert: "/etc/outpost/server.pem".into(),
         key: "/etc/outpost/server.key".into(),
     };
     app.mode = Mode::Settings(SettingsForm {
-        target: Some(ws),
+        target: Some(listener),
         protocol: Protocol::Tls,
         address: "255.255.255.255".into(),
         port: "65535".into(),
@@ -195,8 +195,8 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
 #[test]
 fn quic_tab_tags_streams_and_shows_the_send_stream() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
-    let (sess, _out) = app.add_test_quic_session(ws, "255.255.255.255:65535");
+    let listener = app.add_test_listener(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, _out) = app.add_test_quic_session(listener, "255.255.255.255:65535");
     let data = |app: &mut App, stream, bytes: &[u8]| {
         app.handle(Event::Net(NetEvent::StreamData {
             sess,
@@ -219,7 +219,7 @@ fn quic_tab_tags_streams_and_shows_the_send_stream() {
     row_with(&rows, "│[s4] GET /other");
     row_with(&rows, "❯  s4  ");
     row_with(&rows, "── connected from 255.255.255.255:65535");
-    // The session row keeps its byte count; the workspace label gives way.
+    // The session row keeps its byte count; the listener label gives way.
     row_with(&rows, "   quic :44… · ↓29B open ");
 
     app.handle(Event::Input(ratatui::crossterm::event::Event::Key(
@@ -261,8 +261,8 @@ fn quic_form_asks_for_alpn_and_help_lists_stream_keys() {
 #[test]
 fn transcript_follows_tail_and_scrolls_back() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (sess, _out) = app.add_test_session(listener, "10.0.0.5:51234");
     let bytes: String = (0..100).map(|i| format!("line {i:03}\n")).collect();
     app.handle(Event::Net(NetEvent::Data {
         sess,
@@ -273,20 +273,20 @@ fn transcript_follows_tail_and_scrolls_back() {
     assert!(text.contains("line 099"));
     assert!(!text.contains("line 000"));
 
-    app.workspaces[0].sessions[0].scroll = 1_000;
+    app.listeners[0].sessions[0].scroll = 1_000;
     let text = render_rows(&mut app, W, H).join("\n");
     assert!(text.contains("line 000"), "scrolled to the top");
     assert!(!text.contains("line 099"));
     assert!(text.contains("more "), "scroll indicator shown");
     // Overscroll is clamped to the top of the transcript.
-    assert!(app.workspaces[0].sessions[0].scroll < 1_000);
+    assert!(app.listeners[0].sessions[0].scroll < 1_000);
 }
 
 #[test]
-fn renamed_workspace_shows_name_and_endpoint() {
+fn renamed_listener_shows_name_and_endpoint() {
     let (mut app, _rx) = App::test_new();
-    app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.workspaces[0].name = Some("web".into());
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.listeners[0].name = Some("web".into());
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, " 1 web ○");
     row_with(&rows, "   tcp :4444 · 0 open");
@@ -295,9 +295,9 @@ fn renamed_workspace_shows_name_and_endpoint() {
 #[test]
 fn context_menu_opens_at_the_click_and_stays_on_screen() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.mode = Mode::Menu(ContextMenu {
-        target: Target::Workspace(ws),
+        target: Target::Listener(listener),
         x: 3,
         y: 2,
         highlighted: 0,
@@ -314,7 +314,7 @@ fn context_menu_opens_at_the_click_and_stays_on_screen() {
 
     // Near the bottom-right corner it shifts up and left to fit.
     app.mode = Mode::Menu(ContextMenu {
-        target: Target::Workspace(ws),
+        target: Target::Listener(listener),
         x: W - 1,
         y: H - 1,
         highlighted: 1,
@@ -331,9 +331,9 @@ fn context_menu_opens_at_the_click_and_stays_on_screen() {
 #[test]
 fn rename_overlay_shows_the_input() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.mode = Mode::Rename(RenameForm {
-        target: Target::Workspace(ws),
+        target: Target::Listener(listener),
         input: "web".into(),
     });
     let rows = render_rows(&mut app, W, H);
@@ -343,13 +343,13 @@ fn rename_overlay_shows_the_input() {
 }
 
 #[test]
-fn confirm_close_names_the_workspace_and_its_connections() {
+fn confirm_close_names_the_listener_and_its_connections() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.workspaces[0].name = Some("web".into());
-    let _a = app.add_test_session(ws, "10.0.0.5:1000");
-    let _b = app.add_test_session(ws, "10.0.0.6:1000");
-    app.mode = Mode::Confirm(Confirm::Close(Target::Workspace(ws)));
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.listeners[0].name = Some("web".into());
+    let _a = app.add_test_session(listener, "10.0.0.5:1000");
+    let _b = app.add_test_session(listener, "10.0.0.6:1000");
+    app.mode = Mode::Confirm(Confirm::Close(Target::Listener(listener)));
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Close listener?");
     row_with(&rows, " web (tcp :4444) has 2 open connections.");
@@ -360,16 +360,16 @@ fn confirm_close_names_the_workspace_and_its_connections() {
 #[test]
 fn long_input_scrolls_to_keep_the_cursor_visible() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.add_test_session(ws, "10.0.0.5:51234");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.add_test_session(listener, "10.0.0.5:51234");
     let text: String = ('a'..='z').cycle().take(200).collect();
-    app.workspaces[0].sessions[0].input = text.as_str().into();
+    app.listeners[0].sessions[0].input = text.as_str().into();
     let rows = render_rows(&mut app, W, H);
     // The end is visible while typing at the end...
     assert!(row_with(&rows, "❯ ").contains(&text[190..]));
 
     // ...and the start once the cursor moves home.
-    app.workspaces[0].sessions[0].input.set_cursor(0);
+    app.listeners[0].sessions[0].input.set_cursor(0);
     let rows = render_rows(&mut app, W, H);
     assert!(row_with(&rows, "❯ ").contains("❯ abcdefgh"));
 }
@@ -377,9 +377,9 @@ fn long_input_scrolls_to_keep_the_cursor_visible() {
 #[test]
 fn renamed_tab_shows_its_name_everywhere() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.add_test_session(ws, "10.0.0.5:51234");
-    app.workspaces[0].sessions[0].name = Some("db".into());
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.add_test_session(listener, "10.0.0.5:51234");
+    app.listeners[0].sessions[0].name = Some("db".into());
     let rows = render_rows(&mut app, W, H);
     assert!(rows[0].contains(" db "), "tab bar: {:?}", rows[0]);
     assert!(
@@ -395,8 +395,8 @@ fn renamed_tab_shows_its_name_everywhere() {
 #[test]
 fn rename_overlay_title_matches_its_target() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    let (sess, _out) = app.add_test_session(ws, "10.0.0.5:51234");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (sess, _out) = app.add_test_session(listener, "10.0.0.5:51234");
     app.mode = Mode::Rename(RenameForm {
         target: Target::Session(sess),
         input: "db".into(),
@@ -408,9 +408,9 @@ fn rename_overlay_title_matches_its_target() {
 #[test]
 fn confirm_close_for_a_tab_names_the_peer() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    let (sess, _out) = app.add_test_session(ws, "255.255.255.255:65535");
-    app.workspaces[0].sessions[0].name = Some("db".into());
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (sess, _out) = app.add_test_session(listener, "255.255.255.255:65535");
+    app.listeners[0].sessions[0].name = Some("db".into());
     app.mode = Mode::Confirm(Confirm::Close(Target::Session(sess)));
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Close tab?");
@@ -419,21 +419,21 @@ fn confirm_close_for_a_tab_names_the_peer() {
 }
 
 #[test]
-fn confirm_quit_names_one_workspace_or_counts_several() {
+fn confirm_quit_names_one_listener_or_counts_several() {
     let (mut app, _rx) = App::test_new();
-    let web = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.workspaces[0].name = Some("web".into());
+    let web = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.listeners[0].name = Some("web".into());
     let _a = app.add_test_session(web, "10.0.0.5:1000");
     let _b = app.add_test_session(web, "10.0.0.6:1000");
-    // A workspace with nothing open doesn't count.
-    app.add_test_workspace(Protocol::Tcp, "0.0.0.0:5555");
+    // A listener with nothing open doesn't count.
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:5555");
     app.mode = Mode::Confirm(Confirm::Quit);
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Quit outpost?");
     row_with(&rows, " web (tcp :4444) has 2 open connections.");
     row_with(&rows, "↵ confirm");
 
-    let dns = app.add_test_workspace(Protocol::Udp, "0.0.0.0:5353");
+    let dns = app.add_test_listener(Protocol::Udp, "0.0.0.0:5353");
     let _c = app.add_test_session(dns, "10.0.0.7:1000");
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, " 3 open connections across 2 listeners.");
@@ -442,12 +442,12 @@ fn confirm_quit_names_one_workspace_or_counts_several() {
 #[test]
 fn confirm_restart_says_what_applying_drops() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Udp, "0.0.0.0:5555");
-    app.workspaces[0].name = Some("web".into());
-    let _a = app.add_test_session(ws, "10.0.0.5:1000");
-    let _b = app.add_test_session(ws, "10.0.0.6:1000");
+    let listener = app.add_test_listener(Protocol::Udp, "0.0.0.0:5555");
+    app.listeners[0].name = Some("web".into());
+    let _a = app.add_test_session(listener, "10.0.0.5:1000");
+    let _b = app.add_test_session(listener, "10.0.0.6:1000");
     app.mode = Mode::Settings(SettingsForm {
-        target: Some(ws),
+        target: Some(listener),
         protocol: Protocol::Udp,
         address: "0.0.0.0".into(),
         port: "5556".into(),
@@ -473,8 +473,8 @@ fn confirm_restart_says_what_applying_drops() {
 #[test]
 fn sidebar_follows_its_width_and_split() {
     let (mut app, _rx) = App::test_new();
-    let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
-    app.add_test_session(ws, "10.0.0.5:51234");
+    let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.add_test_session(listener, "10.0.0.5:51234");
     app.sidebar_width = 34;
     app.sidebar_split = 0.75;
     let rows = render_rows(&mut app, W, H);

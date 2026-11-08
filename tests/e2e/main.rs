@@ -40,7 +40,7 @@ fn udp_port_bound(port: u16) -> bool {
 #[tokio::test]
 async fn tcp_round_trip_from_the_keyboard() {
     let mut app = Outpost::start();
-    let port = app.new_workspace("tcp", "", None).await;
+    let port = app.new_listener("tcp", "", None).await;
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     client.write_all(b"hello from client\n").await.unwrap();
@@ -114,7 +114,7 @@ async fn mouse_picks_tabs_closes_from_the_menu_drags_the_sidebar_and_quits() {
 async fn tls_shows_the_handshake_and_the_fingerprint_the_client_sees() {
     let mut app = Outpost::start();
     let port = app
-        .new_workspace("tls", &RIGHT.repeat(2), Some("http/1.1"))
+        .new_listener("tls", &RIGHT.repeat(2), Some("http/1.1"))
         .await;
 
     let (mut client, fingerprint) = clients::tls_connect(port, b"http/1.1").await;
@@ -150,7 +150,7 @@ async fn tls_shows_the_handshake_and_the_fingerprint_the_client_sees() {
 #[tokio::test]
 async fn quic_replies_finishes_and_opens_streams() {
     let mut app = Outpost::start();
-    let port = app.new_workspace("quic", LEFT, Some("hq-interop")).await;
+    let port = app.new_listener("quic", LEFT, Some("hq-interop")).await;
 
     let (_endpoint, conn) = clients::quic_connect(port, b"hq-interop").await;
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -187,7 +187,7 @@ async fn quic_replies_finishes_and_opens_streams() {
 #[tokio::test]
 async fn udp_restart_and_close_ask_before_dropping_peers() {
     let mut app = Outpost::start();
-    let old = app.new_workspace("udp", RIGHT, None).await;
+    let old = app.new_listener("udp", RIGHT, None).await;
     let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
     peer.send_to(b"hello udp\n", ("127.0.0.1", old)).unwrap();
     app.wait_for("hello udp").await;
@@ -217,7 +217,7 @@ async fn udp_restart_and_close_ask_before_dropping_peers() {
     eventually("the new port to be bound", || udp_port_bound(new)).await;
     assert!(!udp_port_bound(old));
 
-    // Closing a workspace with a live peer asks too.
+    // Closing a listener with a live peer asks too.
     peer.send_to(b"again\n", ("127.0.0.1", new)).unwrap();
     app.wait_for("· 1 open").await;
     app.prefix("D");

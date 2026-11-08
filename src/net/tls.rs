@@ -9,7 +9,7 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::{ProtocolVersion, ServerConfig, ServerConnection};
 
-/// What a TLS workspace serves. Plain TCP/UDP workspaces keep the default.
+/// What a TLS listener serves. Plain TCP/UDP listeners keep the default.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct TlsConfig {
     pub cert: CertSource,
@@ -19,7 +19,7 @@ pub struct TlsConfig {
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum CertSource {
-    /// Generated when the workspace is applied.
+    /// Generated when the listener is applied.
     #[default]
     SelfSigned,
     /// PEM files: a certificate chain (leaf first) and its private key.

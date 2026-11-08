@@ -1,4 +1,4 @@
-//! Application state and input handling. The workspace, session, and
+//! Application state and input handling. The listener, session, and
 //! settings-form types live in submodules; this module owns `App`, its
 //! overlays (`Mode`), and how keys and clicks drive them.
 
@@ -12,23 +12,23 @@ use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Event;
-use crate::net::{self, NetEvent, Outlet, SessId, WsId};
+use crate::net::{self, ListenerId, NetEvent, Outlet, SessId};
 use crate::text_input::TextInput;
 use crate::ui::{FormHit, Hits, TextTarget};
 
+mod listener;
 mod session;
 mod settings;
-mod workspace;
 
+pub use listener::{ListenState, Listener, ListenerConfig, Status};
 pub use session::{Dir, Session};
 pub use settings::{Applied, CertKind, Field, SettingsForm};
-pub use workspace::{ListenState, ListenerConfig, Status, Workspace};
 
 /// Sidebar width limits, matching herdr's defaults.
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 const MIN_SIDEBAR_WIDTH: u16 = 18;
 const MAX_SIDEBAR_WIDTH: u16 = 36;
-/// Share of the sidebar given to workspaces; sessions get the rest.
+/// Share of the sidebar given to listeners; sessions get the rest.
 const DEFAULT_SIDEBAR_SPLIT: f32 = 0.5;
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
@@ -49,7 +49,7 @@ fn hit<T: Copy>(targets: &[(Rect, T)], pos: Position) -> Option<T> {
 /// What a right-click menu or rename acts on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
-    Workspace(WsId),
+    Listener(ListenerId),
     /// A tab.
     Session(SessId),
 }
@@ -97,13 +97,13 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The workspace or tab the open overlay acts on, highlighted while it's open.
+    /// The listener or tab the open overlay acts on, highlighted while it's open.
     pub fn target(&self) -> Option<Target> {
         match self {
             Mode::Menu(menu) => Some(menu.target),
             Mode::Rename(form) => Some(form.target),
             Mode::Confirm(Confirm::Close(target)) => Some(*target),
-            Mode::Confirm(Confirm::Restart(form, _)) => form.target.map(Target::Workspace),
+            Mode::Confirm(Confirm::Restart(form, _)) => form.target.map(Target::Listener),
             Mode::Normal
             | Mode::Prefix
             | Mode::Help
@@ -117,7 +117,7 @@ impl Mode {
 // Only one exists at a time, and `Mode::Settings` holds a form unboxed too.
 #[expect(clippy::large_enum_variant)]
 pub enum Confirm {
-    /// Closing a workspace or tab.
+    /// Closing a listener or tab.
     Close(Target),
     /// Applying settings that restart a UDP or QUIC listener. Cancelling
     /// returns to the form.
@@ -131,12 +131,12 @@ pub enum Confirm {
 enum Drag {
     /// The vertical line between the sidebar and the tabs.
     SidebarWidth,
-    /// The horizontal line between workspaces and sessions.
+    /// The horizontal line between listeners and sessions.
     SidebarSplit,
 }
 
 pub struct App {
-    pub workspaces: Vec<Workspace>,
+    pub listeners: Vec<Listener>,
     pub active: usize,
     pub mode: Mode,
     pub hits: Hits,
@@ -151,7 +151,7 @@ pub struct App {
 impl App {
     pub fn new(events: UnboundedSender<Event>) -> Self {
         Self {
-            workspaces: Vec::new(),
+            listeners: Vec::new(),
             active: 0,
             mode: Mode::Normal,
             hits: Hits::default(),
@@ -180,56 +180,63 @@ impl App {
     }
 
     fn focused_session_mut(&mut self) -> Option<&mut Session> {
-        let ws = self.workspaces.get_mut(self.active)?;
-        ws.sessions.get_mut(ws.active_tab)
+        let listener = self.listeners.get_mut(self.active)?;
+        listener.sessions.get_mut(listener.active_tab)
     }
 
-    pub fn workspace(&self, id: WsId) -> Option<&Workspace> {
-        self.workspaces.iter().find(|ws| ws.id == id)
+    pub fn listener(&self, id: ListenerId) -> Option<&Listener> {
+        self.listeners.iter().find(|listener| listener.id == id)
     }
 
     pub fn session(&self, id: SessId) -> Option<&Session> {
-        self.workspaces
+        self.listeners
             .iter()
-            .flat_map(|ws| &ws.sessions)
+            .flat_map(|listener| &listener.sessions)
             .find(|s| s.id == id)
     }
 
     fn session_mut(&mut self, id: SessId) -> Option<&mut Session> {
-        self.workspaces
+        self.listeners
             .iter_mut()
-            .flat_map(|ws| ws.sessions.iter_mut())
+            .flat_map(|listener| listener.sessions.iter_mut())
             .find(|s| s.id == id)
     }
 
-    fn workspace_mut(&mut self, id: WsId) -> Option<&mut Workspace> {
-        self.workspaces.iter_mut().find(|ws| ws.id == id)
+    fn listener_mut(&mut self, id: ListenerId) -> Option<&mut Listener> {
+        self.listeners.iter_mut().find(|listener| listener.id == id)
     }
 
     fn on_net(&mut self, ev: NetEvent) {
         match ev {
-            NetEvent::Listening { ws, local, udp } => {
-                if let Some(w) = self.workspace_mut(ws) {
-                    w.state = ListenState::Listening;
-                    w.config.addr = local;
-                    w.udp_out = udp;
+            NetEvent::Listening {
+                listener: id,
+                local,
+                udp,
+            } => {
+                if let Some(listener) = self.listener_mut(id) {
+                    listener.state = ListenState::Listening;
+                    listener.config.addr = local;
+                    listener.udp_out = udp;
                 }
             }
-            NetEvent::ListenFailed { ws, error } => {
-                if let Some(w) = self.workspace_mut(ws) {
-                    w.state = ListenState::Failed(error);
-                    w.listener = None;
+            NetEvent::ListenFailed {
+                listener: id,
+                error,
+            } => {
+                if let Some(listener) = self.listener_mut(id) {
+                    listener.state = ListenState::Failed(error);
+                    listener.task = None;
                 }
             }
             NetEvent::Accepted {
-                ws,
+                listener: id,
                 sess,
                 peer,
                 outlet,
             } => {
-                // If the workspace is gone, dropping the outlet closes the connection.
-                if let Some(w) = self.workspace_mut(ws) {
-                    w.sessions.push(Session::new(sess, peer, outlet));
+                // If the listener is gone, dropping the outlet closes the connection.
+                if let Some(listener) = self.listener_mut(id) {
+                    listener.sessions.push(Session::new(sess, peer, outlet));
                 }
             }
             NetEvent::Secured { sess, summary } => {
@@ -261,12 +268,18 @@ impl App {
                     s.close(error);
                 }
             }
-            NetEvent::Datagram { ws, peer, bytes } => {
-                let Some(w) = self.workspace_mut(ws) else {
+            NetEvent::Datagram {
+                listener: id,
+                peer,
+                bytes,
+            } => {
+                let Some(listener) = self.listener_mut(id) else {
                     return;
                 };
-                let Some(tx) = w.udp_out.clone() else { return };
-                let index = match w
+                let Some(tx) = listener.udp_out.clone() else {
+                    return;
+                };
+                let index = match listener
                     .sessions
                     .iter()
                     .position(|s| s.is_open() && s.peer == peer)
@@ -274,11 +287,13 @@ impl App {
                     Some(index) => index,
                     None => {
                         let outlet = Outlet::Udp { tx, peer };
-                        w.sessions.push(Session::new(net::next_id(), peer, outlet));
-                        w.sessions.len() - 1
+                        listener
+                            .sessions
+                            .push(Session::new(net::next_id(), peer, outlet));
+                        listener.sessions.len() - 1
                     }
                 };
-                w.sessions[index].receive(&bytes);
+                listener.sessions[index].receive(&bytes);
             }
         }
     }
@@ -346,8 +361,8 @@ impl App {
                 }
             }
             KeyCode::Char(c @ '1'..='9') => self.select_tab(c as usize - '1' as usize),
-            KeyCode::Char('j') | KeyCode::Down => self.cycle_workspace(1),
-            KeyCode::Char('k') | KeyCode::Up => self.cycle_workspace(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.cycle_listener(1),
+            KeyCode::Char('k') | KeyCode::Up => self.cycle_listener(-1),
             KeyCode::Char('X') => {
                 if let Some(s) = self.focused_session_mut() {
                     let id = s.id;
@@ -355,13 +370,13 @@ impl App {
                 }
             }
             KeyCode::Char('D') => {
-                if let Some(ws) = self.workspaces.get(self.active) {
-                    self.request_close(Target::Workspace(ws.id));
+                if let Some(listener) = self.listeners.get(self.active) {
+                    self.request_close(Target::Listener(listener.id));
                 }
             }
             KeyCode::Char('W') => {
-                if let Some(ws) = self.workspaces.get(self.active) {
-                    self.open_rename(Target::Workspace(ws.id));
+                if let Some(listener) = self.listeners.get(self.active) {
+                    self.open_rename(Target::Listener(listener.id));
                 }
             }
             KeyCode::Char('T') => {
@@ -379,7 +394,7 @@ impl App {
     fn settings_key(&mut self, mut form: SettingsForm, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => return,
-            KeyCode::Enter => match form.check(&self.workspaces) {
+            KeyCode::Enter => match form.check(&self.listeners) {
                 Ok(applied) if self.restart_drops_sessions(form.target, &applied.config) => {
                     self.mode = Mode::Confirm(Confirm::Restart(form, applied));
                     return;
@@ -440,9 +455,9 @@ impl App {
                     (!name.is_empty() && name != default).then(|| name.to_string())
                 };
                 match form.target {
-                    Target::Workspace(id) => {
-                        if let Some(ws) = self.workspace_mut(id) {
-                            ws.name = custom(ws.endpoint());
+                    Target::Listener(id) => {
+                        if let Some(listener) = self.listener_mut(id) {
+                            listener.name = custom(listener.endpoint());
                         }
                     }
                     Target::Session(id) => {
@@ -600,14 +615,17 @@ impl App {
         }
     }
 
-    /// What right-clicking at `pos` opens a menu for. Workspace rows and tabs
+    /// What right-clicking at `pos` opens a menu for. Listener rows and tabs
     /// have menus; the sessions list doesn't.
     fn menu_target(&self, pos: Position) -> Option<Target> {
-        if let Some(ws) = hit(&self.hits.workspaces, pos) {
-            return self.workspaces.get(ws).map(|ws| Target::Workspace(ws.id));
+        if let Some(index) = hit(&self.hits.listeners, pos) {
+            return self
+                .listeners
+                .get(index)
+                .map(|listener| Target::Listener(listener.id));
         }
         let tab = hit(&self.hits.tabs, pos)?;
-        let s = self.workspaces.get(self.active)?.sessions.get(tab)?;
+        let s = self.listeners.get(self.active)?.sessions.get(tab)?;
         Some(Target::Session(s.id))
     }
 
@@ -627,20 +645,20 @@ impl App {
         } else if self.hits.section_divider.contains(pos) {
             self.drag = Some(Drag::SidebarSplit);
             self.set_sidebar_split(pos.y);
-        } else if self.hits.new_workspace.contains(pos) {
+        } else if self.hits.new_listener.contains(pos) {
             self.open_new_form();
         } else if self.hits.settings.contains(pos) {
             self.open_settings_form();
-        } else if let Some(ws) = hit(&self.hits.workspaces, pos) {
-            if ws < self.workspaces.len() {
-                self.active = ws;
+        } else if let Some(index) = hit(&self.hits.listeners, pos) {
+            if index < self.listeners.len() {
+                self.active = index;
             }
-        } else if let Some((ws, tab)) = hit(&self.hits.sessions, pos) {
-            if let Some(w) = self.workspaces.get_mut(ws)
-                && tab < w.sessions.len()
+        } else if let Some((index, tab)) = hit(&self.hits.sessions, pos) {
+            if let Some(listener) = self.listeners.get_mut(index)
+                && tab < listener.sessions.len()
             {
-                w.active_tab = tab;
-                self.active = ws;
+                listener.active_tab = tab;
+                self.active = index;
             }
         } else if let Some(tab) = hit(&self.hits.tabs, pos) {
             self.select_tab(tab);
@@ -664,7 +682,7 @@ impl App {
         self.sidebar_width = (column + 1).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
     }
 
-    /// Puts the workspaces/sessions divider at `row`.
+    /// Puts the listeners/sessions divider at `row`.
     fn set_sidebar_split(&mut self, row: u16) {
         let sidebar = self.hits.sidebar_divider;
         if sidebar.height > 0 {
@@ -684,7 +702,7 @@ impl App {
 
     fn open_rename(&mut self, target: Target) {
         let label = match target {
-            Target::Workspace(id) => self.workspace(id).map(Workspace::label),
+            Target::Listener(id) => self.listener(id).map(Listener::label),
             Target::Session(id) => self.session(id).map(Session::label),
         };
         if let Some(label) = label {
@@ -695,102 +713,110 @@ impl App {
         }
     }
 
-    /// (workspace index, tab index) of a session.
+    /// (listener index, tab index) of a session.
     fn locate_session(&self, id: SessId) -> Option<(usize, usize)> {
-        self.workspaces.iter().enumerate().find_map(|(wi, ws)| {
-            ws.sessions
-                .iter()
-                .position(|s| s.id == id)
-                .map(|si| (wi, si))
-        })
+        self.listeners
+            .iter()
+            .enumerate()
+            .find_map(|(index, listener)| {
+                listener
+                    .sessions
+                    .iter()
+                    .position(|s| s.id == id)
+                    .map(|tab| (index, tab))
+            })
     }
 
     fn open_new_form(&mut self) {
-        self.mode = Mode::Settings(SettingsForm::new(&self.workspaces));
+        self.mode = Mode::Settings(SettingsForm::new(&self.listeners));
     }
 
     fn open_settings_form(&mut self) {
-        let form = match self.workspaces.get(self.active) {
-            Some(ws) => SettingsForm::edit(ws),
-            None => SettingsForm::new(&self.workspaces),
+        let form = match self.listeners.get(self.active) {
+            Some(listener) => SettingsForm::edit(listener),
+            None => SettingsForm::new(&self.listeners),
         };
         self.mode = Mode::Settings(form);
     }
 
-    /// Whether applying `config` to workspace `target` would drop open sessions.
-    fn restart_drops_sessions(&self, target: Option<WsId>, config: &ListenerConfig) -> bool {
+    /// Whether applying `config` to listener `target` would drop open sessions.
+    fn restart_drops_sessions(&self, target: Option<ListenerId>, config: &ListenerConfig) -> bool {
         target
-            .and_then(|id| self.workspace(id))
-            .is_some_and(|ws| ws.restart_drops_sessions(config))
+            .and_then(|id| self.listener(id))
+            .is_some_and(|listener| listener.restart_drops_sessions(config))
     }
 
-    /// Creates a workspace (`target` is `None`) or applies new settings to one,
-    /// restarting its listener if anything changed.
-    fn apply(&mut self, target: Option<WsId>, Applied { config, tls }: Applied) {
+    /// Creates a listener (`target` is `None`) or applies new settings to one,
+    /// restarting it if anything changed.
+    fn apply(&mut self, target: Option<ListenerId>, Applied { config, tls }: Applied) {
         match target {
             None => {
-                let mut ws = Workspace::new(config, tls);
-                ws.start(&self.events);
-                self.workspaces.push(ws);
-                self.active = self.workspaces.len() - 1;
+                let mut listener = Listener::new(config, tls);
+                listener.start(&self.events);
+                self.listeners.push(listener);
+                self.active = self.listeners.len() - 1;
             }
             Some(id) => {
                 let events = self.events.clone();
-                let Some(ws) = self.workspace_mut(id) else {
+                let Some(listener) = self.listener_mut(id) else {
                     return;
                 };
-                if ws.restarts_for(&config) {
-                    ws.stop();
-                    ws.config = config;
-                    ws.tls = tls;
-                    ws.start(&events);
+                if listener.restarts_for(&config) {
+                    listener.stop();
+                    listener.config = config;
+                    listener.tls = tls;
+                    listener.start(&events);
                 }
             }
         }
     }
 
     fn cycle_tab(&mut self, delta: isize) {
-        if let Some(ws) = self.workspaces.get_mut(self.active)
-            && !ws.sessions.is_empty()
+        if let Some(listener) = self.listeners.get_mut(self.active)
+            && !listener.sessions.is_empty()
         {
-            ws.active_tab = wrap(ws.active_tab, delta, ws.sessions.len());
+            listener.active_tab = wrap(listener.active_tab, delta, listener.sessions.len());
         }
     }
 
     fn select_tab(&mut self, index: usize) {
-        if let Some(ws) = self.workspaces.get_mut(self.active)
-            && index < ws.sessions.len()
+        if let Some(listener) = self.listeners.get_mut(self.active)
+            && index < listener.sessions.len()
         {
-            ws.active_tab = index;
+            listener.active_tab = index;
         }
     }
 
-    fn cycle_workspace(&mut self, delta: isize) {
-        if !self.workspaces.is_empty() {
-            self.active = wrap(self.active, delta, self.workspaces.len());
+    fn cycle_listener(&mut self, delta: isize) {
+        if !self.listeners.is_empty() {
+            self.active = wrap(self.active, delta, self.listeners.len());
         }
     }
 
     /// Disconnects (if still open) and removes a session, keeping focus on
     /// the same tab when another one is removed.
-    fn remove_session(&mut self, ws: usize, index: usize) {
-        let Some(ws) = self.workspaces.get_mut(ws) else {
+    fn remove_session(&mut self, listener: usize, index: usize) {
+        let Some(listener) = self.listeners.get_mut(listener) else {
             return;
         };
-        if index >= ws.sessions.len() {
+        if index >= listener.sessions.len() {
             return;
         }
-        ws.sessions.remove(index);
-        if index < ws.active_tab {
-            ws.active_tab -= 1;
+        listener.sessions.remove(index);
+        if index < listener.active_tab {
+            listener.active_tab -= 1;
         }
-        ws.active_tab = ws.active_tab.min(ws.sessions.len().saturating_sub(1));
+        listener.active_tab = listener
+            .active_tab
+            .min(listener.sessions.len().saturating_sub(1));
     }
 
-    /// Closes a workspace or tab, asking first if that would drop live connections.
+    /// Closes a listener or tab, asking first if that would drop live connections.
     fn request_close(&mut self, target: Target) {
         let live = match target {
-            Target::Workspace(id) => self.workspace(id).is_some_and(|w| w.open_count() > 0),
+            Target::Listener(id) => self
+                .listener(id)
+                .is_some_and(|listener| listener.open_count() > 0),
             Target::Session(id) => self.session(id).is_some_and(Session::is_open),
         };
         if live {
@@ -802,7 +828,11 @@ impl App {
 
     /// Quits, asking first if that would drop live connections.
     fn request_quit(&mut self) {
-        if self.workspaces.iter().any(|ws| ws.open_count() > 0) {
+        if self
+            .listeners
+            .iter()
+            .any(|listener| listener.open_count() > 0)
+        {
             self.mode = Mode::Confirm(Confirm::Quit);
         } else {
             self.quit = true;
@@ -827,30 +857,30 @@ impl App {
     /// Closes without asking, dropping any connections.
     fn close_target(&mut self, target: Target) {
         match target {
-            Target::Workspace(id) => {
-                if let Some(index) = self.workspaces.iter().position(|w| w.id == id) {
-                    self.remove_workspace(index);
+            Target::Listener(id) => {
+                if let Some(index) = self.listeners.iter().position(|listener| listener.id == id) {
+                    self.remove_listener(index);
                 }
             }
             Target::Session(id) => {
-                if let Some((ws, index)) = self.locate_session(id) {
-                    self.remove_session(ws, index);
+                if let Some((listener, index)) = self.locate_session(id) {
+                    self.remove_session(listener, index);
                 }
             }
         }
     }
 
-    /// Removes a workspace (stopping its listener and sessions), keeping focus
-    /// on the same workspace when another one is removed.
-    fn remove_workspace(&mut self, index: usize) {
-        if index >= self.workspaces.len() {
+    /// Removes a listener (stopping its task and sessions), keeping focus
+    /// on the same listener when another one is removed.
+    fn remove_listener(&mut self, index: usize) {
+        if index >= self.listeners.len() {
             return;
         }
-        self.workspaces.remove(index);
+        self.listeners.remove(index);
         if index < self.active {
             self.active -= 1;
         }
-        self.active = self.active.min(self.workspaces.len().saturating_sub(1));
+        self.active = self.active.min(self.listeners.len().saturating_sub(1));
     }
 }
 
@@ -859,38 +889,38 @@ mod tests;
 
 #[cfg(test)]
 impl App {
-    /// An app with no workspaces. The receiver gets events from any listener the app starts.
+    /// An app with no listeners. The receiver gets events from any listener the app starts.
     pub fn test_new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Event>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (Self::new(tx), rx)
     }
 
-    /// Adds a workspace that is already listening, with no socket behind it.
-    pub fn add_test_workspace(&mut self, protocol: crate::net::Protocol, addr: &str) -> WsId {
+    /// Adds a listener that is already listening, with no socket behind it.
+    pub fn add_test_listener(&mut self, protocol: crate::net::Protocol, addr: &str) -> ListenerId {
         let config = ListenerConfig {
             protocol,
             addr: addr.parse().expect("test address"),
             tls: crate::net::tls::TlsConfig::default(),
         };
-        let mut ws = Workspace::new(config, None);
-        ws.state = ListenState::Listening;
-        let id = ws.id;
-        self.workspaces.push(ws);
+        let mut listener = Listener::new(config, None);
+        listener.state = ListenState::Listening;
+        let id = listener.id;
+        self.listeners.push(listener);
         id
     }
 
-    /// Accepts a TCP session into `ws`, as the listener would. The receiver gets
+    /// Accepts a TCP session into `listener`, as the listener would. The receiver gets
     /// every chunk the app sends to that peer; it reports disconnected once the
     /// app drops the session.
     pub fn add_test_session(
         &mut self,
-        ws: WsId,
+        listener: ListenerId,
         peer: &str,
     ) -> (SessId, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sess = net::next_id();
         self.handle(Event::Net(NetEvent::Accepted {
-            ws,
+            listener,
             sess,
             peer: peer.parse().expect("test peer"),
             outlet: Outlet::Tcp(tx),
@@ -902,7 +932,7 @@ impl App {
     /// each write and finish the app asks for.
     pub fn add_test_quic_session(
         &mut self,
-        ws: WsId,
+        listener: ListenerId,
         peer: &str,
     ) -> (
         SessId,
@@ -911,7 +941,7 @@ impl App {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sess = net::next_id();
         self.handle(Event::Net(NetEvent::Accepted {
-            ws,
+            listener,
             sess,
             peer: peer.parse().expect("test peer"),
             outlet: Outlet::Quic(tx),
