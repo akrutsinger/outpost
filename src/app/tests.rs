@@ -245,7 +245,7 @@ fn close_tab_disconnects_and_keeps_a_valid_focus() {
     prefix(&mut app, 'n');
 
     prefix(&mut app, 'X');
-    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Session(b)));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Session(b)));
     assert_eq!(
         out_b.try_recv(),
         Err(TryRecvError::Empty),
@@ -271,7 +271,7 @@ fn close_workspace_drops_its_sessions() {
     prefix(&mut app, 'j');
 
     prefix(&mut app, 'D');
-    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Workspace(ws)));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Workspace(ws)));
     assert!(
         out.try_recv().is_err_and(|e| e == TryRecvError::Empty),
         "still connected"
@@ -636,7 +636,7 @@ fn close_from_menu_removes_that_workspace_and_keeps_focus() {
     assert_eq!(app.workspaces[app.active].id, ids[2]);
 
     menu_pick(&mut app, 0, "Close");
-    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Workspace(ids[0])));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Workspace(ids[0])));
     render_rows(&mut app, 120, 32);
     let confirm = app.hits.confirm;
     click(&mut app, confirm);
@@ -800,14 +800,14 @@ fn cancelling_the_confirmation_keeps_everything() {
     prefix(&mut app, 'D');
     type_str(&mut app, "yq");
     assert!(
-        matches!(app.mode, Mode::ConfirmClose(_)),
+        matches!(app.mode, Mode::Confirm(_)),
         "other keys are ignored"
     );
     render_rows(&mut app, 120, 32);
     let pane = app.hits.pane;
     click(&mut app, pane);
     assert!(
-        matches!(app.mode, Mode::ConfirmClose(_)),
+        matches!(app.mode, Mode::Confirm(_)),
         "stray clicks are ignored"
     );
     key(&mut app, KeyCode::Esc);
@@ -823,6 +823,103 @@ fn cancelling_the_confirmation_keeps_everything() {
 
     assert_eq!(app.workspaces.len(), 3);
     assert_eq!(out.try_recv(), Err(TryRecvError::Empty));
+}
+
+/// Opens settings for the active workspace and changes its port to `port`.
+fn change_port(app: &mut App, port: &str) {
+    prefix(app, 's');
+    key(app, KeyCode::Tab); // -> address
+    key(app, KeyCode::Tab); // -> port
+    for _ in 0..5 {
+        key(app, KeyCode::Backspace);
+    }
+    type_str(app, port);
+}
+
+#[tokio::test]
+async fn restarting_a_udp_workspace_with_sessions_asks_first() {
+    let (mut app, mut rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Udp, "127.0.0.1:5555");
+    let (_sess, _out) = app.add_test_session(ws, "10.0.0.5:1000");
+
+    // Cancelling goes back to the form with the edit intact.
+    change_port(&mut app, "0");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Restart(..))));
+    type_str(&mut app, "y");
+    assert!(
+        matches!(app.mode, Mode::Confirm(_)),
+        "other keys are ignored"
+    );
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(form(&app).port, "0");
+    assert_eq!(app.workspaces[0].config.addr.port(), 5555);
+    assert!(app.workspaces[0].sessions[0].is_open());
+
+    // Confirming applies it and drops the session.
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[0].config.addr.port(), 0);
+    assert!(!app.workspaces[0].sessions[0].is_open());
+    let ev = next_event(&mut rx).await;
+    app.handle(ev);
+    assert!(matches!(app.workspaces[0].state, ListenState::Listening));
+}
+
+#[tokio::test]
+async fn restart_confirmation_buttons_work_with_the_mouse() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "127.0.0.1:4433");
+    app.workspaces[0].config.tls.alpn = vec!["h3".into()];
+    let (_sess, _out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    change_port(&mut app, "0");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Restart(..))));
+
+    render_rows(&mut app, 120, 32);
+    let cancel = app.hits.cancel;
+    click(&mut app, cancel);
+    assert!(matches!(app.mode, Mode::Settings(_)));
+
+    key(&mut app, KeyCode::Enter);
+    render_rows(&mut app, 120, 32);
+    let confirm = app.hits.confirm;
+    click(&mut app, confirm);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[0].config.addr.port(), 0);
+    assert!(!app.workspaces[0].sessions[0].is_open());
+}
+
+#[tokio::test]
+async fn settings_that_keep_connections_apply_without_asking() {
+    let (mut app, _rx) = App::test_new();
+    // TCP connections outlive a listener restart.
+    let tcp = app.add_test_workspace(Protocol::Tcp, "127.0.0.1:4444");
+    let (_a, _out_a) = app.add_test_session(tcp, "10.0.0.5:1000");
+    change_port(&mut app, "0");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.workspaces[0].sessions[0].is_open());
+
+    // An unchanged UDP workspace doesn't restart.
+    let udp = app.add_test_workspace(Protocol::Udp, "127.0.0.1:5555");
+    let (_b, _out_b) = app.add_test_session(udp, "10.0.0.5:1000");
+    app.active = 1;
+    prefix(&mut app, 's');
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.workspaces[1].sessions[0].is_open());
+
+    // A UDP workspace whose sessions have all gone has nothing to drop.
+    let idle = app.add_test_workspace(Protocol::Udp, "127.0.0.1:6666");
+    let (sess, _out_c) = app.add_test_session(idle, "10.0.0.6:1000");
+    app.handle(Event::Net(NetEvent::Closed { sess, error: None }));
+    app.active = 2;
+    change_port(&mut app, "0");
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.workspaces[2].config.addr.port(), 0);
 }
 
 // ---- cursor movement in text fields ----
@@ -977,7 +1074,7 @@ fn close_tab_from_menu_disconnects_that_session_and_keeps_focus() {
     render_rows(&mut app, 120, 32);
 
     tab_menu_pick(&mut app, 0, "Close");
-    assert!(matches!(app.mode, Mode::ConfirmClose(t) if t == Target::Session(ids[0])));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Session(ids[0])));
     assert_eq!(
         outs[0].try_recv(),
         Err(TryRecvError::Empty),

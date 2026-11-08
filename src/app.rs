@@ -118,13 +118,27 @@ impl Workspace {
         ));
     }
 
+    /// Whether applying `config` stops and restarts the listener.
+    fn restarts_for(&self, config: &ListenerConfig) -> bool {
+        self.config != *config || matches!(self.state, ListenState::Failed(_))
+    }
+
+    /// Whether restarting with `config` would drop open sessions.
+    fn restart_drops_sessions(&self, config: &ListenerConfig) -> bool {
+        self.restarts_for(config) && self.sessions_share_socket() && self.open_count() > 0
+    }
+
+    /// TCP connections outlive their listener; UDP and QUIC sessions share its socket.
+    fn sessions_share_socket(&self) -> bool {
+        matches!(self.config.protocol, Protocol::Udp | Protocol::Quic)
+    }
+
     fn stop(&mut self) {
         if let Some(handle) = self.listener.take() {
             handle.abort();
         }
         self.udp_out = None;
-        // TCP connections outlive their listener; UDP and QUIC sessions share its socket.
-        if matches!(self.config.protocol, Protocol::Udp | Protocol::Quic) {
+        if self.sessions_share_socket() {
             for s in &mut self.sessions {
                 s.close(Some("listener stopped".into()));
             }
@@ -595,8 +609,25 @@ pub enum Mode {
     Settings(SettingsForm),
     Menu(ContextMenu),
     Rename(RenameForm),
-    /// Asks before closing a workspace or tab that would drop live connections.
-    ConfirmClose(Target),
+    /// Asks before an action that would drop live connections.
+    Confirm(Confirm),
+}
+
+/// An action waiting on a confirmation, because it drops live connections.
+// Only one exists at a time, and `Mode::Settings` holds a form unboxed too.
+#[allow(clippy::large_enum_variant)]
+pub enum Confirm {
+    /// Closing a workspace or tab.
+    Close(Target),
+    /// Applying settings that restart a UDP or QUIC listener. Cancelling
+    /// returns to the form.
+    Restart(SettingsForm, Applied),
+}
+
+/// A checked settings form, ready to apply.
+pub struct Applied {
+    config: ListenerConfig,
+    tls: Option<TlsServer>,
 }
 
 /// A sidebar divider being dragged.
@@ -753,10 +784,10 @@ impl App {
             Mode::Settings(form) => self.settings_key(form, key),
             Mode::Menu(menu) => self.menu_key(menu, key),
             Mode::Rename(form) => self.rename_key(form, key),
-            Mode::ConfirmClose(target) => match key.code {
-                KeyCode::Enter => self.close_target(target),
-                KeyCode::Esc => {}
-                _ => self.mode = Mode::ConfirmClose(target),
+            Mode::Confirm(confirm) => match key.code {
+                KeyCode::Enter => self.confirmed(confirm),
+                KeyCode::Esc => self.cancelled(confirm),
+                _ => self.mode = Mode::Confirm(confirm),
             },
         }
     }
@@ -841,8 +872,15 @@ impl App {
     fn settings_key(&mut self, mut form: SettingsForm, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => return,
-            KeyCode::Enter => match self.apply_form(&form) {
-                Ok(()) => return,
+            KeyCode::Enter => match self.check_form(&form) {
+                Ok(applied) if self.restart_drops_sessions(form.target, &applied.config) => {
+                    self.mode = Mode::Confirm(Confirm::Restart(form, applied));
+                    return;
+                }
+                Ok(applied) => {
+                    self.apply(form.target, applied);
+                    return;
+                }
                 Err(e) => form.error = Some(e),
             },
             KeyCode::Tab | KeyCode::Down => form.focus_next(1),
@@ -959,12 +997,24 @@ impl App {
                 }
                 return;
             }
-            &mut Mode::ConfirmClose(target) => {
-                if left_click && self.hits.confirm.contains(pos) {
-                    self.mode = Mode::Normal;
-                    self.close_target(target);
-                } else if left_click && self.hits.cancel.contains(pos) {
-                    self.mode = Mode::Normal;
+            Mode::Confirm(_) => {
+                let button = if !left_click {
+                    None
+                } else if self.hits.confirm.contains(pos) {
+                    Some(true)
+                } else if self.hits.cancel.contains(pos) {
+                    Some(false)
+                } else {
+                    None
+                };
+                if let Some(confirm) = button
+                    && let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Normal)
+                {
+                    if confirm {
+                        self.confirmed(c);
+                    } else {
+                        self.cancelled(c);
+                    }
                 }
                 return;
             }
@@ -1211,7 +1261,8 @@ impl App {
         });
     }
 
-    fn apply_form(&mut self, form: &SettingsForm) -> Result<(), String> {
+    /// Validates a form and builds its certificate, without changing anything.
+    fn check_form(&self, form: &SettingsForm) -> Result<Applied, String> {
         let ip: IpAddr = form
             .address
             .as_str()
@@ -1258,8 +1309,20 @@ impl App {
             }
             _ => Some(net::tls::build(&config.tls)?),
         };
+        Ok(Applied { config, tls })
+    }
 
-        match form.target {
+    /// Whether applying `config` to workspace `target` would drop open sessions.
+    fn restart_drops_sessions(&self, target: Option<WsId>, config: &ListenerConfig) -> bool {
+        target
+            .and_then(|id| self.workspaces.iter().find(|ws| ws.id == id))
+            .is_some_and(|ws| ws.restart_drops_sessions(config))
+    }
+
+    /// Creates a workspace (`target` is `None`) or applies new settings to one,
+    /// restarting its listener if anything changed.
+    fn apply(&mut self, target: Option<WsId>, Applied { config, tls }: Applied) {
+        match target {
             None => {
                 let mut ws = Workspace {
                     id: net::next_id(),
@@ -1279,10 +1342,9 @@ impl App {
             Some(id) => {
                 let events = self.events.clone();
                 let Some(ws) = self.workspace_mut(id) else {
-                    return Ok(());
+                    return;
                 };
-                let failed = matches!(ws.state, ListenState::Failed(_));
-                if ws.config != config || failed {
+                if ws.restarts_for(&config) {
                     ws.stop();
                     ws.config = config;
                     ws.tls = tls;
@@ -1290,7 +1352,6 @@ impl App {
                 }
             }
         }
-        Ok(())
     }
 
     fn cycle_tab(&mut self, delta: isize) {
@@ -1347,9 +1408,23 @@ impl App {
                 .is_some_and(|(ws, index)| self.workspaces[ws].sessions[index].is_open()),
         };
         if live {
-            self.mode = Mode::ConfirmClose(target);
+            self.mode = Mode::Confirm(Confirm::Close(target));
         } else {
             self.close_target(target);
+        }
+    }
+
+    fn confirmed(&mut self, confirm: Confirm) {
+        match confirm {
+            Confirm::Close(target) => self.close_target(target),
+            Confirm::Restart(form, applied) => self.apply(form.target, applied),
+        }
+    }
+
+    fn cancelled(&mut self, confirm: Confirm) {
+        match confirm {
+            Confirm::Close(_) => {}
+            Confirm::Restart(form, _) => self.mode = Mode::Settings(form),
         }
     }
 

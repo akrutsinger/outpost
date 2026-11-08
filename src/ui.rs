@@ -8,10 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use crate::app::{
-    App, CertKind, ContextMenu, Dir, Field, ListenState, MENU_ITEMS, Mode, RenameForm, Session,
-    SettingsForm, Status, Target,
+    App, CertKind, Confirm, ContextMenu, Dir, Field, ListenState, MENU_ITEMS, Mode, RenameForm,
+    Session, SettingsForm, Status, Target,
 };
-use crate::net::Protocol;
+use crate::net::{Protocol, WsId};
 use crate::text_input::TextInput;
 use crate::theme::*;
 
@@ -108,8 +108,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             cursor = render_settings(buf, area, form, fingerprint, &mut hits);
         }
         Mode::Rename(form) => cursor = render_rename(buf, area, form, &mut hits),
-        &Mode::ConfirmClose(target) => {
-            render_confirm_close(buf, area, app, target, &mut hits);
+        Mode::Confirm(confirm) => {
+            render_confirm(buf, area, app, confirm, &mut hits);
             cursor = None;
         }
         Mode::Menu(menu) => {
@@ -273,6 +273,8 @@ fn render_workspaces(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         let targeted = match &app.mode {
             Mode::Menu(menu) => menu.target == Target::Workspace(ws.id),
             Mode::Rename(form) => form.target == Target::Workspace(ws.id),
+            Mode::Confirm(Confirm::Close(target)) => *target == Target::Workspace(ws.id),
+            Mode::Confirm(Confirm::Restart(form, _)) => form.target == Some(ws.id),
             _ => false,
         };
         if targeted {
@@ -513,6 +515,7 @@ fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         let targeted = match &app.mode {
             Mode::Menu(menu) => menu.target == Target::Session(s.id),
             Mode::Rename(form) => form.target == Target::Session(s.id),
+            Mode::Confirm(Confirm::Close(target)) => *target == Target::Session(s.id),
             _ => false,
         };
         let style = if index == ws.active_tab {
@@ -1085,21 +1088,30 @@ fn render_rename(
 }
 
 /// herdr-style confirmation: red square panel, title, detail, two buttons.
-fn render_confirm_close(buf: &mut Buffer, area: Rect, app: &App, target: Target, hits: &mut Hits) {
-    let text = match target {
-        Target::Workspace(id) => app.workspaces.iter().find(|w| w.id == id).map(|ws| {
+fn render_confirm(buf: &mut Buffer, area: Rect, app: &App, confirm: &Confirm, hits: &mut Hits) {
+    // e.g. `web (tcp :4444)` and `2 open connections`.
+    let workspace = |id: WsId| {
+        app.workspaces.iter().find(|w| w.id == id).map(|ws| {
             let who = match &ws.name {
                 Some(name) => format!("{name} ({})", ws.endpoint()),
                 None => ws.endpoint(),
             };
             let open = ws.open_count();
             let plural = if open == 1 { "" } else { "s" };
+            (who, format!("{open} open connection{plural}"))
+        })
+    };
+    let text = match *confirm {
+        Confirm::Close(Target::Workspace(id)) => {
+            workspace(id).map(|(who, open)| (" Close workspace?", format!(" {who} has {open}.")))
+        }
+        Confirm::Restart(ref form, _) => form.target.and_then(workspace).map(|(who, open)| {
             (
-                " Close workspace?",
-                format!(" {who} has {open} open connection{plural}."),
+                " Apply settings?",
+                format!(" Restarting {who} drops its {open}."),
             )
         }),
-        Target::Session(id) => app
+        Confirm::Close(Target::Session(id)) => app
             .workspaces
             .iter()
             .flat_map(|ws| &ws.sessions)
@@ -1594,7 +1606,7 @@ mod tests {
         app.workspaces[0].name = Some("web".into());
         let _a = app.add_test_session(ws, "10.0.0.5:1000");
         let _b = app.add_test_session(ws, "10.0.0.6:1000");
-        app.mode = Mode::ConfirmClose(Target::Workspace(ws));
+        app.mode = Mode::Confirm(Confirm::Close(Target::Workspace(ws)));
         let rows = render_rows(&mut app, W, H);
         row_with(&rows, "│ Close workspace?");
         row_with(&rows, " web (tcp :4444) has 2 open connections.");
@@ -1656,10 +1668,41 @@ mod tests {
         let ws = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
         let (sess, _out) = app.add_test_session(ws, "255.255.255.255:65535");
         app.workspaces[0].sessions[0].name = Some("db".into());
-        app.mode = Mode::ConfirmClose(Target::Session(sess));
+        app.mode = Mode::Confirm(Confirm::Close(Target::Session(sess)));
         let rows = render_rows(&mut app, W, H);
         row_with(&rows, "│ Close tab?");
         row_with(&rows, " db (255.255.255.255:65535) is still connected.");
+        row_with(&rows, "↵ confirm");
+    }
+
+    #[test]
+    fn confirm_restart_says_what_applying_drops() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Udp, "0.0.0.0:5555");
+        app.workspaces[0].name = Some("web".into());
+        let _a = app.add_test_session(ws, "10.0.0.5:1000");
+        let _b = app.add_test_session(ws, "10.0.0.6:1000");
+        app.mode = Mode::Settings(SettingsForm {
+            target: Some(ws),
+            protocol: Protocol::Udp,
+            address: "0.0.0.0".into(),
+            port: "5556".into(),
+            cert: CertKind::SelfSigned,
+            cert_file: "".into(),
+            key_file: "".into(),
+            alpn: "".into(),
+            field: Field::Port,
+            error: None,
+        });
+        app.handle(Event::Input(ratatui::crossterm::event::Event::Key(
+            ratatui::crossterm::event::KeyCode::Enter.into(),
+        )));
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "│ Apply settings?");
+        row_with(
+            &rows,
+            " Restarting web (udp :5555) drops its 2 open connections.",
+        );
         row_with(&rows, "↵ confirm");
     }
 
