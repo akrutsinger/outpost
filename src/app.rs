@@ -622,6 +622,8 @@ pub enum Confirm {
     /// Applying settings that restart a UDP or QUIC listener. Cancelling
     /// returns to the form.
     Restart(SettingsForm, Applied),
+    /// Quitting, which drops every connection.
+    Quit,
 }
 
 /// A checked settings form, ready to apply.
@@ -864,7 +866,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             _ => {}
         }
     }
@@ -1414,16 +1416,26 @@ impl App {
         }
     }
 
+    /// Quits, asking first if that would drop live connections.
+    fn request_quit(&mut self) {
+        if self.workspaces.iter().any(|ws| ws.open_count() > 0) {
+            self.mode = Mode::Confirm(Confirm::Quit);
+        } else {
+            self.quit = true;
+        }
+    }
+
     fn confirmed(&mut self, confirm: Confirm) {
         match confirm {
             Confirm::Close(target) => self.close_target(target),
             Confirm::Restart(form, applied) => self.apply(form.target, applied),
+            Confirm::Quit => self.quit = true,
         }
     }
 
     fn cancelled(&mut self, confirm: Confirm) {
         match confirm {
-            Confirm::Close(_) => {}
+            Confirm::Close(_) | Confirm::Quit => {}
             Confirm::Restart(form, _) => self.mode = Mode::Settings(form),
         }
     }

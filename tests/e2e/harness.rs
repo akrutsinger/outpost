@@ -227,12 +227,25 @@ impl Outpost {
         .await
     }
 
-    /// Quits with `prefix q` and checks the process exits on its own.
+    /// Quits with `prefix q`, which must not need confirming (no live
+    /// connections), and checks the process exits on its own.
     pub async fn quit(mut self) {
         self.prefix("q");
+        self.wait_exit().await;
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    pub async fn wait_exit(&mut self) {
         let deadline = Instant::now() + WAIT;
-        while self.child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "outpost did not quit");
+        while self.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "outpost did not quit; screen:\n{}",
+                self.screen()
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

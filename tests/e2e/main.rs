@@ -58,7 +58,7 @@ async fn tcp_round_trip_from_the_keyboard() {
 }
 
 #[tokio::test]
-async fn mouse_picks_tabs_closes_from_the_menu_and_drags_the_sidebar() {
+async fn mouse_picks_tabs_closes_from_the_menu_drags_the_sidebar_and_quits() {
     let mut app = Outpost::start();
     app.click_text("new  ").await;
     let port = app.fill_form("tcp", "", None).await;
@@ -95,7 +95,19 @@ async fn mouse_picks_tabs_closes_from_the_menu_and_drags_the_sidebar() {
         (edge(s, 35) && !edge(s, 25)).then_some(())
     })
     .await;
-    app.quit().await;
+
+    // Quitting with a live connection asks; Escape keeps it running.
+    app.prefix("q");
+    app.wait_for("Quit outpost?").await;
+    app.wait_for(&format!("tcp :{port} has 1 open connection."))
+        .await;
+    app.keys(ESC);
+    app.wait_gone("Quit outpost?").await;
+    assert!(app.is_running());
+    app.prefix("q");
+    app.click_text("↵ confirm").await;
+    app.wait_exit().await;
+    assert_eq!(read_to_eof(&mut one).await, b"");
 }
 
 #[tokio::test]
@@ -128,6 +140,10 @@ async fn tls_shows_the_handshake_and_the_fingerprint_the_client_sees() {
         .await;
     app.prefix("2");
     app.wait_for("tls handshake failed").await;
+
+    // Once the client hangs up, quitting doesn't need confirming.
+    drop(client);
+    app.wait_for("· 0 open").await;
     app.quit().await;
 }
 

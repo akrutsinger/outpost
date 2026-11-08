@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use crate::app::{
     App, CertKind, Confirm, ContextMenu, Dir, Field, ListenState, MENU_ITEMS, Mode, RenameForm,
-    Session, SettingsForm, Status, Target,
+    Session, SettingsForm, Status, Target, Workspace,
 };
 use crate::net::{Protocol, WsId};
 use crate::text_input::TextInput;
@@ -1089,18 +1089,16 @@ fn render_rename(
 
 /// herdr-style confirmation: red square panel, title, detail, two buttons.
 fn render_confirm(buf: &mut Buffer, area: Rect, app: &App, confirm: &Confirm, hits: &mut Hits) {
+    let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
     // e.g. `web (tcp :4444)` and `2 open connections`.
-    let workspace = |id: WsId| {
-        app.workspaces.iter().find(|w| w.id == id).map(|ws| {
-            let who = match &ws.name {
-                Some(name) => format!("{name} ({})", ws.endpoint()),
-                None => ws.endpoint(),
-            };
-            let open = ws.open_count();
-            let plural = if open == 1 { "" } else { "s" };
-            (who, format!("{open} open connection{plural}"))
-        })
+    let describe = |ws: &Workspace| {
+        let who = match &ws.name {
+            Some(name) => format!("{name} ({})", ws.endpoint()),
+            None => ws.endpoint(),
+        };
+        (who, count(ws.open_count(), "open connection"))
     };
+    let workspace = |id: WsId| app.workspaces.iter().find(|w| w.id == id).map(describe);
     let text = match *confirm {
         Confirm::Close(Target::Workspace(id)) => {
             workspace(id).map(|(who, open)| (" Close workspace?", format!(" {who} has {open}.")))
@@ -1111,6 +1109,28 @@ fn render_confirm(buf: &mut Buffer, area: Rect, app: &App, confirm: &Confirm, hi
                 format!(" Restarting {who} drops its {open}."),
             )
         }),
+        Confirm::Quit => {
+            let live: Vec<_> = app
+                .workspaces
+                .iter()
+                .filter(|w| w.open_count() > 0)
+                .collect();
+            let detail = match live[..] {
+                [ws] => {
+                    let (who, open) = describe(ws);
+                    format!(" {who} has {open}.")
+                }
+                _ => {
+                    let open = live.iter().map(|w| w.open_count()).sum();
+                    format!(
+                        " {} across {}.",
+                        count(open, "open connection"),
+                        count(live.len(), "workspace")
+                    )
+                }
+            };
+            Some((" Quit outpost?", detail))
+        }
         Confirm::Close(Target::Session(id)) => app
             .workspaces
             .iter()
@@ -1673,6 +1693,27 @@ mod tests {
         row_with(&rows, "│ Close tab?");
         row_with(&rows, " db (255.255.255.255:65535) is still connected.");
         row_with(&rows, "↵ confirm");
+    }
+
+    #[test]
+    fn confirm_quit_names_one_workspace_or_counts_several() {
+        let (mut app, _rx) = App::test_new();
+        let web = app.add_test_workspace(Protocol::Tcp, "0.0.0.0:4444");
+        app.workspaces[0].name = Some("web".into());
+        let _a = app.add_test_session(web, "10.0.0.5:1000");
+        let _b = app.add_test_session(web, "10.0.0.6:1000");
+        // A workspace with nothing open doesn't count.
+        app.add_test_workspace(Protocol::Tcp, "0.0.0.0:5555");
+        app.mode = Mode::Confirm(Confirm::Quit);
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "│ Quit outpost?");
+        row_with(&rows, " web (tcp :4444) has 2 open connections.");
+        row_with(&rows, "↵ confirm");
+
+        let dns = app.add_test_workspace(Protocol::Udp, "0.0.0.0:5353");
+        let _c = app.add_test_session(dns, "10.0.0.7:1000");
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, " 3 open connections across 2 workspaces.");
     }
 
     #[test]

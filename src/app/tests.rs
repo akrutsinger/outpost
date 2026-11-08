@@ -294,6 +294,36 @@ fn quit_and_help() {
 }
 
 #[test]
+fn quitting_with_live_connections_asks_first() {
+    let (mut app, _sess, _out) = one_session();
+    prefix(&mut app, 'q');
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Quit)));
+    type_str(&mut app, "y");
+    assert!(
+        matches!(app.mode, Mode::Confirm(_)),
+        "other keys are ignored"
+    );
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(!app.quit);
+
+    prefix(&mut app, 'q');
+    render_rows(&mut app, 120, 32);
+    let confirm = app.hits.confirm;
+    click(&mut app, confirm);
+    assert!(app.quit);
+}
+
+#[test]
+fn quitting_after_connections_close_skips_confirmation() {
+    let (mut app, sess, _out) = one_session();
+    app.handle(Event::Net(NetEvent::Closed { sess, error: None }));
+    prefix(&mut app, 'q');
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.quit);
+}
+
+#[test]
 fn datagrams_map_to_one_session_per_peer() {
     let (mut app, _rx) = App::test_new();
     let ws = app.add_test_workspace(Protocol::Udp, "0.0.0.0:5555");
