@@ -15,6 +15,7 @@ use tokio_rustls::rustls::ServerConfig;
 
 use crate::Event;
 
+pub mod quic;
 pub mod tls;
 
 /// A client that connects but never finishes the handshake is dropped after this.
@@ -38,18 +39,26 @@ pub enum Protocol {
     Udp,
     /// TLS over TCP.
     Tls,
+    /// QUIC over UDP (always TLS 1.3).
+    Quic,
 }
 
 impl Protocol {
     /// In the order the settings form shows them.
-    pub const ALL: [Protocol; 3] = [Protocol::Tcp, Protocol::Udp, Protocol::Tls];
+    pub const ALL: [Protocol; 4] = [Protocol::Tcp, Protocol::Udp, Protocol::Tls, Protocol::Quic];
 
     pub fn label(self) -> &'static str {
         match self {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp",
             Protocol::Tls => "tls",
+            Protocol::Quic => "quic",
         }
+    }
+
+    /// Whether the listener needs a certificate.
+    pub fn uses_tls(self) -> bool {
+        matches!(self, Protocol::Tls | Protocol::Quic)
     }
 
     /// The protocol `delta` places along in [`Protocol::ALL`], wrapping around.
@@ -63,14 +72,28 @@ impl Protocol {
 /// Write side of a session. Dropping it closes a TCP (or TLS) connection.
 pub enum Outlet {
     Tcp(UnboundedSender<Vec<u8>>),
-    Udp { tx: UdpOut, peer: SocketAddr },
+    Udp {
+        tx: UdpOut,
+        peer: SocketAddr,
+    },
+    /// Dropping it closes the QUIC connection.
+    Quic(UnboundedSender<quic::QuicOut>),
 }
 
 impl Outlet {
+    /// Sends on a TCP or UDP session. QUIC needs a stream: use [`Outlet::quic`].
     pub fn send(&self, bytes: Vec<u8>) -> bool {
         match self {
             Outlet::Tcp(tx) => tx.send(bytes).is_ok(),
             Outlet::Udp { tx, peer } => tx.send((*peer, bytes)).is_ok(),
+            Outlet::Quic(_) => false,
+        }
+    }
+
+    pub fn quic(&self, out: quic::QuicOut) -> bool {
+        match self {
+            Outlet::Quic(tx) => tx.send(out).is_ok(),
+            Outlet::Tcp(_) | Outlet::Udp { .. } => false,
         }
     }
 }
@@ -92,7 +115,7 @@ pub enum NetEvent {
         peer: SocketAddr,
         outlet: Outlet,
     },
-    /// A TLS session finished its handshake; `summary` says what was agreed.
+    /// A TLS or QUIC session finished its handshake; `summary` says what was agreed.
     Secured {
         sess: SessId,
         summary: String,
@@ -105,6 +128,17 @@ pub enum NetEvent {
         sess: SessId,
         error: Option<String>,
     },
+    /// Data on one stream of a QUIC session.
+    StreamData {
+        sess: SessId,
+        stream: quic::StreamId,
+        bytes: Vec<u8>,
+    },
+    StreamEnded {
+        sess: SessId,
+        stream: quic::StreamId,
+        end: quic::StreamEnd,
+    },
     /// UDP has no connections; the app maps peers to sessions.
     Datagram {
         ws: WsId,
@@ -113,7 +147,7 @@ pub enum NetEvent {
     },
 }
 
-/// `tls` is the server config for [`Protocol::Tls`] and is ignored otherwise.
+/// `tls` is the server config for TLS and QUIC, and is ignored otherwise.
 pub fn spawn_listener(
     ws: WsId,
     protocol: Protocol,
@@ -124,7 +158,10 @@ pub fn spawn_listener(
     match protocol {
         Protocol::Tcp => tokio::spawn(tcp_listener(ws, addr, None, events)).abort_handle(),
         Protocol::Udp => tokio::spawn(udp_listener(ws, addr, events)).abort_handle(),
-        Protocol::Tls => match tls {
+        Protocol::Tls | Protocol::Quic => match tls {
+            Some(config) if protocol == Protocol::Quic => {
+                tokio::spawn(quic::listener(ws, addr, config, events)).abort_handle()
+            }
             Some(config) => {
                 let acceptor = TlsAcceptor::from(config);
                 tokio::spawn(tcp_listener(ws, addr, Some(acceptor), events)).abort_handle()
@@ -324,6 +361,7 @@ async fn udp_listener(ws: WsId, addr: SocketAddr, events: UnboundedSender<Event>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quinn::crypto::rustls::QuicClientConfig;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::client::danger::{
@@ -507,7 +545,7 @@ mod tests {
         }
     }
 
-    fn tls_client(alpn: &[u8]) -> TlsConnector {
+    fn client_config(alpn: &[u8]) -> ClientConfig {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -516,7 +554,11 @@ mod tests {
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
             .with_no_client_auth();
         config.alpn_protocols = vec![alpn.to_vec()];
-        TlsConnector::from(Arc::new(config))
+        config
+    }
+
+    fn tls_client(alpn: &[u8]) -> TlsConnector {
+        TlsConnector::from(Arc::new(client_config(alpn)))
     }
 
     /// Starts a TLS listener with a self-signed certificate and the given ALPN.
@@ -601,6 +643,171 @@ mod tests {
         };
         assert_eq!(s, sess);
         assert!(error.starts_with("tls handshake failed: "), "{error}");
+    }
+
+    /// Starts a QUIC listener with a self-signed certificate and the given ALPN.
+    async fn listen_quic(alpn: &str) -> (UnboundedReceiver<Event>, SocketAddr, AbortHandle) {
+        let server = tls::build(&tls::TlsConfig {
+            cert: tls::CertSource::SelfSigned,
+            alpn: vec![alpn.into()],
+        })
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let handle = spawn_listener(1, Protocol::Quic, addr, Some(server.config), tx);
+        let NetEvent::Listening { ws: 1, local, .. } = next(&mut rx).await else {
+            panic!("expected Listening");
+        };
+        (rx, local, handle)
+    }
+
+    /// The client endpoint must outlive the connection.
+    async fn quic_connect(
+        server: SocketAddr,
+        alpn: &[u8],
+    ) -> (
+        quinn::Endpoint,
+        Result<quinn::Connection, quinn::ConnectionError>,
+    ) {
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let crypto = QuicClientConfig::try_from(Arc::new(client_config(alpn))).unwrap();
+        let config = quinn::ClientConfig::new(Arc::new(crypto));
+        let connecting = endpoint.connect_with(config, server, "localhost").unwrap();
+        let conn = timeout(WAIT, connecting).await.unwrap();
+        (endpoint, conn)
+    }
+
+    /// Collects one stream's data until the peer finishes it.
+    async fn stream_text(rx: &mut UnboundedReceiver<Event>, want: quic::StreamId) -> Vec<u8> {
+        let mut text = Vec::new();
+        loop {
+            match next(rx).await {
+                NetEvent::StreamData { stream, bytes, .. } if stream == want => text.extend(bytes),
+                NetEvent::StreamEnded {
+                    stream,
+                    end: quic::StreamEnd::PeerFinished,
+                    ..
+                } if stream == want => return text,
+                _ => panic!("expected data on stream {want}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_streams_flow_both_ways() {
+        let (mut rx, local, _listener) = listen_quic("outpost-test").await;
+        let (endpoint, conn) = quic_connect(local, b"outpost-test").await;
+        let conn = conn.unwrap();
+
+        let NetEvent::Accepted { peer, outlet, .. } = next(&mut rx).await else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(peer.port(), endpoint.local_addr().unwrap().port());
+        let NetEvent::Secured { summary, .. } = next(&mut rx).await else {
+            panic!("expected Secured");
+        };
+        assert_eq!(summary, "quic · alpn outpost-test · sni localhost");
+
+        // A request on the client's first stream, answered on the same one.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /\r\n").await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(stream_text(&mut rx, 0).await, b"GET /\r\n");
+        assert!(outlet.quic(quic::QuicOut::Write {
+            stream: 0,
+            bytes: b"hello\n".to_vec(),
+        }));
+        assert!(outlet.quic(quic::QuicOut::Finish(0)));
+        let reply = timeout(WAIT, recv.read_to_end(100)).await.unwrap().unwrap();
+        assert_eq!(reply, b"hello\n");
+
+        // Writing to the server's first stream ID opens it.
+        assert!(outlet.quic(quic::QuicOut::Write {
+            stream: quic::server_bidi(0),
+            bytes: b"push\n".to_vec(),
+        }));
+        let (_send, mut pushed) = timeout(WAIT, conn.accept_bi()).await.unwrap().unwrap();
+        assert_eq!(quinn::VarInt::from(pushed.id()).into_inner(), 1);
+        let mut buf = [0u8; 5];
+        timeout(WAIT, pushed.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"push\n");
+
+        // A one-way stream from the client.
+        let mut uni = conn.open_uni().await.unwrap();
+        uni.write_all(b"one-way").await.unwrap();
+        uni.finish().unwrap();
+        assert_eq!(stream_text(&mut rx, 2).await, b"one-way");
+
+        // Dropping the outlet closes the connection cleanly.
+        drop(outlet);
+        let closed = timeout(WAIT, conn.closed()).await.unwrap();
+        assert!(
+            matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+            "{closed}"
+        );
+        let NetEvent::Closed { error: None, .. } = next(&mut rx).await else {
+            panic!("expected a clean Closed");
+        };
+    }
+
+    #[tokio::test]
+    async fn quic_peer_close_reports_nonzero_codes() {
+        let (mut rx, local, _listener) = listen_quic("outpost-test").await;
+        for (code, want_error) in [(0, false), (7, true)] {
+            let (_endpoint, conn) = quic_connect(local, b"outpost-test").await;
+            let conn = conn.unwrap();
+            // Keep the outlet: dropping it would hang up from our side first.
+            let NetEvent::Accepted {
+                outlet: _outlet, ..
+            } = next(&mut rx).await
+            else {
+                panic!("expected Accepted");
+            };
+            let NetEvent::Secured { .. } = next(&mut rx).await else {
+                panic!("expected Secured");
+            };
+            conn.close(quinn::VarInt::from_u32(code), b"bye");
+            let NetEvent::Closed { error, .. } = next(&mut rx).await else {
+                panic!("expected Closed");
+            };
+            assert_eq!(error.is_some(), want_error, "code {code}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_with_the_wrong_alpn_fails_the_handshake() {
+        let (mut rx, local, _listener) = listen_quic("outpost-test").await;
+        let (_endpoint, conn) = quic_connect(local, b"h3").await;
+        assert!(conn.is_err());
+        let NetEvent::Accepted { .. } = next(&mut rx).await else {
+            panic!("expected Accepted");
+        };
+        let NetEvent::Closed {
+            error: Some(error), ..
+        } = next(&mut rx).await
+        else {
+            panic!("expected Closed with an error");
+        };
+        assert!(error.starts_with("quic handshake failed: "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn aborting_a_quic_listener_frees_its_port() {
+        let (_rx, local, listener) = listen_quic("outpost-test").await;
+        listener.abort();
+        let rebound = timeout(WAIT, async {
+            loop {
+                if let Ok(socket) = UdpSocket::bind(local).await {
+                    return socket;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(rebound.is_ok(), "port {local} was not released");
     }
 
     #[tokio::test]

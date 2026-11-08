@@ -13,6 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
 
 use crate::Event;
+use crate::net::quic::{self, QuicOut, StreamEnd, StreamId};
 use crate::net::tls::{CertSource, TlsConfig, TlsServer};
 use crate::net::{self, NetEvent, Outlet, Protocol, SessId, UdpOut, WsId};
 use crate::text_input::TextInput;
@@ -122,8 +123,8 @@ impl Workspace {
             handle.abort();
         }
         self.udp_out = None;
-        // TCP connections outlive their listener; UDP sessions share its socket.
-        if self.config.protocol == Protocol::Udp {
+        // TCP connections outlive their listener; UDP and QUIC sessions share its socket.
+        if matches!(self.config.protocol, Protocol::Udp | Protocol::Quic) {
             for s in &mut self.sessions {
                 s.close(Some("listener stopped".into()));
             }
@@ -149,6 +150,65 @@ pub enum Dir {
 pub struct Line {
     pub dir: Dir,
     pub text: String,
+    /// The QUIC stream it belongs to.
+    pub stream: Option<StreamId>,
+}
+
+/// A QUIC session's streams.
+#[derive(Default)]
+pub struct Streams {
+    /// Every stream seen, in order. Lines get stream tags once there are two.
+    pub seen: Vec<StreamId>,
+    /// Bidirectional streams we can still send on, in the order seen.
+    pub writable: Vec<StreamId>,
+    /// Where the next line goes; `None` opens a new stream.
+    pub send_to: Option<StreamId>,
+    /// How many streams we have opened.
+    opened: u64,
+}
+
+impl Streams {
+    pub fn tagged(&self) -> bool {
+        self.seen.len() > 1
+    }
+
+    fn see(&mut self, stream: StreamId) {
+        if !self.seen.contains(&stream) {
+            self.seen.push(stream);
+            if quic::is_bidi(stream) {
+                self.writable.push(stream);
+            }
+        }
+    }
+
+    /// Opens our next stream, which the connection will number the same way.
+    fn open(&mut self) -> StreamId {
+        let stream = quic::server_bidi(self.opened);
+        self.opened += 1;
+        self.see(stream);
+        stream
+    }
+
+    /// Steps the send target through the writable streams, then "new".
+    fn cycle(&mut self, delta: isize) {
+        let options: Vec<Option<StreamId>> = self
+            .writable
+            .iter()
+            .copied()
+            .map(Some)
+            .chain([None])
+            .collect();
+        let index = options.iter().position(|&o| o == self.send_to).unwrap_or(0) as isize;
+        self.send_to = options[(index + delta).rem_euclid(options.len() as isize) as usize];
+    }
+
+    /// We can't send on `stream` any more; target the newest one left instead.
+    fn stop_sending(&mut self, stream: StreamId) {
+        self.writable.retain(|&s| s != stream);
+        if self.send_to == Some(stream) {
+            self.send_to = self.writable.last().copied();
+        }
+    }
 }
 
 pub struct Session {
@@ -166,10 +226,13 @@ pub struct Session {
     pub input: TextInput,
     /// Rows scrolled up from the bottom of the transcript.
     pub scroll: usize,
+    /// QUIC sessions only.
+    pub streams: Option<Streams>,
 }
 
 impl Session {
     fn new(id: SessId, peer: SocketAddr, outlet: Outlet) -> Self {
+        let streams = matches!(outlet, Outlet::Quic(_)).then(Streams::default);
         Self {
             id,
             name: None,
@@ -178,6 +241,7 @@ impl Session {
             lines: vec![Line {
                 dir: Dir::Info,
                 text: format!("connected from {peer}"),
+                stream: None,
             }],
             in_open: false,
             unread: true,
@@ -185,6 +249,7 @@ impl Session {
             bytes_out: 0,
             input: TextInput::default(),
             scroll: 0,
+            streams,
         }
     }
 
@@ -207,13 +272,52 @@ impl Session {
     }
 
     fn push(&mut self, dir: Dir, text: String) {
-        self.lines.push(Line { dir, text });
+        self.push_on(dir, None, text);
+    }
+
+    /// Adds a line; whatever incoming line was still open is now closed.
+    fn push_on(&mut self, dir: Dir, stream: Option<StreamId>, text: String) {
+        self.in_open = false;
+        self.lines.push(Line { dir, text, stream });
         if self.lines.len() > MAX_LINES {
             self.lines.drain(..self.lines.len() - MAX_LINES);
         }
     }
 
     fn receive(&mut self, bytes: &[u8]) {
+        self.receive_on(None, bytes);
+    }
+
+    /// QUIC data. Replies go to the stream that last sent something.
+    fn receive_stream(&mut self, stream: StreamId, bytes: &[u8]) {
+        if let Some(streams) = &mut self.streams {
+            streams.see(stream);
+            if streams.writable.contains(&stream) {
+                streams.send_to = Some(stream);
+            }
+        }
+        self.receive_on(Some(stream), bytes);
+    }
+
+    fn stream_ended(&mut self, stream: StreamId, end: StreamEnd) {
+        let text = match end {
+            StreamEnd::PeerFinished => "peer finished sending".to_string(),
+            StreamEnd::PeerReset(code) => format!("reset by peer (code {code})"),
+            StreamEnd::WriteFailed(e) => {
+                if let Some(streams) = &mut self.streams {
+                    streams.stop_sending(stream);
+                }
+                format!("can't send: {e}")
+            }
+        };
+        self.push_on(Dir::Info, Some(stream), text);
+    }
+
+    fn receive_on(&mut self, stream: Option<StreamId>, bytes: &[u8]) {
+        // A different stream's data starts its own line.
+        if self.in_open && self.lines.last().map(|l| l.stream) != Some(stream) {
+            self.in_open = false;
+        }
         self.bytes_in += bytes.len() as u64;
         self.unread = true;
         // Lossy: a multi-byte character split across reads shows as U+FFFD.
@@ -223,13 +327,13 @@ impl Session {
             }
             if ch == '\n' {
                 if !self.in_open {
-                    self.push(Dir::In, String::new());
+                    self.push_on(Dir::In, stream, String::new());
                 }
                 self.in_open = false;
                 continue;
             }
             if !self.in_open {
-                self.push(Dir::In, String::new());
+                self.push_on(Dir::In, stream, String::new());
                 self.in_open = true;
             }
             let line = &mut self.lines.last_mut().expect("just pushed").text;
@@ -247,14 +351,50 @@ impl Session {
         let mut bytes = text.clone().into_bytes();
         bytes.push(b'\n');
         let len = bytes.len() as u64;
-        if !outlet.send(bytes) {
+        let (sent, stream) = match &mut self.streams {
+            Some(streams) => {
+                let stream = match streams.send_to {
+                    Some(stream) => stream,
+                    None => {
+                        let stream = streams.open();
+                        streams.send_to = Some(stream);
+                        stream
+                    }
+                };
+                (outlet.quic(QuicOut::Write { stream, bytes }), Some(stream))
+            }
+            None => (outlet.send(bytes), None),
+        };
+        if !sent {
             self.close(Some("send failed".into()));
             return;
         }
         self.bytes_out += len;
-        self.in_open = false;
-        self.push(Dir::Out, text);
+        self.push_on(Dir::Out, stream, text);
         self.scroll = 0;
+    }
+
+    /// Ends our side of the QUIC stream we're sending on.
+    fn finish_stream(&mut self) {
+        let (Some(outlet), Some(streams)) = (&self.outlet, &mut self.streams) else {
+            return;
+        };
+        let Some(stream) = streams.send_to else {
+            return;
+        };
+        if outlet.quic(QuicOut::Finish(stream)) {
+            streams.stop_sending(stream);
+            self.push_on(Dir::Info, Some(stream), "finished sending".into());
+        }
+    }
+
+    /// Picks the QUIC stream the next line goes to.
+    fn cycle_stream(&mut self, delta: isize) {
+        if self.is_open()
+            && let Some(streams) = &mut self.streams
+        {
+            streams.cycle(delta);
+        }
     }
 
     fn close(&mut self, error: Option<String>) {
@@ -353,7 +493,7 @@ impl SettingsForm {
     /// The rows shown for the current choices, top to bottom.
     pub fn fields(&self) -> Vec<Field> {
         let mut fields = vec![Field::Protocol, Field::Address, Field::Port];
-        if self.protocol == Protocol::Tls {
+        if self.protocol.uses_tls() {
             fields.push(Field::Cert);
             if self.cert == CertKind::Files {
                 fields.extend([Field::CertFile, Field::KeyFile]);
@@ -564,6 +704,20 @@ impl App {
                     s.receive(&bytes);
                 }
             }
+            NetEvent::StreamData {
+                sess,
+                stream,
+                bytes,
+            } => {
+                if let Some(s) = self.session_mut(sess) {
+                    s.receive_stream(stream, &bytes);
+                }
+            }
+            NetEvent::StreamEnded { sess, stream, end } => {
+                if let Some(s) = self.session_mut(sess) {
+                    s.stream_ended(stream, end);
+                }
+            }
             NetEvent::Closed { sess, error } => {
                 if let Some(s) = self.session_mut(sess) {
                     s.close(error);
@@ -616,6 +770,11 @@ impl App {
         let Some(s) = self.focused_session_mut() else {
             return;
         };
+        // End of input, as in a terminal: finishes the QUIC stream.
+        if ctrl && key.code == KeyCode::Char('d') && s.input.len() == 0 {
+            s.finish_stream();
+            return;
+        }
         if s.is_open() && s.input.edit(&key) {
             return;
         }
@@ -638,6 +797,16 @@ impl App {
             KeyCode::Char('s') => self.open_settings_form(),
             KeyCode::Char('n') => self.cycle_tab(1),
             KeyCode::Char('p') => self.cycle_tab(-1),
+            KeyCode::Tab => {
+                if let Some(s) = self.focused_session_mut() {
+                    s.cycle_stream(1);
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(s) = self.focused_session_mut() {
+                    s.cycle_stream(-1);
+                }
+            }
             KeyCode::Char(c @ '1'..='9') => self.select_tab(c as usize - '1' as usize),
             KeyCode::Char('j') | KeyCode::Down => self.cycle_workspace(1),
             KeyCode::Char('k') | KeyCode::Up => self.cycle_workspace(-1),
@@ -912,6 +1081,14 @@ impl App {
                 } else if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(pos))
                 {
                     self.select_tab(tab);
+                } else if self.hits.send_stream.contains(pos) {
+                    if let Some(s) = self.focused_session_mut() {
+                        s.cycle_stream(1);
+                    }
+                } else if self.hits.finish_stream.contains(pos) {
+                    if let Some(s) = self.focused_session_mut() {
+                        s.finish_stream();
+                    }
                 } else if let Some((TextTarget::Session, cursor)) = text_hit
                     && let Some(s) = self.focused_session_mut()
                 {
@@ -1049,11 +1226,16 @@ impl App {
         let config = ListenerConfig {
             protocol: form.protocol,
             addr: SocketAddr::new(ip, port),
-            tls: match form.protocol {
-                Protocol::Tls => form.tls_config()?,
-                Protocol::Tcp | Protocol::Udp => TlsConfig::default(),
+            tls: if form.protocol.uses_tls() {
+                form.tls_config()?
+            } else {
+                TlsConfig::default()
             },
         };
+        // Without ALPN, no QUIC client can complete a handshake.
+        if config.protocol == Protocol::Quic && config.tls.alpn.is_empty() {
+            return Err("quic needs an alpn protocol, e.g. h3".into());
+        }
         if self.workspaces.iter().any(|ws| {
             Some(ws.id) != form.target
                 && ws.config.protocol == config.protocol
@@ -1067,8 +1249,8 @@ impl App {
             .target
             .and_then(|id| self.workspaces.iter().find(|ws| ws.id == id));
         let tls = match current {
-            _ if config.protocol != Protocol::Tls => None,
-            Some(ws) if ws.config.protocol == Protocol::Tls && ws.config.tls == config.tls => {
+            _ if !config.protocol.uses_tls() => None,
+            Some(ws) if ws.config.protocol.uses_tls() && ws.config.tls == config.tls => {
                 match &ws.tls {
                     Some(tls) => Some(tls.clone()),
                     None => Some(net::tls::build(&config.tls)?),
@@ -1248,6 +1430,24 @@ impl App {
             sess,
             peer: peer.parse().expect("test peer"),
             outlet: Outlet::Tcp(tx),
+        }));
+        (sess, rx)
+    }
+
+    /// Like [`App::add_test_session`] for a QUIC connection: the receiver gets
+    /// each write and finish the app asks for.
+    pub fn add_test_quic_session(
+        &mut self,
+        ws: WsId,
+        peer: &str,
+    ) -> (SessId, tokio::sync::mpsc::UnboundedReceiver<QuicOut>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sess = net::next_id();
+        self.handle(Event::Net(NetEvent::Accepted {
+            ws,
+            sess,
+            peer: peer.parse().expect("test peer"),
+            outlet: Outlet::Quic(tx),
         }));
         (sess, rx)
     }

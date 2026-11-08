@@ -59,6 +59,10 @@ pub struct Hits {
     pub form: Vec<(Rect, FormHit)>,
     /// Text fields: (area, field, index of the first visible char).
     pub text: Vec<(Rect, TextTarget, usize)>,
+    /// QUIC sessions: the stream the input goes to (click to cycle), and the
+    /// button that finishes it.
+    pub send_stream: Rect,
+    pub finish_stream: Rect,
     /// Close-confirmation buttons.
     pub confirm: Rect,
     pub cancel: Rect,
@@ -422,12 +426,17 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             put(buf, x, y, right, &s.label(), name_style);
             // Status sits on the second row: a full IPv4 peer barely fits the first.
             let state_x = right.saturating_sub(state.len() as u16);
+            let detail_right = state_x.saturating_sub(1);
+            // Shorten the workspace label first so the byte count stays visible.
+            let bytes = format!(" · ↓{}", human(s.bytes_in));
+            let room = detail_right.saturating_sub(rect.x + 3) as usize;
+            let label = shorten(&ws.label(), room.saturating_sub(bytes.chars().count()));
             put(
                 buf,
                 rect.x + 3,
                 y + 1,
-                state_x.saturating_sub(1),
-                &format!("{} · ↓{}", ws.label(), human(s.bytes_in)),
+                detail_right,
+                &format!("{label}{bytes}"),
                 Style::new().fg(OVERLAY0),
             );
             put(buf, state_x, y + 1, right, state, Style::new().fg(color));
@@ -435,6 +444,18 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             y += 2;
         }
     }
+}
+
+/// `text` cut to `width` chars, ending in `…` when cut.
+fn shorten(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut short: String = text.chars().take(width.saturating_sub(1)).collect();
+    if width > 0 {
+        short.push('…');
+    }
+    short
 }
 
 fn tab_label(s: &Session) -> String {
@@ -645,7 +666,7 @@ fn render_pane(buf: &mut Buffer, area: Rect, app: &mut App, hits: &mut Hits) -> 
         );
         return None;
     }
-    let x = put(
+    let mut x = put(
         buf,
         inner.x,
         input_y,
@@ -653,11 +674,41 @@ fn render_pane(buf: &mut Buffer, area: Rect, app: &mut App, hits: &mut Hits) -> 
         "❯ ",
         Style::new().fg(ACCENT),
     );
+    let mut right = inner.right();
+    if let Some(streams) = &s.streams {
+        let label = match streams.send_to {
+            Some(stream) => format!(" s{stream} "),
+            None => " new ".into(),
+        };
+        let end = put(
+            buf,
+            x,
+            input_y,
+            right,
+            &label,
+            Style::new().fg(ACCENT).bg(SURFACE0),
+        );
+        hits.send_stream = Rect::new(x, input_y, end - x, 1);
+        x = end + 1;
+        if streams.send_to.is_some() && right >= x + 6 {
+            let start = right - 5;
+            put(
+                buf,
+                start,
+                input_y,
+                right,
+                " fin ",
+                Style::new().fg(OVERLAY0).bg(SURFACE0),
+            );
+            hits.finish_stream = Rect::new(start, input_y, 5, 1);
+            right = start - 1;
+        }
+    }
     let cursor = render_input(
         buf,
         x,
         input_y,
-        inner.right(),
+        right,
         &s.input,
         Style::new().fg(TEXT),
         TextTarget::Session,
@@ -680,6 +731,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 fn render_transcript(buf: &mut Buffer, area: Rect, s: &mut Session) {
     let height = area.height as usize;
     let needed = height + s.scroll;
+    let tagged = s.streams.as_ref().is_some_and(|streams| streams.tagged());
     // Wrap from the newest line backwards, stopping once enough rows exist.
     let mut rows: Vec<(String, Style)> = Vec::new();
     'lines: for line in s.lines.iter().rev() {
@@ -691,7 +743,11 @@ fn render_transcript(buf: &mut Buffer, area: Rect, s: &mut Session) {
                 Style::new().fg(OVERLAY0).add_modifier(Modifier::ITALIC),
             ),
         };
-        for row in wrap(&format!("{prefix}{}", line.text), area.width as usize)
+        let tag = match line.stream {
+            Some(stream) if tagged => format!("[s{stream}] "),
+            _ => String::new(),
+        };
+        for row in wrap(&format!("{prefix}{tag}{}", line.text), area.width as usize)
             .into_iter()
             .rev()
         {
@@ -785,7 +841,7 @@ fn render_settings(
     hits: &mut Hits,
 ) -> Option<Position> {
     let fields = form.fields();
-    let fingerprint = fingerprint.filter(|_| form.protocol == Protocol::Tls);
+    let fingerprint = fingerprint.filter(|_| form.protocol.uses_tls());
     let rows = fields.len() as u16 + if fingerprint.is_some() { 2 } else { 0 };
     let rect = centered(area, 58, rows + 6);
     Clear.render(rect, buf);
@@ -845,7 +901,13 @@ fn render_settings(
             Field::Port => Some((&form.port, TextTarget::Port, "")),
             Field::CertFile => Some((&form.cert_file, TextTarget::CertFile, "PEM file")),
             Field::KeyFile => Some((&form.key_file, TextTarget::KeyFile, "PEM file")),
-            Field::Alpn => Some((&form.alpn, TextTarget::Alpn, "none")),
+            Field::Alpn => {
+                let placeholder = match form.protocol {
+                    Protocol::Quic => "required, e.g. h3",
+                    _ => "none",
+                };
+                Some((&form.alpn, TextTarget::Alpn, placeholder))
+            }
         };
         if let Some((input, target, placeholder)) = text {
             let at = render_input(
@@ -1134,6 +1196,8 @@ fn render_help(buf: &mut Buffer, area: Rect) {
         ("right-click", "rename / close menu"),
         ("prefix q", "quit"),
         ("enter", "send input line"),
+        ("prefix (⇧)tab", "quic: cycle send stream"),
+        ("ctrl+d", "quic: finish send stream"),
         ("pgup / pgdn", "scroll transcript"),
     ];
     let rect = centered(area, 46, KEYS.len() as u16 + 4);
@@ -1371,6 +1435,72 @@ mod tests {
         assert!(at("alpn") < at("sha256"));
         assert!(at("sha256") < at("no private key"));
         assert!(at("no private key") < at("tab field"));
+    }
+
+    #[test]
+    fn quic_tab_tags_streams_and_shows_the_send_stream() {
+        let (mut app, _rx) = App::test_new();
+        let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+        let (sess, _out) = app.add_test_quic_session(ws, "255.255.255.255:65535");
+        let data = |app: &mut App, stream, bytes: &[u8]| {
+            app.handle(Event::Net(NetEvent::StreamData {
+                sess,
+                stream,
+                bytes: bytes.to_vec(),
+            }))
+        };
+
+        // One stream: no tags yet.
+        data(&mut app, 0, b"GET /index.html\r\n");
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "│GET /index.html");
+        let input = row_with(&rows, "❯  s0  ");
+        assert!(input.contains(" fin │"), "{input:?}");
+
+        // A second stream tags every stream line.
+        data(&mut app, 4, b"GET /other\r\n");
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "│[s0] GET /index.html");
+        row_with(&rows, "│[s4] GET /other");
+        row_with(&rows, "❯  s4  ");
+        row_with(&rows, "── connected from 255.255.255.255:65535");
+        // The session row keeps its byte count; the workspace label gives way.
+        row_with(&rows, "   quic :44… · ↓29B open ");
+
+        app.handle(Event::Input(ratatui::crossterm::event::Event::Key(
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('d'),
+                ratatui::crossterm::event::KeyModifiers::CONTROL,
+            ),
+        )));
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "── [s4] finished sending");
+        row_with(&rows, "❯  s0  ");
+    }
+
+    #[test]
+    fn quic_form_asks_for_alpn_and_help_lists_stream_keys() {
+        let (mut app, _rx) = App::test_new();
+        app.mode = Mode::Settings(SettingsForm {
+            target: None,
+            protocol: Protocol::Quic,
+            address: "0.0.0.0".into(),
+            port: "4433".into(),
+            cert: CertKind::SelfSigned,
+            cert_file: "".into(),
+            key_file: "".into(),
+            alpn: "".into(),
+            field: Field::Protocol,
+            error: None,
+        });
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "protocol    tcp   udp   tls   quic ");
+        row_with(&rows, "alpn       required, e.g. h3");
+
+        app.mode = Mode::Help;
+        let rows = render_rows(&mut app, W, H);
+        row_with(&rows, "prefix (⇧)tab  quic: cycle send stream");
+        row_with(&rows, "ctrl+d         quic: finish send stream");
     }
 
     #[test]

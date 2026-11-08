@@ -1242,7 +1242,8 @@ fn open_tls_form(app: &mut App) {
     }
     type_str(app, "0");
     key(app, KeyCode::Tab); // -> protocol
-    key(app, KeyCode::Left); // tcp wraps round to tls
+    key(app, KeyCode::Right);
+    key(app, KeyCode::Right); // -> tls
     key(app, KeyCode::Tab); // -> address
     for _ in 0..7 {
         key(app, KeyCode::Backspace);
@@ -1267,16 +1268,16 @@ fn fingerprint(app: &App) -> String {
 }
 
 #[test]
-fn protocol_arrows_cycle_through_tls() {
+fn protocol_arrows_cycle_through_every_protocol() {
     let (mut app, _rx) = App::test_new();
     prefix(&mut app, 'N');
     key(&mut app, KeyCode::Tab); // -> protocol
-    for want in [Protocol::Udp, Protocol::Tls, Protocol::Tcp] {
+    for want in [Protocol::Udp, Protocol::Tls, Protocol::Quic, Protocol::Tcp] {
         key(&mut app, KeyCode::Right);
         assert_eq!(form(&app).protocol, want);
     }
     key(&mut app, KeyCode::Left);
-    assert_eq!(form(&app).protocol, Protocol::Tls);
+    assert_eq!(form(&app).protocol, Protocol::Quic);
 }
 
 #[test]
@@ -1286,7 +1287,8 @@ fn tls_adds_cert_and_alpn_fields_to_the_tab_order() {
     key(&mut app, KeyCode::Tab); // -> protocol
     use Field::*;
     assert_eq!(form(&app).fields(), [Protocol, Address, Port]);
-    key(&mut app, KeyCode::Left); // -> tls
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right); // -> tls
     assert_eq!(form(&app).fields(), [Protocol, Address, Port, Cert, Alpn]);
 
     for _ in 0..3 {
@@ -1325,7 +1327,8 @@ fn cert_files_are_required_and_must_exist() {
     let (mut app, _rx) = App::test_new();
     prefix(&mut app, 'N');
     key(&mut app, KeyCode::Tab); // -> protocol
-    key(&mut app, KeyCode::Left); // -> tls
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right); // -> tls
     for _ in 0..3 {
         key(&mut app, KeyCode::Tab); // -> cert
     }
@@ -1470,7 +1473,8 @@ fn clicking_cert_buttons_and_path_fields() {
     let (mut app, _rx) = App::test_new();
     prefix(&mut app, 'N');
     key(&mut app, KeyCode::Tab); // -> protocol
-    key(&mut app, KeyCode::Left); // -> tls
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right); // -> tls
     render_rows(&mut app, 120, 32);
 
     let files = form_target(&app, |h| matches!(h, FormHit::Cert(CertKind::Files)));
@@ -1488,4 +1492,293 @@ fn clicking_cert_buttons_and_path_fields() {
     let self_signed = form_target(&app, |h| matches!(h, FormHit::Cert(CertKind::SelfSigned)));
     click(&mut app, self_signed);
     assert_eq!(form(&app).cert, CertKind::SelfSigned);
+}
+
+// ---- QUIC ----
+
+fn stream_data(app: &mut App, sess: SessId, stream: StreamId, bytes: &[u8]) {
+    app.handle(Event::Net(NetEvent::StreamData {
+        sess,
+        stream,
+        bytes: bytes.to_vec(),
+    }));
+}
+
+fn prefix_key(app: &mut App, code: KeyCode) {
+    app.handle(Event::Input(TermEvent::Key(KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL,
+    ))));
+    key(app, code);
+}
+
+fn ctrl_d(app: &mut App) {
+    app.handle(Event::Input(TermEvent::Key(KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+    ))));
+}
+
+fn streams(app: &App) -> &Streams {
+    app.workspaces[0].sessions[0]
+        .streams
+        .as_ref()
+        .expect("QUIC session")
+}
+
+fn write(stream: StreamId, text: &str) -> QuicOut {
+    QuicOut::Write {
+        stream,
+        bytes: text.as_bytes().to_vec(),
+    }
+}
+
+/// Transcript lines as (dir, stream, text), skipping the connect line.
+fn stream_lines(app: &App) -> Vec<(Dir, Option<StreamId>, String)> {
+    app.workspaces[0].sessions[0].lines[1..]
+        .iter()
+        .map(|line| (line.dir, line.stream, line.text.clone()))
+        .collect()
+}
+
+#[test]
+fn quic_replies_go_to_the_stream_that_last_sent() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, mut out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    assert_eq!(streams(&app).send_to, None, "nothing to reply to yet");
+
+    stream_data(&mut app, sess, 0, b"GET /\r\n");
+    assert_eq!(streams(&app).send_to, Some(0));
+    type_str(&mut app, "hello");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(out.try_recv().unwrap(), write(0, "hello\n"));
+
+    stream_data(&mut app, sess, 4, b"again\n");
+    assert_eq!(streams(&app).send_to, Some(4));
+    type_str(&mut app, "hi");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(out.try_recv().unwrap(), write(4, "hi\n"));
+
+    assert_eq!(
+        stream_lines(&app),
+        [
+            (Dir::In, Some(0), "GET /".into()),
+            (Dir::Out, Some(0), "hello".into()),
+            (Dir::In, Some(4), "again".into()),
+            (Dir::Out, Some(4), "hi".into()),
+        ]
+    );
+    assert!(streams(&app).tagged());
+}
+
+#[test]
+fn quic_one_way_streams_are_not_reply_targets() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, _out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    stream_data(&mut app, sess, 0, b"a\n");
+    stream_data(&mut app, sess, 2, b"b\n");
+    assert_eq!(streams(&app).send_to, Some(0));
+    assert_eq!(streams(&app).seen, [0, 2]);
+    assert_eq!(streams(&app).writable, [0]);
+}
+
+#[test]
+fn quic_new_streams_take_the_next_server_ids() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (_sess, mut out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+
+    type_str(&mut app, "first");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(out.try_recv().unwrap(), write(1, "first\n"));
+    assert_eq!(streams(&app).send_to, Some(1), "then sticks to it");
+
+    prefix_key(&mut app, KeyCode::Tab); // -> new
+    assert_eq!(streams(&app).send_to, None);
+    type_str(&mut app, "second");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(out.try_recv().unwrap(), write(5, "second\n"));
+}
+
+#[test]
+fn quic_prefix_tab_cycles_streams_then_new() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, _out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    stream_data(&mut app, sess, 0, b"a\n");
+    stream_data(&mut app, sess, 4, b"b\n");
+    for want in [None, Some(0), Some(4)] {
+        prefix_key(&mut app, KeyCode::Tab);
+        assert_eq!(streams(&app).send_to, want);
+    }
+    prefix_key(&mut app, KeyCode::BackTab);
+    assert_eq!(streams(&app).send_to, Some(0));
+}
+
+#[test]
+fn quic_ctrl_d_finishes_the_send_stream() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, mut out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    stream_data(&mut app, sess, 0, b"a\n");
+    stream_data(&mut app, sess, 4, b"b\n");
+
+    type_str(&mut app, "x");
+    ctrl_d(&mut app);
+    assert!(out.try_recv().is_err(), "only on an empty line");
+
+    key(&mut app, KeyCode::Backspace);
+    ctrl_d(&mut app);
+    assert_eq!(out.try_recv().unwrap(), QuicOut::Finish(4));
+    assert_eq!(streams(&app).writable, [0]);
+    assert_eq!(
+        streams(&app).send_to,
+        Some(0),
+        "falls back to the newest left"
+    );
+    assert_eq!(
+        stream_lines(&app).last().unwrap(),
+        &(Dir::Info, Some(4), "finished sending".into())
+    );
+
+    // Data on a finished stream doesn't make it a reply target again.
+    stream_data(&mut app, sess, 4, b"late\n");
+    assert_eq!(streams(&app).send_to, Some(0));
+}
+
+#[test]
+fn quic_stream_endings_are_noted() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, _out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    stream_data(&mut app, sess, 0, b"a\n");
+    stream_data(&mut app, sess, 4, b"b\n");
+    for (stream, end) in [
+        (0, StreamEnd::PeerFinished),
+        (4, StreamEnd::PeerReset(9)),
+        (
+            4,
+            StreamEnd::WriteFailed("sending stopped by peer: error 5".into()),
+        ),
+    ] {
+        app.handle(Event::Net(NetEvent::StreamEnded { sess, stream, end }));
+    }
+    let lines = stream_lines(&app);
+    assert_eq!(
+        lines[2..],
+        [
+            (Dir::Info, Some(0), "peer finished sending".into()),
+            (Dir::Info, Some(4), "reset by peer (code 9)".into()),
+            (
+                Dir::Info,
+                Some(4),
+                "can't send: sending stopped by peer: error 5".into()
+            ),
+        ]
+    );
+    assert_eq!(streams(&app).writable, [0], "still writable after peer FIN");
+    assert_eq!(streams(&app).send_to, Some(0));
+}
+
+#[test]
+fn quic_interleaved_streams_keep_their_own_lines() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, _out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    stream_data(&mut app, sess, 0, b"GE");
+    stream_data(&mut app, sess, 4, b"x");
+    stream_data(&mut app, sess, 4, b"y\n");
+    stream_data(&mut app, sess, 0, b"T\n");
+    assert_eq!(
+        stream_lines(&app),
+        [
+            (Dir::In, Some(0), "GE".into()),
+            (Dir::In, Some(4), "xy".into()),
+            (Dir::In, Some(0), "T".into()),
+        ]
+    );
+}
+
+#[test]
+fn quic_stream_controls_work_with_the_mouse() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (sess, mut out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    stream_data(&mut app, sess, 0, b"a\n");
+
+    render_rows(&mut app, 120, 32);
+    let finish = app.hits.finish_stream;
+    click(&mut app, finish);
+    assert_eq!(out.try_recv().unwrap(), QuicOut::Finish(0));
+    assert_eq!(streams(&app).send_to, None);
+
+    stream_data(&mut app, sess, 4, b"b\n");
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.hits.finish_stream.width, 5);
+    let target = app.hits.send_stream;
+    click(&mut app, target);
+    assert_eq!(streams(&app).send_to, None, "s4 -> new");
+    render_rows(&mut app, 120, 32);
+    assert_eq!(app.hits.finish_stream.width, 0, "nothing to finish on new");
+}
+
+#[test]
+fn quic_needs_alpn() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 'N');
+    key(&mut app, KeyCode::Tab); // -> protocol
+    key(&mut app, KeyCode::Left); // tcp wraps round to quic
+    assert_eq!(form(&app).protocol, Protocol::Quic);
+    assert_eq!(
+        form(&app).fields(),
+        [
+            Field::Protocol,
+            Field::Address,
+            Field::Port,
+            Field::Cert,
+            Field::Alpn
+        ]
+    );
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form(&app).error.as_deref(),
+        Some("quic needs an alpn protocol, e.g. h3")
+    );
+    assert!(app.workspaces.is_empty());
+}
+
+#[tokio::test]
+async fn switching_tls_to_quic_keeps_the_certificate() {
+    let (mut app, mut rx) = App::test_new();
+    open_tls_form(&mut app);
+    key(&mut app, KeyCode::Tab); // -> port
+    key(&mut app, KeyCode::Tab); // -> cert
+    key(&mut app, KeyCode::Tab); // -> alpn
+    type_str(&mut app, "h3");
+    key(&mut app, KeyCode::Enter);
+    let ev = next_event(&mut rx).await;
+    app.handle(ev);
+    let original = fingerprint(&app);
+
+    prefix(&mut app, 's');
+    key(&mut app, KeyCode::Right); // tls -> quic
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal));
+    let ev = next_event(&mut rx).await;
+    app.handle(ev);
+    let ws = &app.workspaces[0];
+    assert_eq!(ws.config.protocol, Protocol::Quic);
+    assert!(matches!(ws.state, ListenState::Listening));
+    assert_eq!(fingerprint(&app), original);
+}
+
+#[test]
+fn stopping_a_quic_listener_closes_its_sessions() {
+    let (mut app, _rx) = App::test_new();
+    let ws = app.add_test_workspace(Protocol::Quic, "0.0.0.0:4433");
+    let (_sess, _out) = app.add_test_quic_session(ws, "10.0.0.5:1000");
+    app.workspaces[0].stop();
+    assert!(!app.workspaces[0].sessions[0].is_open());
 }

@@ -7,9 +7,11 @@ goal is a TUI that feels almost identical to herdr.
 
 ## Vocabulary
 
-- **Workspace**: one listener on `IP:PORT`, TCP, UDP, or TLS (herdr: workspace).
+- **Workspace**: one listener on `IP:PORT`: TCP, UDP, TLS, or QUIC (herdr: workspace).
 - **Session**: one connection to a workspace. For UDP, each distinct peer
   address is a session. Each session is shown as a **tab** (herdr: agent / tab).
+- **Stream**: QUIC only. One session carries many; its transcript tags lines
+  `[sN]` by stream ID once there are two, and input goes to one stream at a time.
 - **Overlay**: any modal box (settings form, rename, menu, confirmation, help).
 
 ## herdr as the reference
@@ -39,6 +41,9 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
   config from a self-signed or PEM-file certificate, and the handshake
   summary line. The app builds it when a form is applied, so certificate
   errors show in the form.
+- `src/net/quic.rs`: QUIC listener and connections (quinn), reusing the TLS
+  config. The app predicts the IDs of streams it opens (`server_bidi`), so
+  `QuicOut::Write` to a new ID opens that stream.
 - `src/app.rs`: all state and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
   `Target` names what a menu, rename, or close acts on (workspace or tab).
