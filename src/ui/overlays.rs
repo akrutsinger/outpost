@@ -50,9 +50,9 @@ pub(super) fn render_settings(
     let rect = centered(area, 58, rows + 6);
     Clear.render(rect, buf);
     let title = if form.target.is_some() {
-        "workspace settings"
+        "listener settings"
     } else {
-        "new workspace"
+        "new listener"
     };
     let block = overlay_block(title);
     let inner = block.inner(rect);
@@ -259,7 +259,7 @@ pub(super) fn render_rename(
     let rect = centered(area, 46, 7);
     Clear.render(rect, buf);
     let block = overlay_block(match form.target {
-        Target::Workspace(_) => "rename workspace",
+        Target::Workspace(_) => "rename listener",
         Target::Session(_) => "rename tab",
     });
     let inner = block.inner(rect);
@@ -309,7 +309,7 @@ pub(super) fn render_confirm(
     let workspace = |id: WsId| app.workspace(id).map(describe);
     let text = match *confirm {
         Confirm::Close(Target::Workspace(id)) => {
-            workspace(id).map(|(who, open)| (" Close workspace?", format!(" {who} has {open}.")))
+            workspace(id).map(|(who, open)| (" Close listener?", format!(" {who} has {open}.")))
         }
         Confirm::Restart(ref form, _) => form.target.and_then(workspace).map(|(who, open)| {
             (
@@ -333,7 +333,7 @@ pub(super) fn render_confirm(
                     format!(
                         " {} across {}.",
                         count(open, "open connection"),
-                        count(live.len(), "workspace")
+                        count(live.len(), "listener")
                     )
                 }
             };
@@ -419,14 +419,14 @@ pub(super) fn render_confirm(
 pub(super) fn render_help(buf: &mut Buffer, area: Rect) {
     const KEYS: &[(&str, &str)] = &[
         ("ctrl+b", "prefix"),
-        ("prefix N", "new workspace (listener)"),
-        ("prefix s", "workspace settings"),
-        ("prefix j / k", "next / previous workspace"),
+        ("prefix N", "new listener"),
+        ("prefix s", "listener settings"),
+        ("prefix j / k", "next / previous listener"),
         ("prefix n / p", "next / previous tab"),
         ("prefix 1..9", "jump to tab"),
         ("prefix X", "close tab (disconnects)"),
-        ("prefix D", "close workspace"),
-        ("prefix W", "rename workspace"),
+        ("prefix D", "close listener"),
+        ("prefix W", "rename listener"),
         ("prefix T", "rename tab"),
         ("right-click", "rename / close menu"),
         ("prefix q", "quit"),

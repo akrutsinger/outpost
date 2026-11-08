@@ -7,8 +7,9 @@ goal is a TUI that feels almost identical to herdr.
 
 ## Vocabulary
 
-- **Workspace**: one listener on `IP:PORT`: TCP, UDP, TLS, or QUIC (herdr: workspace).
-- **Session**: one connection to a workspace. For UDP, each distinct peer
+- **Listener**: one socket bound to `IP:PORT`: TCP, UDP, TLS, or QUIC
+  (herdr: workspace). The code still calls it `Workspace`.
+- **Session**: one connection to a listener. For UDP, each distinct peer
   address is a session. Each session is shown as a **tab** (herdr: agent / tab).
 - **Stream**: QUIC only. One session carries many; its transcript tags lines
   `[sN]` by stream ID once there are two, and input goes to one stream at a time.
@@ -56,7 +57,7 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 - `src/ui.rs`: rendering entry point and shared drawing helpers. Records
   clickable regions in `Hits`, which the next mouse event resolves against.
   Split like herdr's shell:
-  - `ui/sidebar.rs`: workspaces over sessions, and the dividers.
+  - `ui/sidebar.rs`: listeners over sessions, and the dividers.
   - `ui/tabs.rs`: the tab bar and the focused tab's transcript and input.
   - `ui/overlays.rs`: settings form, menu, rename, confirmation, help
     (`render_help`).
@@ -73,11 +74,11 @@ outpost is mouse-first, like herdr. Every new feature should work with both
 mouse and keyboard, and reuse the existing patterns instead of inventing new
 ones:
 
-- **Forms** (new workspace, settings, rename): rounded accent border with a
+- **Forms** (new listener, settings, rename): rounded accent border with a
   title. Clicking a field focuses it; clicking inside text places the cursor.
 - **Right-click menus**: square accent border, opened at the click and kept on
   screen, hover highlights, ↑/↓/Enter/Esc. Any click outside dismisses without
-  passing through. Workspaces and tabs have menus; the sessions list does not.
+  passing through. Listeners and tabs have menus; the sessions list does not.
 - **Confirmations**: herdr's red square box, title + one detail line, centered
   `↵ confirm` / `esc cancel` buttons. Other keys and stray clicks are ignored.
   Ask before any action that drops live connections; skip asking otherwise.

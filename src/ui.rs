@@ -212,9 +212,9 @@ fn render_prefix_bar(buf: &mut Buffer, pane: Rect) {
         ("N", "new"),
         ("s", "settings"),
         ("n/p", "tab"),
-        ("j/k", "workspace"),
+        ("j/k", "listener"),
         ("X", "close tab"),
-        ("D", "close workspace"),
+        ("D", "close listener"),
         ("?", "keybinds"),
         ("q", "quit"),
     ] {

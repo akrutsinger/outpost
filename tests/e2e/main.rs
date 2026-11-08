@@ -221,7 +221,7 @@ async fn udp_restart_and_close_ask_before_dropping_peers() {
     peer.send_to(b"again\n", ("127.0.0.1", new)).unwrap();
     app.wait_for("· 1 open").await;
     app.prefix("D");
-    app.wait_for("Close workspace?").await;
+    app.wait_for("Close listener?").await;
     app.keys(ENTER);
     app.wait_for("no listeners").await;
     eventually("the port to be freed", || !udp_port_bound(new)).await;

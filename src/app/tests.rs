@@ -444,7 +444,7 @@ fn duplicate_listener_is_rejected() {
     key(&mut app, KeyCode::Enter);
     assert_eq!(
         form(&app).error.as_deref(),
-        Some("a workspace already uses that address")
+        Some("a listener already uses that address")
     );
     assert_eq!(app.workspaces.len(), 1);
 }

@@ -173,7 +173,7 @@ impl SettingsForm {
                 && ws.config.protocol == config.protocol
                 && ws.config.addr == config.addr
         }) {
-            return Err("a workspace already uses that address".into());
+            return Err("a listener already uses that address".into());
         }
         // Keep the certificate while its settings are unchanged, so a
         // self-signed fingerprint survives edits to the address or port.

@@ -56,7 +56,7 @@ fn render_workspaces(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         area.x,
         area.y,
         area.right(),
-        " workspaces",
+        " listeners",
         header_style(),
     );
     let body = Rect::new(

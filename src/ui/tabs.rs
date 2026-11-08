@@ -140,7 +140,7 @@ pub(super) fn render_pane(
             buf,
             area,
             &[
-                "no workspaces".into(),
+                "no listeners".into(),
                 "ctrl+b N or click new to open a listener".into(),
             ],
         );

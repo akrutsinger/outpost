@@ -23,7 +23,7 @@ fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a str {
 fn empty_app_explains_how_to_start() {
     let (mut app, _rx) = App::test_new();
     let text = screen(&mut app);
-    assert!(text.contains(" workspaces"));
+    assert!(text.contains(" listeners"));
     assert!(text.contains("no listeners"));
     assert!(text.contains("no connections"));
     assert!(text.contains("ctrl+b N or click new to open a listener"));
@@ -119,7 +119,7 @@ fn prefix_mode_shows_mode_bar_on_last_row() {
     let last = rows.last().unwrap();
     assert!(last.contains(" PREFIX "));
     assert!(last.contains("N new"));
-    assert!(last.contains("D close workspace"));
+    assert!(last.contains("D close listener"));
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn settings_modal_fits_its_hint_line() {
         error: Some("invalid port".into()),
     });
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, "╭ new workspace ");
+    row_with(&rows, "╭ new listener ");
     row_with(&rows, "address    0.0.0.0");
     row_with(&rows, "port       4444");
     row_with(&rows, "invalid port");
@@ -171,7 +171,7 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
         error: Some("key file: no private key found".into()),
     });
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, "╭ workspace settings ");
+    row_with(&rows, "╭ listener settings ");
     row_with(&rows, "protocol    tcp   udp   tls ");
     row_with(&rows, "cert        self-signed   files ");
     row_with(&rows, "cert file  /etc/outpost/server.pem");
@@ -337,7 +337,7 @@ fn rename_overlay_shows_the_input() {
         input: "web".into(),
     });
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, "╭ rename workspace ");
+    row_with(&rows, "╭ rename listener ");
     row_with(&rows, "│  web ");
     row_with(&rows, "enter save · esc cancel · empty resets");
 }
@@ -351,7 +351,7 @@ fn confirm_close_names_the_workspace_and_its_connections() {
     let _b = app.add_test_session(ws, "10.0.0.6:1000");
     app.mode = Mode::Confirm(Confirm::Close(Target::Workspace(ws)));
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, "│ Close workspace?");
+    row_with(&rows, "│ Close listener?");
     row_with(&rows, " web (tcp :4444) has 2 open connections.");
     let buttons = row_with(&rows, "↵ confirm");
     assert!(buttons.contains("esc cancel"));
@@ -436,7 +436,7 @@ fn confirm_quit_names_one_workspace_or_counts_several() {
     let dns = app.add_test_workspace(Protocol::Udp, "0.0.0.0:5353");
     let _c = app.add_test_session(dns, "10.0.0.7:1000");
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, " 3 open connections across 2 workspaces.");
+    row_with(&rows, " 3 open connections across 2 listeners.");
 }
 
 #[test]
