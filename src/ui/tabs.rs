@@ -261,9 +261,7 @@ pub(super) fn render_pane(
     }
     let cursor = render_input(
         buf,
-        x,
-        input_y,
-        right,
+        Rect::new(x, input_y, right.saturating_sub(x), 1),
         &s.input,
         Style::new().fg(TEXT),
         TextTarget::Session,

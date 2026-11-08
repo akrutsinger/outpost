@@ -115,7 +115,7 @@ impl Mode {
 
 /// An action waiting on a confirmation, because it drops live connections.
 // Only one exists at a time, and `Mode::Settings` holds a form unboxed too.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum Confirm {
     /// Closing a workspace or tab.
     Close(Target),

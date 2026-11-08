@@ -1,7 +1,7 @@
 //! Overlays drawn over everything: settings form, menu, rename, confirmation, help.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, BorderType, Clear, Widget};
@@ -74,6 +74,7 @@ pub(super) fn render_settings(
 
     for (i, &field) in fields.iter().enumerate() {
         let y = inner.y + 1 + i as u16;
+        let value = Rect::new(value_x, y, right.saturating_sub(value_x), 1);
         put(
             buf,
             inner.x + 1,
@@ -84,20 +85,20 @@ pub(super) fn render_settings(
         );
         let text = match field {
             Field::Protocol => {
-                let mut x = value_x;
+                let mut row = value;
                 for protocol in Protocol::ALL {
                     let hit = FormHit::Protocol(protocol);
                     let selected = protocol == form.protocol;
-                    x = render_choice(buf, x, y, right, protocol.label(), selected, hit, hits);
+                    render_choice(buf, &mut row, protocol.label(), selected, hit, hits);
                 }
                 None
             }
             Field::Cert => {
-                let mut x = value_x;
+                let mut row = value;
                 for cert in CertKind::ALL {
                     let hit = FormHit::Cert(cert);
                     let selected = cert == form.cert;
-                    x = render_choice(buf, x, y, right, cert.label(), selected, hit, hits);
+                    render_choice(buf, &mut row, cert.label(), selected, hit, hits);
                 }
                 None
             }
@@ -114,16 +115,7 @@ pub(super) fn render_settings(
             }
         };
         if let Some((input, target, placeholder)) = text {
-            let at = render_input(
-                buf,
-                value_x,
-                y,
-                right,
-                input,
-                Style::new().fg(TEXT),
-                target,
-                hits,
-            );
+            let at = render_input(buf, value, input, Style::new().fg(TEXT), target, hits);
             if form.field == field {
                 cursor = Some(at);
             } else if input.len() == 0 {
@@ -190,26 +182,26 @@ pub(super) fn render_settings(
     cursor
 }
 
-/// A form button, highlighted when selected. Returns where the next one goes.
-#[allow(clippy::too_many_arguments)]
+/// Draws a form button at the start of `row`, highlighted when selected, and
+/// moves `row` past it (and a gap) for the next one.
 fn render_choice(
     buf: &mut Buffer,
-    x: u16,
-    y: u16,
-    right: u16,
+    row: &mut Rect,
     label: &str,
     selected: bool,
     hit: FormHit,
     hits: &mut Hits,
-) -> u16 {
+) {
     let style = if selected {
         Style::new().fg(PANEL_BG).bg(ACCENT)
     } else {
         Style::new().fg(OVERLAY0).bg(SURFACE0)
     };
-    let end = put(buf, x, y, right, &format!(" {label} "), style);
-    hits.form.push((Rect::new(x, y, end - x, 1), hit));
-    end + 1
+    let end = put(buf, row.x, row.y, row.right(), &format!(" {label} "), style);
+    hits.form
+        .push((Rect::new(row.x, row.y, end - row.x, 1), hit));
+    let next = (end + 1).min(row.right());
+    *row = Rect::new(next, row.y, row.right() - next, 1);
 }
 
 /// herdr-style menu: square accent border, opened at the click and kept on screen.
@@ -280,9 +272,7 @@ pub(super) fn render_rename(
     buf.set_style(input, Style::new().fg(TEXT).bg(SURFACE0));
     let cursor = render_input(
         buf,
-        input.x + 1,
-        input.y,
-        input.right() - 1,
+        input.inner(Margin::new(1, 0)),
         &form.input,
         Style::new().fg(TEXT).bg(SURFACE0),
         TextTarget::Rename,

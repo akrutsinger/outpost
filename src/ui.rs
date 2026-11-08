@@ -142,30 +142,22 @@ fn put_right(buf: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
     put(buf, area.right() - width, y, area.right(), text, style);
 }
 
-/// Draws `input` between `x` and `right`, scrolled so its cursor is visible.
+/// Draws `input` on the one-row `area`, scrolled so its cursor is visible.
 /// Records the field as a click target and returns where the cursor goes.
-#[allow(clippy::too_many_arguments)]
 fn render_input(
     buf: &mut Buffer,
-    x: u16,
-    y: u16,
-    right: u16,
+    area: Rect,
     input: &TextInput,
     style: Style,
     target: TextTarget,
     hits: &mut Hits,
 ) -> Position {
-    let width = right.saturating_sub(x);
-    let start = input.scroll(width as usize);
-    let visible: String = input
-        .as_str()
-        .chars()
-        .skip(start)
-        .take(width as usize)
-        .collect();
-    put(buf, x, y, right, &visible, style);
-    hits.text.push((Rect::new(x, y, width, 1), target, start));
-    Position::new(x + (input.cursor() - start) as u16, y)
+    let width = area.width as usize;
+    let start = input.scroll(width);
+    let visible: String = input.as_str().chars().skip(start).take(width).collect();
+    put(buf, area.x, area.y, area.right(), &visible, style);
+    hits.text.push((area, target, start));
+    Position::new(area.x + (input.cursor() - start) as u16, area.y)
 }
 
 fn status_glyph(status: Status) -> (&'static str, Color) {

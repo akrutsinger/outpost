@@ -135,7 +135,8 @@ behavior and say so; don't loosen assertions to make them pass.
 
 - No `unwrap()`/`expect()` in production code except where the invariant is
   local and obvious (with a message saying why). Tests may unwrap.
-- `#[allow(...)]` only with a comment or an obvious reason.
+- Silence a lint with `#[expect(...)]` (not `#[allow]`, so it flags itself once
+  the lint stops firing), and only with a comment or an obvious reason.
 - Don't add dependencies without a reason; check tokio/ratatui first.
 - Keep changes surgical; match the surrounding style.
 
