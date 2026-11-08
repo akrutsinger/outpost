@@ -99,13 +99,16 @@ in-process without spawning the binary.
   so render first, then click a recorded rect.
 - **Networking** (`src/net.rs` tests): real sockets on `127.0.0.1:0`, with
   timeouts on every wait.
-- **End-to-end**, when a change depends on how a real terminal delivers input
-  (mouse buttons, hover, escape sequences): drive `target/debug/outpost` with
-  a small Python script using `pty.fork()`, set the size with `TIOCSWINSZ`, and
-  write raw bytes (SGR mouse is `\x1b[<button;col;rowM`, 1-based). Check the
-  result from the network side (what a client receives, whether a port is
-  open). tmux `send-keys` cannot deliver mouse events. Keep these scripts in
-  the session scratchpad, not the repo, and run them with `python3 -I`.
+- **End-to-end** (`tests/e2e/`), when a change depends on how a real terminal
+  delivers input (mouse buttons, drags, escape sequences) or on real
+  listeners: add a case to `tests/e2e/main.rs`. `Outpost::start()` runs the
+  binary in a 120×32 pty and reads its screen through `vt100`; drive it with
+  `keys`, `prefix`, `click`, `right_click`, `drag`, and `new_workspace`. Check
+  the network side too (what a client receives, whether a port is bound);
+  `clients.rs` has TLS and QUIC clients. Before each step, wait for what it
+  acts on (`wait_for`, `wait_until`, `eventually`), never sleep: keys sent
+  before a tab or overlay exists go nowhere. tmux `send-keys` cannot deliver
+  mouse events.
 
 When a behavior changes on purpose, update the tests that encoded the old
 behavior and say so; don't loosen assertions to make them pass.

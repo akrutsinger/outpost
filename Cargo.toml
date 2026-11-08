@@ -14,3 +14,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 [dev-dependencies]
 # PEM output, to test loading certificate files without writing any.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+# End-to-end tests (tests/e2e.rs): run the binary in a pseudo-terminal and
+# read its screen through a terminal emulator.
+portable-pty = "0.9.0"
+vt100 = "0.18.1"
