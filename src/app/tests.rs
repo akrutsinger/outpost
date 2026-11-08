@@ -5,11 +5,18 @@ use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::error::TryRecvError;
 
+use super::session::{MAX_LINES, Streams};
+use super::settings::form_path;
 use super::*;
+use crate::net::Protocol;
+use crate::net::quic::{QuicOut, StreamEnd, StreamId};
+use crate::net::tls::{CertSource, TlsConfig};
 use crate::ui::{TextTarget, render_rows};
 
 fn key(app: &mut App, code: KeyCode) {

@@ -44,9 +44,15 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 - `src/net/quic.rs`: QUIC listener and connections (quinn), reusing the TLS
   config. The app predicts the IDs of streams it opens (`server_bidi`), so
   `QuicOut::Write` to a new ID opens that stream.
-- `src/app.rs`: all state and input handling. Everything enters through
+- `src/app.rs`: `App` and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
   `Target` names what a menu, rename, or close acts on (workspace or tab).
+  - `app/workspace.rs`: `Workspace` (one listener and its sessions) and
+    starting/stopping its listener task.
+  - `app/session.rs`: `Session` (transcript, input line, byte counts) and a
+    QUIC session's `Streams`.
+  - `app/settings.rs`: `SettingsForm`: building it, editing rules per field,
+    and `check`, which validates it into an `Applied` config.
 - `src/ui.rs`: rendering. Records clickable regions in `Hits`, which the next
   mouse event resolves against.
 - `src/text_input.rs`: single-line text with a movable cursor, used by every

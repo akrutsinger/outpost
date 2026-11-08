@@ -1,7 +1,7 @@
-//! Application state: workspaces (listeners), sessions (connections), and input handling.
+//! Application state and input handling. The workspace, session, and
+//! settings-form types live in submodules; this module owns `App`, its
+//! overlays (`Mode`), and how keys and clicks drive them.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -10,17 +10,20 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::AbortHandle;
 
 use crate::Event;
-use crate::net::quic::{self, QuicOut, StreamEnd, StreamId};
-use crate::net::tls::{CertSource, TlsConfig, TlsServer};
-use crate::net::{self, NetEvent, Outlet, Protocol, SessId, UdpOut, WsId};
+use crate::net::{self, NetEvent, Outlet, SessId, WsId};
 use crate::text_input::TextInput;
 use crate::ui::{FormHit, Hits, TextTarget};
 
-const MAX_LINES: usize = 10_000;
-const DEFAULT_PORT: u16 = 4444;
+mod session;
+mod settings;
+mod workspace;
+
+pub use session::{Dir, Session};
+pub use settings::{Applied, CertKind, Field, SettingsForm};
+pub use workspace::{ListenState, ListenerConfig, Status, Workspace};
+
 /// Sidebar width limits, matching herdr's defaults.
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 const MIN_SIDEBAR_WIDTH: u16 = 18;
@@ -28,561 +31,6 @@ const MAX_SIDEBAR_WIDTH: u16 = 36;
 /// Share of the sidebar given to workspaces; sessions get the rest.
 const DEFAULT_SIDEBAR_SPLIT: f32 = 0.5;
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ListenerConfig {
-    pub protocol: Protocol,
-    pub addr: SocketAddr,
-    /// Only used by TLS workspaces; the default otherwise.
-    pub tls: TlsConfig,
-}
-
-pub enum ListenState {
-    Binding,
-    Listening,
-    Failed(String),
-}
-
-/// Drives the sidebar icon/color for both workspaces and sessions.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Status {
-    Unread,
-    Open,
-    Idle,
-    Closed,
-    Failed,
-}
-
-impl Status {
-    pub fn text(self) -> &'static str {
-        match self {
-            Status::Unread => "unread",
-            Status::Open => "open",
-            Status::Idle => "idle",
-            Status::Closed => "closed",
-            Status::Failed => "failed",
-        }
-    }
-}
-
-pub struct Workspace {
-    pub id: WsId,
-    /// User-chosen name; `None` shows the endpoint.
-    pub name: Option<String>,
-    pub config: ListenerConfig,
-    pub state: ListenState,
-    pub sessions: Vec<Session>,
-    pub active_tab: usize,
-    /// The certificate in use, built from `config.tls`. TLS workspaces only.
-    pub tls: Option<TlsServer>,
-    listener: Option<AbortHandle>,
-    udp_out: Option<UdpOut>,
-}
-
-impl Workspace {
-    pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.endpoint())
-    }
-
-    /// Protocol and port, e.g. `tcp :4444`.
-    pub fn endpoint(&self) -> String {
-        format!(
-            "{} :{}",
-            self.config.protocol.label(),
-            self.config.addr.port()
-        )
-    }
-
-    pub fn open_count(&self) -> usize {
-        self.sessions.iter().filter(|s| s.is_open()).count()
-    }
-
-    pub fn status(&self) -> Status {
-        match self.state {
-            ListenState::Failed(_) => Status::Failed,
-            ListenState::Binding => Status::Closed,
-            ListenState::Listening if self.sessions.iter().any(|s| s.unread) => Status::Unread,
-            ListenState::Listening if self.open_count() > 0 => Status::Open,
-            ListenState::Listening => Status::Idle,
-        }
-    }
-
-    fn start(&mut self, events: &UnboundedSender<Event>) {
-        self.state = ListenState::Binding;
-        self.listener = Some(net::spawn_listener(
-            self.id,
-            self.config.protocol,
-            self.config.addr,
-            self.tls.as_ref().map(|tls| tls.config.clone()),
-            events.clone(),
-        ));
-    }
-
-    /// Whether applying `config` stops and restarts the listener.
-    fn restarts_for(&self, config: &ListenerConfig) -> bool {
-        self.config != *config || matches!(self.state, ListenState::Failed(_))
-    }
-
-    /// Whether restarting with `config` would drop open sessions.
-    fn restart_drops_sessions(&self, config: &ListenerConfig) -> bool {
-        self.restarts_for(config) && self.sessions_share_socket() && self.open_count() > 0
-    }
-
-    /// TCP connections outlive their listener; UDP and QUIC sessions share its socket.
-    fn sessions_share_socket(&self) -> bool {
-        matches!(self.config.protocol, Protocol::Udp | Protocol::Quic)
-    }
-
-    fn stop(&mut self) {
-        if let Some(handle) = self.listener.take() {
-            handle.abort();
-        }
-        self.udp_out = None;
-        if self.sessions_share_socket() {
-            for s in &mut self.sessions {
-                s.close(Some("listener stopped".into()));
-            }
-        }
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        if let Some(handle) = self.listener.take() {
-            handle.abort();
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Dir {
-    In,
-    Out,
-    Info,
-}
-
-pub struct Line {
-    pub dir: Dir,
-    pub text: String,
-    /// The QUIC stream it belongs to.
-    pub stream: Option<StreamId>,
-}
-
-/// A QUIC session's streams.
-#[derive(Default)]
-pub struct Streams {
-    /// Every stream seen, in order. Lines get stream tags once there are two.
-    pub seen: Vec<StreamId>,
-    /// Bidirectional streams we can still send on, in the order seen.
-    pub writable: Vec<StreamId>,
-    /// Where the next line goes; `None` opens a new stream.
-    pub send_to: Option<StreamId>,
-    /// How many streams we have opened.
-    opened: u64,
-}
-
-impl Streams {
-    pub fn tagged(&self) -> bool {
-        self.seen.len() > 1
-    }
-
-    fn see(&mut self, stream: StreamId) {
-        if !self.seen.contains(&stream) {
-            self.seen.push(stream);
-            if quic::is_bidi(stream) {
-                self.writable.push(stream);
-            }
-        }
-    }
-
-    /// Opens our next stream, which the connection will number the same way.
-    fn open(&mut self) -> StreamId {
-        let stream = quic::server_bidi(self.opened);
-        self.opened += 1;
-        self.see(stream);
-        stream
-    }
-
-    /// Steps the send target through the writable streams, then "new".
-    fn cycle(&mut self, delta: isize) {
-        let options: Vec<Option<StreamId>> = self
-            .writable
-            .iter()
-            .copied()
-            .map(Some)
-            .chain([None])
-            .collect();
-        let index = options.iter().position(|&o| o == self.send_to).unwrap_or(0);
-        self.send_to = options[wrap(index, delta, options.len())];
-    }
-
-    /// We can't send on `stream` any more; target the newest one left instead.
-    fn stop_sending(&mut self, stream: StreamId) {
-        self.writable.retain(|&s| s != stream);
-        if self.send_to == Some(stream) {
-            self.send_to = self.writable.last().copied();
-        }
-    }
-}
-
-pub struct Session {
-    pub id: SessId,
-    /// User-chosen name; `None` shows the peer address.
-    pub name: Option<String>,
-    pub peer: SocketAddr,
-    outlet: Option<Outlet>,
-    pub lines: Vec<Line>,
-    /// The last line is incoming text still waiting for its newline.
-    in_open: bool,
-    pub unread: bool,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub input: TextInput,
-    /// Rows scrolled up from the bottom of the transcript.
-    pub scroll: usize,
-    /// QUIC sessions only.
-    pub streams: Option<Streams>,
-}
-
-impl Session {
-    fn new(id: SessId, peer: SocketAddr, outlet: Outlet) -> Self {
-        let streams = matches!(outlet, Outlet::Quic(_)).then(Streams::default);
-        Self {
-            id,
-            name: None,
-            peer,
-            outlet: Some(outlet),
-            lines: vec![Line {
-                dir: Dir::Info,
-                text: format!("connected from {peer}"),
-                stream: None,
-            }],
-            in_open: false,
-            unread: true,
-            bytes_in: 0,
-            bytes_out: 0,
-            input: TextInput::default(),
-            scroll: 0,
-            streams,
-        }
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.outlet.is_some()
-    }
-
-    pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.peer.to_string())
-    }
-
-    pub fn status(&self) -> Status {
-        if !self.is_open() {
-            Status::Closed
-        } else if self.unread {
-            Status::Unread
-        } else {
-            Status::Open
-        }
-    }
-
-    fn push(&mut self, dir: Dir, text: String) {
-        self.push_on(dir, None, text);
-    }
-
-    /// Adds a line; whatever incoming line was still open is now closed.
-    fn push_on(&mut self, dir: Dir, stream: Option<StreamId>, text: String) {
-        self.in_open = false;
-        self.lines.push(Line { dir, text, stream });
-        if self.lines.len() > MAX_LINES {
-            self.lines.drain(..self.lines.len() - MAX_LINES);
-        }
-    }
-
-    fn receive(&mut self, bytes: &[u8]) {
-        self.receive_on(None, bytes);
-    }
-
-    /// QUIC data. Replies go to the stream that last sent something.
-    fn receive_stream(&mut self, stream: StreamId, bytes: &[u8]) {
-        if let Some(streams) = &mut self.streams {
-            streams.see(stream);
-            if streams.writable.contains(&stream) {
-                streams.send_to = Some(stream);
-            }
-        }
-        self.receive_on(Some(stream), bytes);
-    }
-
-    fn stream_ended(&mut self, stream: StreamId, end: StreamEnd) {
-        let text = match end {
-            StreamEnd::PeerFinished => "peer finished sending".to_string(),
-            StreamEnd::PeerReset(code) => format!("reset by peer (code {code})"),
-            StreamEnd::WriteFailed(e) => {
-                if let Some(streams) = &mut self.streams {
-                    streams.stop_sending(stream);
-                }
-                format!("can't send: {e}")
-            }
-        };
-        self.push_on(Dir::Info, Some(stream), text);
-    }
-
-    fn receive_on(&mut self, stream: Option<StreamId>, bytes: &[u8]) {
-        // A different stream's data starts its own line.
-        if self.in_open && self.lines.last().map(|l| l.stream) != Some(stream) {
-            self.in_open = false;
-        }
-        self.bytes_in += bytes.len() as u64;
-        self.unread = true;
-        // Lossy: a multi-byte character split across reads shows as U+FFFD.
-        for ch in String::from_utf8_lossy(bytes).chars() {
-            if ch == '\r' {
-                continue;
-            }
-            if ch == '\n' {
-                if !self.in_open {
-                    self.push_on(Dir::In, stream, String::new());
-                }
-                self.in_open = false;
-                continue;
-            }
-            if !self.in_open {
-                self.push_on(Dir::In, stream, String::new());
-                self.in_open = true;
-            }
-            let line = &mut self.lines.last_mut().expect("just pushed").text;
-            match ch {
-                '\t' => line.push_str("    "),
-                c if c.is_control() => line.push_str(&format!("\\x{:02x}", c as u32)),
-                c => line.push(c),
-            }
-        }
-    }
-
-    fn submit(&mut self) {
-        let Some(outlet) = &self.outlet else { return };
-        let text = self.input.take();
-        let mut bytes = text.clone().into_bytes();
-        bytes.push(b'\n');
-        let len = bytes.len() as u64;
-        let (sent, stream) = match &mut self.streams {
-            Some(streams) => {
-                let stream = match streams.send_to {
-                    Some(stream) => stream,
-                    None => {
-                        let stream = streams.open();
-                        streams.send_to = Some(stream);
-                        stream
-                    }
-                };
-                (outlet.quic(QuicOut::Write { stream, bytes }), Some(stream))
-            }
-            None => (outlet.send(bytes), None),
-        };
-        if !sent {
-            self.close(Some("send failed".into()));
-            return;
-        }
-        self.bytes_out += len;
-        self.push_on(Dir::Out, stream, text);
-        self.scroll = 0;
-    }
-
-    /// Ends our side of the QUIC stream we're sending on.
-    fn finish_stream(&mut self) {
-        let (Some(outlet), Some(streams)) = (&self.outlet, &mut self.streams) else {
-            return;
-        };
-        let Some(stream) = streams.send_to else {
-            return;
-        };
-        if outlet.quic(QuicOut::Finish(stream)) {
-            streams.stop_sending(stream);
-            self.push_on(Dir::Info, Some(stream), "finished sending".into());
-        }
-    }
-
-    /// Picks the QUIC stream the next line goes to.
-    fn cycle_stream(&mut self, delta: isize) {
-        if self.is_open()
-            && let Some(streams) = &mut self.streams
-        {
-            streams.cycle(delta);
-        }
-    }
-
-    fn close(&mut self, error: Option<String>) {
-        if self.outlet.take().is_none() {
-            return;
-        }
-        self.in_open = false;
-        let text = match error {
-            Some(e) => format!("disconnected: {e}"),
-            None => "disconnected".into(),
-        };
-        self.push(Dir::Info, text);
-    }
-}
-
-pub struct SettingsForm {
-    /// `None` creates a new workspace.
-    pub target: Option<WsId>,
-    pub protocol: Protocol,
-    pub address: TextInput,
-    pub port: TextInput,
-    /// TLS only, like the fields below.
-    pub cert: CertKind,
-    pub cert_file: TextInput,
-    pub key_file: TextInput,
-    /// Comma-separated ALPN protocols.
-    pub alpn: TextInput,
-    pub field: Field,
-    pub error: Option<String>,
-}
-
-/// A row of the settings form.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Field {
-    Protocol,
-    Address,
-    Port,
-    Cert,
-    CertFile,
-    KeyFile,
-    Alpn,
-}
-
-impl Field {
-    pub fn label(self) -> &'static str {
-        match self {
-            Field::Protocol => "protocol",
-            Field::Address => "address",
-            Field::Port => "port",
-            Field::Cert => "cert",
-            Field::CertFile => "cert file",
-            Field::KeyFile => "key file",
-            Field::Alpn => "alpn",
-        }
-    }
-
-    /// The form field a text-field click belongs to.
-    fn for_text(target: TextTarget) -> Option<Field> {
-        match target {
-            TextTarget::Address => Some(Field::Address),
-            TextTarget::Port => Some(Field::Port),
-            TextTarget::CertFile => Some(Field::CertFile),
-            TextTarget::KeyFile => Some(Field::KeyFile),
-            TextTarget::Alpn => Some(Field::Alpn),
-            TextTarget::Session | TextTarget::Rename => None,
-        }
-    }
-}
-
-/// Where a TLS workspace's certificate comes from, as chosen in the form.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CertKind {
-    SelfSigned,
-    Files,
-}
-
-impl CertKind {
-    pub const ALL: [CertKind; 2] = [CertKind::SelfSigned, CertKind::Files];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            CertKind::SelfSigned => "self-signed",
-            CertKind::Files => "files",
-        }
-    }
-
-    fn toggled(self) -> Self {
-        match self {
-            CertKind::SelfSigned => CertKind::Files,
-            CertKind::Files => CertKind::SelfSigned,
-        }
-    }
-}
-
-impl SettingsForm {
-    /// The rows shown for the current choices, top to bottom.
-    pub fn fields(&self) -> Vec<Field> {
-        let mut fields = vec![Field::Protocol, Field::Address, Field::Port];
-        if self.protocol.uses_tls() {
-            fields.push(Field::Cert);
-            if self.cert == CertKind::Files {
-                fields.extend([Field::CertFile, Field::KeyFile]);
-            }
-            fields.push(Field::Alpn);
-        }
-        fields
-    }
-
-    fn focus_next(&mut self, delta: isize) {
-        let fields = self.fields();
-        let index = fields.iter().position(|&f| f == self.field).unwrap_or(0);
-        self.field = fields[wrap(index, delta, fields.len())];
-    }
-
-    fn cycle_protocol(&mut self, delta: isize) {
-        let all = Protocol::ALL;
-        let index = all.iter().position(|&p| p == self.protocol).unwrap_or(0);
-        self.protocol = all[wrap(index, delta, all.len())];
-    }
-
-    fn input_mut(&mut self) -> Option<&mut TextInput> {
-        match self.field {
-            Field::Address => Some(&mut self.address),
-            Field::Port => Some(&mut self.port),
-            Field::CertFile => Some(&mut self.cert_file),
-            Field::KeyFile => Some(&mut self.key_file),
-            Field::Alpn => Some(&mut self.alpn),
-            Field::Protocol | Field::Cert => None,
-        }
-    }
-
-    /// Whether typing `c` adds it to the focused field.
-    fn accepts(&self, c: char) -> bool {
-        match self.field {
-            Field::Address => c.is_ascii_hexdigit() || c == '.' || c == ':',
-            Field::Port => c.is_ascii_digit() && self.port.len() < 5,
-            Field::CertFile | Field::KeyFile | Field::Alpn => true,
-            Field::Protocol | Field::Cert => false,
-        }
-    }
-
-    fn tls_config(&self) -> Result<TlsConfig, String> {
-        let cert = match self.cert {
-            CertKind::SelfSigned => CertSource::SelfSigned,
-            CertKind::Files => CertSource::Files {
-                cert: form_path(&self.cert_file).ok_or("cert file is required")?,
-                key: form_path(&self.key_file).ok_or("key file is required")?,
-            },
-        };
-        let alpn = self
-            .alpn
-            .as_str()
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(String::from)
-            .collect();
-        Ok(TlsConfig { cert, alpn })
-    }
-}
-
-/// A path typed into the form; a leading `~/` means the home directory.
-fn form_path(input: &TextInput) -> Option<PathBuf> {
-    let text = input.as_str().trim();
-    if text.is_empty() {
-        return None;
-    }
-    if let Some(rest) = text.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return Some(PathBuf::from(home).join(rest));
-    }
-    Some(PathBuf::from(text))
-}
 
 /// The index `delta` steps from `index` in a list of `len` items, wrapping
 /// around. `len` must not be zero.
@@ -676,12 +124,6 @@ pub enum Confirm {
     Restart(SettingsForm, Applied),
     /// Quitting, which drops every connection.
     Quit,
-}
-
-/// A checked settings form, ready to apply.
-pub struct Applied {
-    config: ListenerConfig,
-    tls: Option<TlsServer>,
 }
 
 /// A sidebar divider being dragged.
@@ -937,7 +379,7 @@ impl App {
     fn settings_key(&mut self, mut form: SettingsForm, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => return,
-            KeyCode::Enter => match self.check_form(&form) {
+            KeyCode::Enter => match form.check(&self.workspaces) {
                 Ok(applied) if self.restart_drops_sessions(form.target, &applied.config) => {
                     self.mode = Mode::Confirm(Confirm::Restart(form, applied));
                     return;
@@ -1264,102 +706,15 @@ impl App {
     }
 
     fn open_new_form(&mut self) {
-        // Suggest the next port not already used by a workspace.
-        let mut port = DEFAULT_PORT;
-        while self
-            .workspaces
-            .iter()
-            .any(|ws| ws.config.addr.port() == port)
-        {
-            port = port.wrapping_add(1);
-        }
-        self.mode = Mode::Settings(SettingsForm {
-            target: None,
-            protocol: Protocol::Tcp,
-            address: Ipv4Addr::UNSPECIFIED.to_string().into(),
-            port: port.to_string().into(),
-            cert: CertKind::SelfSigned,
-            cert_file: TextInput::default(),
-            key_file: TextInput::default(),
-            alpn: TextInput::default(),
-            field: Field::Port,
-            error: None,
-        });
+        self.mode = Mode::Settings(SettingsForm::new(&self.workspaces));
     }
 
     fn open_settings_form(&mut self) {
-        let Some(ws) = self.workspaces.get(self.active) else {
-            self.open_new_form();
-            return;
+        let form = match self.workspaces.get(self.active) {
+            Some(ws) => SettingsForm::edit(ws),
+            None => SettingsForm::new(&self.workspaces),
         };
-        let (cert, cert_file, key_file) = match &ws.config.tls.cert {
-            CertSource::SelfSigned => (CertKind::SelfSigned, String::new(), String::new()),
-            CertSource::Files { cert, key } => (
-                CertKind::Files,
-                cert.display().to_string(),
-                key.display().to_string(),
-            ),
-        };
-        self.mode = Mode::Settings(SettingsForm {
-            target: Some(ws.id),
-            protocol: ws.config.protocol,
-            address: ws.config.addr.ip().to_string().into(),
-            port: ws.config.addr.port().to_string().into(),
-            cert,
-            cert_file: cert_file.into(),
-            key_file: key_file.into(),
-            alpn: ws.config.tls.alpn.join(", ").into(),
-            field: Field::Protocol,
-            error: None,
-        });
-    }
-
-    /// Validates a form and builds its certificate, without changing anything.
-    fn check_form(&self, form: &SettingsForm) -> Result<Applied, String> {
-        let ip: IpAddr = form
-            .address
-            .as_str()
-            .trim()
-            .parse()
-            .map_err(|_| "invalid address".to_string())?;
-        let port: u16 = form
-            .port
-            .as_str()
-            .parse()
-            .map_err(|_| "invalid port".to_string())?;
-        let config = ListenerConfig {
-            protocol: form.protocol,
-            addr: SocketAddr::new(ip, port),
-            tls: if form.protocol.uses_tls() {
-                form.tls_config()?
-            } else {
-                TlsConfig::default()
-            },
-        };
-        // Without ALPN, no QUIC client can complete a handshake.
-        if config.protocol == Protocol::Quic && config.tls.alpn.is_empty() {
-            return Err("quic needs an alpn protocol, e.g. h3".into());
-        }
-        if self.workspaces.iter().any(|ws| {
-            Some(ws.id) != form.target
-                && ws.config.protocol == config.protocol
-                && ws.config.addr == config.addr
-        }) {
-            return Err("a workspace already uses that address".into());
-        }
-        // Keep the certificate while its settings are unchanged, so a
-        // self-signed fingerprint survives edits to the address or port.
-        let tls = match form.target.and_then(|id| self.workspace(id)) {
-            _ if !config.protocol.uses_tls() => None,
-            Some(ws) if ws.config.protocol.uses_tls() && ws.config.tls == config.tls => {
-                match &ws.tls {
-                    Some(tls) => Some(tls.clone()),
-                    None => Some(net::tls::build(&config.tls)?),
-                }
-            }
-            _ => Some(net::tls::build(&config.tls)?),
-        };
-        Ok(Applied { config, tls })
+        self.mode = Mode::Settings(form);
     }
 
     /// Whether applying `config` to workspace `target` would drop open sessions.
@@ -1374,17 +729,7 @@ impl App {
     fn apply(&mut self, target: Option<WsId>, Applied { config, tls }: Applied) {
         match target {
             None => {
-                let mut ws = Workspace {
-                    id: net::next_id(),
-                    name: None,
-                    config,
-                    state: ListenState::Binding,
-                    sessions: Vec::new(),
-                    active_tab: 0,
-                    tls,
-                    listener: None,
-                    udp_out: None,
-                };
+                let mut ws = Workspace::new(config, tls);
                 ws.start(&self.events);
                 self.workspaces.push(ws);
                 self.active = self.workspaces.len() - 1;
@@ -1521,23 +866,16 @@ impl App {
     }
 
     /// Adds a workspace that is already listening, with no socket behind it.
-    pub fn add_test_workspace(&mut self, protocol: Protocol, addr: &str) -> WsId {
-        let id = net::next_id();
-        self.workspaces.push(Workspace {
-            id,
-            name: None,
-            config: ListenerConfig {
-                protocol,
-                addr: addr.parse().expect("test address"),
-                tls: TlsConfig::default(),
-            },
-            state: ListenState::Listening,
-            sessions: Vec::new(),
-            active_tab: 0,
-            tls: None,
-            listener: None,
-            udp_out: None,
-        });
+    pub fn add_test_workspace(&mut self, protocol: crate::net::Protocol, addr: &str) -> WsId {
+        let config = ListenerConfig {
+            protocol,
+            addr: addr.parse().expect("test address"),
+            tls: crate::net::tls::TlsConfig::default(),
+        };
+        let mut ws = Workspace::new(config, None);
+        ws.state = ListenState::Listening;
+        let id = ws.id;
+        self.workspaces.push(ws);
         id
     }
 
@@ -1566,7 +904,10 @@ impl App {
         &mut self,
         ws: WsId,
         peer: &str,
-    ) -> (SessId, tokio::sync::mpsc::UnboundedReceiver<QuicOut>) {
+    ) -> (
+        SessId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::net::quic::QuicOut>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sess = net::next_id();
         self.handle(Event::Net(NetEvent::Accepted {
