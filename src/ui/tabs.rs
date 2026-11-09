@@ -22,14 +22,14 @@ fn tab_label(s: &Session) -> String {
 
 pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     buf.set_style(area, Style::new().bg(PANEL_BG));
-    let Some(listener) = app.listeners.get(app.active) else {
+    let Some(endpoint) = app.endpoints.get(app.active) else {
         return;
     };
 
     let status = format!(
         "{} {}",
-        listener.config.protocol.label(),
-        listener.config.addr
+        endpoint.config.protocol.label(),
+        endpoint.config.addr
     );
     let status_width = status.chars().count() as u16;
     let mut tabs_right = area.right();
@@ -44,7 +44,7 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         tabs_right = area.right() - status_width - 1;
     }
 
-    let labels: Vec<String> = listener.sessions.iter().map(tab_label).collect();
+    let labels: Vec<String> = endpoint.sessions.iter().map(tab_label).collect();
     let widths: Vec<u16> = labels
         .iter()
         .map(|label| (label.chars().count() as u16 + 4).max(MIN_TAB_WIDTH))
@@ -55,7 +55,7 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         widths[from..=to].iter().sum::<u16>() + (to - from) as u16
     };
     let mut start = 0;
-    while start < listener.active_tab && span(start, listener.active_tab) > available {
+    while start < endpoint.active_tab && span(start, endpoint.active_tab) > available {
         start += 1;
     }
 
@@ -67,8 +67,8 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         if width == 0 {
             break;
         }
-        let s = &listener.sessions[index];
-        let style = if index == listener.active_tab {
+        let s = &endpoint.sessions[index];
+        let style = if index == endpoint.active_tab {
             Style::new().fg(PANEL_BG).bg(ACCENT)
         } else if target == Some(Target::Session(s.id)) {
             // The tab an overlay is acting on stands out like a selection.
@@ -139,7 +139,7 @@ pub(super) fn render_pane(
     if area.width < 4 || area.height < 3 {
         return None;
     }
-    let Some(listener) = app.listeners.get_mut(app.active) else {
+    let Some(endpoint) = app.endpoints.get_mut(app.active) else {
         render_empty(
             buf,
             area,
@@ -152,11 +152,11 @@ pub(super) fn render_pane(
     };
     let listen = format!(
         "{} {}",
-        listener.config.protocol.label(),
-        listener.config.addr
+        endpoint.config.protocol.label(),
+        endpoint.config.addr
     );
-    let Some(s) = listener.sessions.get_mut(listener.active_tab) else {
-        let lines = match &listener.state {
+    let Some(s) = endpoint.sessions.get_mut(endpoint.active_tab) else {
+        let lines = match &endpoint.state {
             ListenState::Listening => vec![
                 format!("listening on {listen}"),
                 "waiting for connections…".into(),

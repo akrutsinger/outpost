@@ -7,12 +7,12 @@ goal is a TUI that feels almost identical to herdr.
 
 ## Vocabulary
 
-- **Listener**: one socket bound to `IP:PORT`: TCP, UDP, TLS, or QUIC
-  (herdr: workspace).
-- **Session**: one connection to a listener. For UDP, each distinct peer
-  address is a session. Each session is shown as a **tab** (herdr: agent / tab).
-- **Stream**: QUIC only. One session carries many; its transcript tags lines
-  `[sN]` by stream ID once there are two, and input goes to one stream at a time.
+- **Endpoint**: a sidebar row that owns sessions. Every endpoint is a listener for now.
+- **Listener**: an endpoint with one socket bound to `IP:PORT`: TCP, UDP, TLS, or QUIC.
+- **Session**: one connection to a listener. For UDP, each distinct peer address is a session. Each
+  session is shown as a **tab** (herdr: agent / tab).
+- **Stream**: QUIC only. One session carries many; its transcript tags lines `[sN]` by stream ID
+  once there are two, and input goes to one stream at a time.
 - **Overlay**: any modal box (settings form, rename, menu, confirmation, help).
 
 ## herdr as the reference
@@ -47,9 +47,9 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
   `QuicOut::Write` to a new ID opens that stream.
 - `src/app.rs`: `App` and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
-  `Target` names what a menu, rename, or close acts on (listener or tab).
-  - `app/listener.rs`: `Listener` (one bound socket and its sessions) and
-    starting/stopping its listening task.
+  `Target` names what a menu, rename, or close acts on (endpoint or tab).
+  - `app/endpoint.rs`: `Endpoint` (a sidebar row: for now, one bound socket
+    and its sessions) and starting/stopping its listening task.
   - `app/session.rs`: `Session` (transcript, input line, byte counts) and a
     QUIC session's `Streams`.
   - `app/settings.rs`: `SettingsForm`: building it, editing rules per field,
@@ -57,7 +57,7 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 - `src/ui.rs`: rendering entry point and shared drawing helpers. Records
   clickable regions in `Hits`, which the next mouse event resolves against.
   Split like herdr's shell:
-  - `ui/sidebar.rs`: listeners over sessions, and the dividers.
+  - `ui/sidebar.rs`: endpoints over sessions, and the dividers.
   - `ui/tabs.rs`: the tab bar and the focused tab's transcript and input.
   - `ui/overlays.rs`: settings form, menu, rename, confirmation, help
     (`render_help`).

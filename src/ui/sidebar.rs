@@ -1,4 +1,4 @@
-//! The sidebar: listeners over sessions, with draggable dividers.
+//! The sidebar: endpoints over sessions, with draggable dividers.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -8,7 +8,7 @@ use super::{Hits, human, put, put_right, status_glyph};
 use crate::app::{App, ListenState, Target};
 use crate::theme::*;
 
-const LISTENER_HEADER_ROWS: u16 = 2;
+const ENDPOINT_HEADER_ROWS: u16 = 2;
 
 fn header_style() -> Style {
     Style::new().fg(OVERLAY0).add_modifier(Modifier::BOLD)
@@ -46,11 +46,11 @@ pub(super) fn render_sidebar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
     if content.height >= 6 {
         hits.section_divider = Rect::new(content.x, bottom.y, content.width, 1);
     }
-    render_listeners(buf, top, app, hits);
+    render_endpoints(buf, top, app, hits);
     render_sessions(buf, bottom, app, hits);
 }
 
-fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
+fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     put(
         buf,
         area.x,
@@ -61,11 +61,11 @@ fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     );
     let body = Rect::new(
         area.x,
-        area.y + LISTENER_HEADER_ROWS,
+        area.y + ENDPOINT_HEADER_ROWS,
         area.width,
-        area.height.saturating_sub(LISTENER_HEADER_ROWS + 1),
+        area.height.saturating_sub(ENDPOINT_HEADER_ROWS + 1),
     );
-    if app.listeners.is_empty() && !body.is_empty() {
+    if app.endpoints.is_empty() && !body.is_empty() {
         put(
             buf,
             body.x,
@@ -78,14 +78,14 @@ fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
 
     let target = app.mode.target();
     let mut y = body.y;
-    for (index, listener) in app.listeners.iter().enumerate() {
+    for (index, endpoint) in app.endpoints.iter().enumerate() {
         if y + 2 > body.bottom() {
             break;
         }
         let rect = Rect::new(body.x, y, body.width, 2);
         let focused = index == app.active;
-        // The listener an overlay is acting on stands out like a selection.
-        if target == Some(Target::Listener(listener.id)) {
+        // The endpoint an overlay is acting on stands out like a selection.
+        if target == Some(Target::Endpoint(endpoint.id)) {
             buf.set_style(rect, Style::new().bg(SURFACE0));
         } else if focused {
             buf.set_style(rect, Style::new().bg(ACTIVE_ROW_BG));
@@ -96,7 +96,7 @@ fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         } else {
             Style::new().fg(SUBTEXT0)
         };
-        let (icon, color) = status_glyph(listener.status());
+        let (icon, color) = status_glyph(endpoint.status());
         let mut x = put(
             buf,
             rect.x + 1,
@@ -105,7 +105,7 @@ fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             &format!("{} ", index + 1),
             Style::new().fg(OVERLAY0),
         );
-        x = put(buf, x, y, right, &listener.label(), name_style);
+        x = put(buf, x, y, right, &endpoint.label(), name_style);
         put(
             buf,
             x,
@@ -116,29 +116,29 @@ fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         );
 
         let secondary = Style::new().fg(if focused { MAUVE } else { OVERLAY0 });
-        let (detail, style) = match &listener.state {
+        let (detail, style) = match &endpoint.state {
             ListenState::Failed(error) => (error.clone(), Style::new().fg(RED)),
             ListenState::Binding => ("binding…".to_string(), secondary),
             // A custom name hides the port, so show it here instead of the IP.
-            ListenState::Listening if listener.name.is_some() => (
-                format!("{} · {} open", listener.endpoint(), listener.open_count()),
+            ListenState::Listening if endpoint.name.is_some() => (
+                format!("{} · {} open", endpoint.addr_label(), endpoint.open_count()),
                 secondary,
             ),
             ListenState::Listening => (
                 format!(
                     "{} · {} open",
-                    listener.config.addr.ip(),
-                    listener.open_count()
+                    endpoint.config.addr.ip(),
+                    endpoint.open_count()
                 ),
                 secondary,
             ),
         };
         put(buf, rect.x + 3, y + 1, right, &detail, style);
-        hits.listeners.push((rect, index));
+        hits.endpoints.push((rect, index));
         y += 3;
     }
 
-    if area.height > LISTENER_HEADER_ROWS {
+    if area.height > ENDPOINT_HEADER_ROWS {
         let footer_y = area.bottom() - 1;
         hits.new_listener = Rect::new(area.x, footer_y, 4.min(area.width), 1);
         put(
@@ -149,7 +149,7 @@ fn render_listeners(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             " new",
             Style::new().fg(OVERLAY0),
         );
-        if !app.listeners.is_empty() {
+        if !app.endpoints.is_empty() {
             let label = "settings";
             let width = (label.len() as u16).min(area.width);
             hits.settings = Rect::new(area.right() - width, footer_y, width, 1);
@@ -182,9 +182,9 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         header_style(),
     );
     let open: usize = app
-        .listeners
+        .endpoints
         .iter()
-        .map(|listener| listener.open_count())
+        .map(|endpoint| endpoint.open_count())
         .sum();
     put_right(
         buf,
@@ -216,8 +216,8 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     }
 
     let mut y = body.y;
-    for (listener_index, listener) in app.listeners.iter().enumerate() {
-        for (tab, s) in listener
+    for (listener_index, endpoint) in app.endpoints.iter().enumerate() {
+        for (tab, s) in endpoint
             .sessions
             .iter()
             .enumerate()
@@ -227,7 +227,7 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
                 return;
             }
             let rect = Rect::new(body.x, y, body.width, 2);
-            let focused = listener_index == app.active && tab == listener.active_tab;
+            let focused = listener_index == app.active && tab == endpoint.active_tab;
             if focused {
                 buf.set_style(rect, Style::new().bg(ACTIVE_ROW_BG));
             }
@@ -250,11 +250,11 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             // Status sits on the second row: a full IPv4 peer barely fits the first.
             let state_x = right.saturating_sub(state.len() as u16);
             let detail_right = state_x.saturating_sub(1);
-            // Shorten the listener label first so the byte count stays visible.
+            // Shorten the endpoint label first so the byte count stays visible.
             let bytes = format!(" · ↓{}", human(s.bytes_in));
             let room = detail_right.saturating_sub(rect.x + 3) as usize;
             let label = shorten(
-                &listener.label(),
+                &endpoint.label(),
                 room.saturating_sub(bytes.chars().count()),
             );
             put(

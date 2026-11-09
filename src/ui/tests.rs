@@ -153,8 +153,8 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
     let listener = app.add_test_listener(Protocol::Tls, "0.0.0.0:8443");
     let server = tls::build(&TlsConfig::default()).unwrap();
     let fingerprint = server.fingerprint.clone();
-    app.listeners[0].tls = Some(server);
-    app.listeners[0].config.tls.cert = CertSource::Files {
+    app.endpoints[0].tls = Some(server);
+    app.endpoints[0].config.tls.cert = CertSource::Files {
         cert: "/etc/outpost/server.pem".into(),
         key: "/etc/outpost/server.key".into(),
     };
@@ -273,20 +273,20 @@ fn transcript_follows_tail_and_scrolls_back() {
     assert!(text.contains("line 099"));
     assert!(!text.contains("line 000"));
 
-    app.listeners[0].sessions[0].scroll = 1_000;
+    app.endpoints[0].sessions[0].scroll = 1_000;
     let text = render_rows(&mut app, W, H).join("\n");
     assert!(text.contains("line 000"), "scrolled to the top");
     assert!(!text.contains("line 099"));
     assert!(text.contains("more "), "scroll indicator shown");
     // Overscroll is clamped to the top of the transcript.
-    assert!(app.listeners[0].sessions[0].scroll < 1_000);
+    assert!(app.endpoints[0].sessions[0].scroll < 1_000);
 }
 
 #[test]
 fn renamed_listener_shows_name_and_endpoint() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
-    app.listeners[0].name = Some("web".into());
+    app.endpoints[0].name = Some("web".into());
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, " 1 web ○");
     row_with(&rows, "   tcp :4444 · 0 open");
@@ -297,7 +297,7 @@ fn context_menu_opens_at_the_click_and_stays_on_screen() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.mode = Mode::Menu(ContextMenu {
-        target: Target::Listener(listener),
+        target: Target::Endpoint(listener),
         x: 3,
         y: 2,
         highlighted: 0,
@@ -314,7 +314,7 @@ fn context_menu_opens_at_the_click_and_stays_on_screen() {
 
     // Near the bottom-right corner it shifts up and left to fit.
     app.mode = Mode::Menu(ContextMenu {
-        target: Target::Listener(listener),
+        target: Target::Endpoint(listener),
         x: W - 1,
         y: H - 1,
         highlighted: 1,
@@ -333,7 +333,7 @@ fn rename_overlay_shows_the_input() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.mode = Mode::Rename(RenameForm {
-        target: Target::Listener(listener),
+        target: Target::Endpoint(listener),
         input: "web".into(),
     });
     let rows = render_rows(&mut app, W, H);
@@ -346,10 +346,10 @@ fn rename_overlay_shows_the_input() {
 fn confirm_close_names_the_listener_and_its_connections() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
-    app.listeners[0].name = Some("web".into());
+    app.endpoints[0].name = Some("web".into());
     let _a = app.add_test_session(listener, "10.0.0.5:1000");
     let _b = app.add_test_session(listener, "10.0.0.6:1000");
-    app.mode = Mode::Confirm(Confirm::Close(Target::Listener(listener)));
+    app.mode = Mode::Confirm(Confirm::Close(Target::Endpoint(listener)));
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Close listener?");
     row_with(&rows, " web (tcp :4444) has 2 open connections.");
@@ -363,13 +363,13 @@ fn long_input_scrolls_to_keep_the_cursor_visible() {
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.add_test_session(listener, "10.0.0.5:51234");
     let text: String = ('a'..='z').cycle().take(200).collect();
-    app.listeners[0].sessions[0].input = text.as_str().into();
+    app.endpoints[0].sessions[0].input = text.as_str().into();
     let rows = render_rows(&mut app, W, H);
     // The end is visible while typing at the end...
     assert!(row_with(&rows, "❯ ").contains(&text[190..]));
 
     // ...and the start once the cursor moves home.
-    app.listeners[0].sessions[0].input.set_cursor(0);
+    app.endpoints[0].sessions[0].input.set_cursor(0);
     let rows = render_rows(&mut app, W, H);
     assert!(row_with(&rows, "❯ ").contains("❯ abcdefgh"));
 }
@@ -379,7 +379,7 @@ fn renamed_tab_shows_its_name_everywhere() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.add_test_session(listener, "10.0.0.5:51234");
-    app.listeners[0].sessions[0].name = Some("db".into());
+    app.endpoints[0].sessions[0].name = Some("db".into());
     let rows = render_rows(&mut app, W, H);
     assert!(rows[0].contains(" db "), "tab bar: {:?}", rows[0]);
     assert!(
@@ -410,7 +410,7 @@ fn confirm_close_for_a_tab_names_the_peer() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     let (sess, _out) = app.add_test_session(listener, "255.255.255.255:65535");
-    app.listeners[0].sessions[0].name = Some("db".into());
+    app.endpoints[0].sessions[0].name = Some("db".into());
     app.mode = Mode::Confirm(Confirm::Close(Target::Session(sess)));
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Close tab?");
@@ -422,7 +422,7 @@ fn confirm_close_for_a_tab_names_the_peer() {
 fn confirm_quit_names_one_listener_or_counts_several() {
     let (mut app, _rx) = App::test_new();
     let web = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
-    app.listeners[0].name = Some("web".into());
+    app.endpoints[0].name = Some("web".into());
     let _a = app.add_test_session(web, "10.0.0.5:1000");
     let _b = app.add_test_session(web, "10.0.0.6:1000");
     // A listener with nothing open doesn't count.
@@ -443,7 +443,7 @@ fn confirm_quit_names_one_listener_or_counts_several() {
 fn confirm_restart_says_what_applying_drops() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Udp, "0.0.0.0:5555");
-    app.listeners[0].name = Some("web".into());
+    app.endpoints[0].name = Some("web".into());
     let _a = app.add_test_session(listener, "10.0.0.5:1000");
     let _b = app.add_test_session(listener, "10.0.0.6:1000");
     app.mode = Mode::Settings(SettingsForm {

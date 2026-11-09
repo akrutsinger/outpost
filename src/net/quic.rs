@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 use tokio_rustls::rustls::ServerConfig;
 
-use super::{HANDSHAKE_TIMEOUT, ListenerId, NetEvent, Outlet, SessId, emit, next_id};
+use super::{EndpointId, HANDSHAKE_TIMEOUT, NetEvent, Outlet, SessId, emit, next_id};
 use crate::Event;
 
 /// Keeps a quiet connection open while the user types a reply.
@@ -53,7 +53,7 @@ pub enum StreamEnd {
 }
 
 pub async fn listener(
-    id: ListenerId,
+    id: EndpointId,
     addr: SocketAddr,
     tls: Arc<ServerConfig>,
     events: UnboundedSender<Event>,

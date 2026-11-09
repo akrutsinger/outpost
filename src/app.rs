@@ -1,4 +1,4 @@
-//! Application state and input handling. The listener, session, and
+//! Application state and input handling. The endpoint, session, and
 //! settings-form types live in submodules; this module owns `App`, its
 //! overlays (`Mode`), and how keys and clicks drive them.
 
@@ -12,15 +12,15 @@ use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Event;
-use crate::net::{self, ListenerId, NetEvent, Outlet, SessId};
+use crate::net::{self, EndpointId, NetEvent, Outlet, SessId};
 use crate::text_input::TextInput;
 use crate::ui::{FormHit, Hits, TextTarget};
 
-mod listener;
+mod endpoint;
 mod session;
 mod settings;
 
-pub use listener::{ListenState, Listener, ListenerConfig, Status};
+pub use endpoint::{Endpoint, ListenState, ListenerConfig, Status};
 pub use session::{Dir, Session};
 pub use settings::{Applied, CertKind, Field, SettingsForm};
 
@@ -28,7 +28,7 @@ pub use settings::{Applied, CertKind, Field, SettingsForm};
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 const MIN_SIDEBAR_WIDTH: u16 = 18;
 const MAX_SIDEBAR_WIDTH: u16 = 36;
-/// Share of the sidebar given to listeners; sessions get the rest.
+/// Share of the sidebar given to endpoints; sessions get the rest.
 const DEFAULT_SIDEBAR_SPLIT: f32 = 0.5;
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
@@ -49,7 +49,7 @@ fn hit<T: Copy>(targets: &[(Rect, T)], pos: Position) -> Option<T> {
 /// What a right-click menu or rename acts on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
-    Listener(ListenerId),
+    Endpoint(EndpointId),
     /// A tab.
     Session(SessId),
 }
@@ -97,13 +97,13 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The listener or tab the open overlay acts on, highlighted while it's open.
+    /// The endpoint or tab the open overlay acts on, highlighted while it's open.
     pub fn target(&self) -> Option<Target> {
         match self {
             Mode::Menu(menu) => Some(menu.target),
             Mode::Rename(form) => Some(form.target),
             Mode::Confirm(Confirm::Close(target)) => Some(*target),
-            Mode::Confirm(Confirm::Restart(form, _)) => form.target.map(Target::Listener),
+            Mode::Confirm(Confirm::Restart(form, _)) => form.target.map(Target::Endpoint),
             Mode::Normal
             | Mode::Prefix
             | Mode::Help
@@ -117,7 +117,7 @@ impl Mode {
 // Only one exists at a time, and `Mode::Settings` holds a form unboxed too.
 #[expect(clippy::large_enum_variant)]
 pub enum Confirm {
-    /// Closing a listener or tab.
+    /// Closing an endpoint or tab.
     Close(Target),
     /// Applying settings that restart a UDP or QUIC listener. Cancelling
     /// returns to the form.
@@ -131,12 +131,12 @@ pub enum Confirm {
 enum Drag {
     /// The vertical line between the sidebar and the tabs.
     SidebarWidth,
-    /// The horizontal line between listeners and sessions.
+    /// The horizontal line between endpoints and sessions.
     SidebarSplit,
 }
 
 pub struct App {
-    pub listeners: Vec<Listener>,
+    pub endpoints: Vec<Endpoint>,
     pub active: usize,
     pub mode: Mode,
     pub hits: Hits,
@@ -151,7 +151,7 @@ pub struct App {
 impl App {
     pub fn new(events: UnboundedSender<Event>) -> Self {
         Self {
-            listeners: Vec::new(),
+            endpoints: Vec::new(),
             active: 0,
             mode: Mode::Normal,
             hits: Hits::default(),
@@ -180,30 +180,30 @@ impl App {
     }
 
     fn focused_session_mut(&mut self) -> Option<&mut Session> {
-        let listener = self.listeners.get_mut(self.active)?;
-        listener.sessions.get_mut(listener.active_tab)
+        let endpoint = self.endpoints.get_mut(self.active)?;
+        endpoint.sessions.get_mut(endpoint.active_tab)
     }
 
-    pub fn listener(&self, id: ListenerId) -> Option<&Listener> {
-        self.listeners.iter().find(|listener| listener.id == id)
+    pub fn endpoint(&self, id: EndpointId) -> Option<&Endpoint> {
+        self.endpoints.iter().find(|endpoint| endpoint.id == id)
     }
 
     pub fn session(&self, id: SessId) -> Option<&Session> {
-        self.listeners
+        self.endpoints
             .iter()
-            .flat_map(|listener| &listener.sessions)
+            .flat_map(|endpoint| &endpoint.sessions)
             .find(|s| s.id == id)
     }
 
     fn session_mut(&mut self, id: SessId) -> Option<&mut Session> {
-        self.listeners
+        self.endpoints
             .iter_mut()
-            .flat_map(|listener| listener.sessions.iter_mut())
+            .flat_map(|endpoint| endpoint.sessions.iter_mut())
             .find(|s| s.id == id)
     }
 
-    fn listener_mut(&mut self, id: ListenerId) -> Option<&mut Listener> {
-        self.listeners.iter_mut().find(|listener| listener.id == id)
+    fn endpoint_mut(&mut self, id: EndpointId) -> Option<&mut Endpoint> {
+        self.endpoints.iter_mut().find(|endpoint| endpoint.id == id)
     }
 
     fn on_net(&mut self, ev: NetEvent) {
@@ -213,19 +213,19 @@ impl App {
                 local,
                 udp,
             } => {
-                if let Some(listener) = self.listener_mut(id) {
-                    listener.state = ListenState::Listening;
-                    listener.config.addr = local;
-                    listener.udp_out = udp;
+                if let Some(endpoint) = self.endpoint_mut(id) {
+                    endpoint.state = ListenState::Listening;
+                    endpoint.config.addr = local;
+                    endpoint.udp_out = udp;
                 }
             }
             NetEvent::ListenFailed {
                 listener: id,
                 error,
             } => {
-                if let Some(listener) = self.listener_mut(id) {
-                    listener.state = ListenState::Failed(error);
-                    listener.task = None;
+                if let Some(endpoint) = self.endpoint_mut(id) {
+                    endpoint.state = ListenState::Failed(error);
+                    endpoint.task = None;
                 }
             }
             NetEvent::Accepted {
@@ -234,9 +234,9 @@ impl App {
                 peer,
                 outlet,
             } => {
-                // If the listener is gone, dropping the outlet closes the connection.
-                if let Some(listener) = self.listener_mut(id) {
-                    listener.sessions.push(Session::new(sess, peer, outlet));
+                // If the endpoint is gone, dropping the outlet closes the connection.
+                if let Some(endpoint) = self.endpoint_mut(id) {
+                    endpoint.sessions.push(Session::new(sess, peer, outlet));
                 }
             }
             NetEvent::Secured { sess, summary } => {
@@ -273,13 +273,13 @@ impl App {
                 peer,
                 bytes,
             } => {
-                let Some(listener) = self.listener_mut(id) else {
+                let Some(endpoint) = self.endpoint_mut(id) else {
                     return;
                 };
-                let Some(tx) = listener.udp_out.clone() else {
+                let Some(tx) = endpoint.udp_out.clone() else {
                     return;
                 };
-                let index = match listener
+                let index = match endpoint
                     .sessions
                     .iter()
                     .position(|s| s.is_open() && s.peer == peer)
@@ -287,13 +287,13 @@ impl App {
                     Some(index) => index,
                     None => {
                         let outlet = Outlet::Udp { tx, peer };
-                        listener
+                        endpoint
                             .sessions
                             .push(Session::new(net::next_id(), peer, outlet));
-                        listener.sessions.len() - 1
+                        endpoint.sessions.len() - 1
                     }
                 };
-                listener.sessions[index].receive(&bytes);
+                endpoint.sessions[index].receive(&bytes);
             }
         }
     }
@@ -361,8 +361,8 @@ impl App {
                 }
             }
             KeyCode::Char(c @ '1'..='9') => self.select_tab(c as usize - '1' as usize),
-            KeyCode::Char('j') | KeyCode::Down => self.cycle_listener(1),
-            KeyCode::Char('k') | KeyCode::Up => self.cycle_listener(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.cycle_endpoint(1),
+            KeyCode::Char('k') | KeyCode::Up => self.cycle_endpoint(-1),
             KeyCode::Char('X') => {
                 if let Some(s) = self.focused_session_mut() {
                     let id = s.id;
@@ -370,13 +370,13 @@ impl App {
                 }
             }
             KeyCode::Char('D') => {
-                if let Some(listener) = self.listeners.get(self.active) {
-                    self.request_close(Target::Listener(listener.id));
+                if let Some(endpoint) = self.endpoints.get(self.active) {
+                    self.request_close(Target::Endpoint(endpoint.id));
                 }
             }
             KeyCode::Char('W') => {
-                if let Some(listener) = self.listeners.get(self.active) {
-                    self.open_rename(Target::Listener(listener.id));
+                if let Some(endpoint) = self.endpoints.get(self.active) {
+                    self.open_rename(Target::Endpoint(endpoint.id));
                 }
             }
             KeyCode::Char('T') => {
@@ -394,7 +394,7 @@ impl App {
     fn settings_key(&mut self, mut form: SettingsForm, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => return,
-            KeyCode::Enter => match form.check(&self.listeners) {
+            KeyCode::Enter => match form.check(&self.endpoints) {
                 Ok(applied) if self.restart_drops_sessions(form.target, &applied.config) => {
                     self.mode = Mode::Confirm(Confirm::Restart(form, applied));
                     return;
@@ -455,9 +455,9 @@ impl App {
                     (!name.is_empty() && name != default).then(|| name.to_string())
                 };
                 match form.target {
-                    Target::Listener(id) => {
-                        if let Some(listener) = self.listener_mut(id) {
-                            listener.name = custom(listener.endpoint());
+                    Target::Endpoint(id) => {
+                        if let Some(endpoint) = self.endpoint_mut(id) {
+                            endpoint.name = custom(endpoint.addr_label());
                         }
                     }
                     Target::Session(id) => {
@@ -615,17 +615,17 @@ impl App {
         }
     }
 
-    /// What right-clicking at `pos` opens a menu for. Listener rows and tabs
+    /// What right-clicking at `pos` opens a menu for. Endpoint rows and tabs
     /// have menus; the sessions list doesn't.
     fn menu_target(&self, pos: Position) -> Option<Target> {
-        if let Some(index) = hit(&self.hits.listeners, pos) {
+        if let Some(index) = hit(&self.hits.endpoints, pos) {
             return self
-                .listeners
+                .endpoints
                 .get(index)
-                .map(|listener| Target::Listener(listener.id));
+                .map(|endpoint| Target::Endpoint(endpoint.id));
         }
         let tab = hit(&self.hits.tabs, pos)?;
-        let s = self.listeners.get(self.active)?.sessions.get(tab)?;
+        let s = self.endpoints.get(self.active)?.sessions.get(tab)?;
         Some(Target::Session(s.id))
     }
 
@@ -649,15 +649,15 @@ impl App {
             self.open_new_form();
         } else if self.hits.settings.contains(pos) {
             self.open_settings_form();
-        } else if let Some(index) = hit(&self.hits.listeners, pos) {
-            if index < self.listeners.len() {
+        } else if let Some(index) = hit(&self.hits.endpoints, pos) {
+            if index < self.endpoints.len() {
                 self.active = index;
             }
         } else if let Some((index, tab)) = hit(&self.hits.sessions, pos) {
-            if let Some(listener) = self.listeners.get_mut(index)
-                && tab < listener.sessions.len()
+            if let Some(endpoint) = self.endpoints.get_mut(index)
+                && tab < endpoint.sessions.len()
             {
-                listener.active_tab = tab;
+                endpoint.active_tab = tab;
                 self.active = index;
             }
         } else if let Some(tab) = hit(&self.hits.tabs, pos) {
@@ -682,7 +682,7 @@ impl App {
         self.sidebar_width = (column + 1).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
     }
 
-    /// Puts the listeners/sessions divider at `row`.
+    /// Puts the endpoints/sessions divider at `row`.
     fn set_sidebar_split(&mut self, row: u16) {
         let sidebar = self.hits.sidebar_divider;
         if sidebar.height > 0 {
@@ -702,7 +702,7 @@ impl App {
 
     fn open_rename(&mut self, target: Target) {
         let label = match target {
-            Target::Listener(id) => self.listener(id).map(Listener::label),
+            Target::Endpoint(id) => self.endpoint(id).map(Endpoint::label),
             Target::Session(id) => self.session(id).map(Session::label),
         };
         if let Some(label) = label {
@@ -713,13 +713,13 @@ impl App {
         }
     }
 
-    /// (listener index, tab index) of a session.
+    /// (endpoint index, tab index) of a session.
     fn locate_session(&self, id: SessId) -> Option<(usize, usize)> {
-        self.listeners
+        self.endpoints
             .iter()
             .enumerate()
-            .find_map(|(index, listener)| {
-                listener
+            .find_map(|(index, endpoint)| {
+                endpoint
                     .sessions
                     .iter()
                     .position(|s| s.id == id)
@@ -728,95 +728,95 @@ impl App {
     }
 
     fn open_new_form(&mut self) {
-        self.mode = Mode::Settings(SettingsForm::new(&self.listeners));
+        self.mode = Mode::Settings(SettingsForm::new(&self.endpoints));
     }
 
     fn open_settings_form(&mut self) {
-        let form = match self.listeners.get(self.active) {
-            Some(listener) => SettingsForm::edit(listener),
-            None => SettingsForm::new(&self.listeners),
+        let form = match self.endpoints.get(self.active) {
+            Some(endpoint) => SettingsForm::edit(endpoint),
+            None => SettingsForm::new(&self.endpoints),
         };
         self.mode = Mode::Settings(form);
     }
 
-    /// Whether applying `config` to listener `target` would drop open sessions.
-    fn restart_drops_sessions(&self, target: Option<ListenerId>, config: &ListenerConfig) -> bool {
+    /// Whether applying `config` to endpoint `target` would drop open sessions.
+    fn restart_drops_sessions(&self, target: Option<EndpointId>, config: &ListenerConfig) -> bool {
         target
-            .and_then(|id| self.listener(id))
-            .is_some_and(|listener| listener.restart_drops_sessions(config))
+            .and_then(|id| self.endpoint(id))
+            .is_some_and(|endpoint| endpoint.restart_drops_sessions(config))
     }
 
     /// Creates a listener (`target` is `None`) or applies new settings to one,
     /// restarting it if anything changed.
-    fn apply(&mut self, target: Option<ListenerId>, Applied { config, tls }: Applied) {
+    fn apply(&mut self, target: Option<EndpointId>, Applied { config, tls }: Applied) {
         match target {
             None => {
-                let mut listener = Listener::new(config, tls);
-                listener.start(&self.events);
-                self.listeners.push(listener);
-                self.active = self.listeners.len() - 1;
+                let mut endpoint = Endpoint::new(config, tls);
+                endpoint.start(&self.events);
+                self.endpoints.push(endpoint);
+                self.active = self.endpoints.len() - 1;
             }
             Some(id) => {
                 let events = self.events.clone();
-                let Some(listener) = self.listener_mut(id) else {
+                let Some(endpoint) = self.endpoint_mut(id) else {
                     return;
                 };
-                if listener.restarts_for(&config) {
-                    listener.stop();
-                    listener.config = config;
-                    listener.tls = tls;
-                    listener.start(&events);
+                if endpoint.restarts_for(&config) {
+                    endpoint.stop();
+                    endpoint.config = config;
+                    endpoint.tls = tls;
+                    endpoint.start(&events);
                 }
             }
         }
     }
 
     fn cycle_tab(&mut self, delta: isize) {
-        if let Some(listener) = self.listeners.get_mut(self.active)
-            && !listener.sessions.is_empty()
+        if let Some(endpoint) = self.endpoints.get_mut(self.active)
+            && !endpoint.sessions.is_empty()
         {
-            listener.active_tab = wrap(listener.active_tab, delta, listener.sessions.len());
+            endpoint.active_tab = wrap(endpoint.active_tab, delta, endpoint.sessions.len());
         }
     }
 
     fn select_tab(&mut self, index: usize) {
-        if let Some(listener) = self.listeners.get_mut(self.active)
-            && index < listener.sessions.len()
+        if let Some(endpoint) = self.endpoints.get_mut(self.active)
+            && index < endpoint.sessions.len()
         {
-            listener.active_tab = index;
+            endpoint.active_tab = index;
         }
     }
 
-    fn cycle_listener(&mut self, delta: isize) {
-        if !self.listeners.is_empty() {
-            self.active = wrap(self.active, delta, self.listeners.len());
+    fn cycle_endpoint(&mut self, delta: isize) {
+        if !self.endpoints.is_empty() {
+            self.active = wrap(self.active, delta, self.endpoints.len());
         }
     }
 
     /// Disconnects (if still open) and removes a session, keeping focus on
     /// the same tab when another one is removed.
-    fn remove_session(&mut self, listener: usize, index: usize) {
-        let Some(listener) = self.listeners.get_mut(listener) else {
+    fn remove_session(&mut self, endpoint: usize, index: usize) {
+        let Some(endpoint) = self.endpoints.get_mut(endpoint) else {
             return;
         };
-        if index >= listener.sessions.len() {
+        if index >= endpoint.sessions.len() {
             return;
         }
-        listener.sessions.remove(index);
-        if index < listener.active_tab {
-            listener.active_tab -= 1;
+        endpoint.sessions.remove(index);
+        if index < endpoint.active_tab {
+            endpoint.active_tab -= 1;
         }
-        listener.active_tab = listener
+        endpoint.active_tab = endpoint
             .active_tab
-            .min(listener.sessions.len().saturating_sub(1));
+            .min(endpoint.sessions.len().saturating_sub(1));
     }
 
-    /// Closes a listener or tab, asking first if that would drop live connections.
+    /// Closes an endpoint or tab, asking first if that would drop live connections.
     fn request_close(&mut self, target: Target) {
         let live = match target {
-            Target::Listener(id) => self
-                .listener(id)
-                .is_some_and(|listener| listener.open_count() > 0),
+            Target::Endpoint(id) => self
+                .endpoint(id)
+                .is_some_and(|endpoint| endpoint.open_count() > 0),
             Target::Session(id) => self.session(id).is_some_and(Session::is_open),
         };
         if live {
@@ -829,9 +829,9 @@ impl App {
     /// Quits, asking first if that would drop live connections.
     fn request_quit(&mut self) {
         if self
-            .listeners
+            .endpoints
             .iter()
-            .any(|listener| listener.open_count() > 0)
+            .any(|endpoint| endpoint.open_count() > 0)
         {
             self.mode = Mode::Confirm(Confirm::Quit);
         } else {
@@ -857,30 +857,30 @@ impl App {
     /// Closes without asking, dropping any connections.
     fn close_target(&mut self, target: Target) {
         match target {
-            Target::Listener(id) => {
-                if let Some(index) = self.listeners.iter().position(|listener| listener.id == id) {
-                    self.remove_listener(index);
+            Target::Endpoint(id) => {
+                if let Some(index) = self.endpoints.iter().position(|endpoint| endpoint.id == id) {
+                    self.remove_endpoint(index);
                 }
             }
             Target::Session(id) => {
-                if let Some((listener, index)) = self.locate_session(id) {
-                    self.remove_session(listener, index);
+                if let Some((endpoint, index)) = self.locate_session(id) {
+                    self.remove_session(endpoint, index);
                 }
             }
         }
     }
 
-    /// Removes a listener (stopping its task and sessions), keeping focus
-    /// on the same listener when another one is removed.
-    fn remove_listener(&mut self, index: usize) {
-        if index >= self.listeners.len() {
+    /// Removes an endpoint (stopping its task and sessions), keeping focus
+    /// on the same endpoint when another one is removed.
+    fn remove_endpoint(&mut self, index: usize) {
+        if index >= self.endpoints.len() {
             return;
         }
-        self.listeners.remove(index);
+        self.endpoints.remove(index);
         if index < self.active {
             self.active -= 1;
         }
-        self.active = self.active.min(self.listeners.len().saturating_sub(1));
+        self.active = self.active.min(self.endpoints.len().saturating_sub(1));
     }
 }
 
@@ -896,16 +896,16 @@ impl App {
     }
 
     /// Adds a listener that is already listening, with no socket behind it.
-    pub fn add_test_listener(&mut self, protocol: crate::net::Protocol, addr: &str) -> ListenerId {
+    pub fn add_test_listener(&mut self, protocol: crate::net::Protocol, addr: &str) -> EndpointId {
         let config = ListenerConfig {
             protocol,
             addr: addr.parse().expect("test address"),
             tls: crate::net::tls::TlsConfig::default(),
         };
-        let mut listener = Listener::new(config, None);
+        let mut listener = Endpoint::new(config, None);
         listener.state = ListenState::Listening;
         let id = listener.id;
-        self.listeners.push(listener);
+        self.endpoints.push(listener);
         id
     }
 
@@ -914,7 +914,7 @@ impl App {
     /// app drops the session.
     pub fn add_test_session(
         &mut self,
-        listener: ListenerId,
+        listener: EndpointId,
         peer: &str,
     ) -> (SessId, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -932,7 +932,7 @@ impl App {
     /// each write and finish the app asks for.
     pub fn add_test_quic_session(
         &mut self,
-        listener: ListenerId,
+        listener: EndpointId,
         peer: &str,
     ) -> (
         SessId,

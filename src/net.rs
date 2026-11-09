@@ -23,7 +23,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a hang-up waits to tell the peer (TLS close_notify) before dropping.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub type ListenerId = u64;
+pub type EndpointId = u64;
 pub type SessId = u64;
 pub type UdpOut = UnboundedSender<(SocketAddr, Vec<u8>)>;
 
@@ -94,16 +94,16 @@ impl Outlet {
 pub enum NetEvent {
     /// Listener bound. UDP listeners hand back the channel used to send datagrams.
     Listening {
-        listener: ListenerId,
+        listener: EndpointId,
         local: SocketAddr,
         udp: Option<UdpOut>,
     },
     ListenFailed {
-        listener: ListenerId,
+        listener: EndpointId,
         error: String,
     },
     Accepted {
-        listener: ListenerId,
+        listener: EndpointId,
         sess: SessId,
         peer: SocketAddr,
         outlet: Outlet,
@@ -134,7 +134,7 @@ pub enum NetEvent {
     },
     /// UDP has no connections; the app maps peers to sessions.
     Datagram {
-        listener: ListenerId,
+        listener: EndpointId,
         peer: SocketAddr,
         bytes: Vec<u8>,
     },
@@ -142,7 +142,7 @@ pub enum NetEvent {
 
 /// `tls` is the server config for TLS and QUIC, and is ignored otherwise.
 pub fn spawn_listener(
-    id: ListenerId,
+    id: EndpointId,
     protocol: Protocol,
     addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
@@ -179,7 +179,7 @@ fn emit(events: &UnboundedSender<Event>, ev: NetEvent) -> bool {
 
 /// Accepts TCP connections, running a TLS handshake on each when `tls` is set.
 async fn tcp_listener(
-    id: ListenerId,
+    id: EndpointId,
     addr: SocketAddr,
     tls: Option<TlsAcceptor>,
     events: UnboundedSender<Event>,
@@ -306,7 +306,7 @@ async fn stream_session<S: AsyncRead + AsyncWrite + Unpin>(
     emit(&events, NetEvent::Closed { sess, error });
 }
 
-async fn udp_listener(id: ListenerId, addr: SocketAddr, events: UnboundedSender<Event>) {
+async fn udp_listener(id: EndpointId, addr: SocketAddr, events: UnboundedSender<Event>) {
     let socket = match UdpSocket::bind(addr).await {
         Ok(socket) => socket,
         Err(e) => {

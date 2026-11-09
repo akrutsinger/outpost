@@ -8,10 +8,10 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use super::{FormHit, Hits, TextTarget, put, render_input};
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Field, Listener, MenuItem, RenameForm, SettingsForm,
+    App, CertKind, Confirm, ContextMenu, Endpoint, Field, MenuItem, RenameForm, SettingsForm,
     Target,
 };
-use crate::net::{ListenerId, Protocol};
+use crate::net::{EndpointId, Protocol};
 use crate::theme::*;
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -259,7 +259,7 @@ pub(super) fn render_rename(
     let rect = centered(area, 46, 7);
     Clear.render(rect, buf);
     let block = overlay_block(match form.target {
-        Target::Listener(_) => "rename listener",
+        Target::Endpoint(_) => "rename listener",
         Target::Session(_) => "rename tab",
     });
     let inner = block.inner(rect);
@@ -299,19 +299,19 @@ pub(super) fn render_confirm(
 ) {
     let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
     // e.g. `web (tcp :4444)` and `2 open connections`.
-    let describe = |listener: &Listener| {
-        let who = match &listener.name {
-            Some(name) => format!("{name} ({})", listener.endpoint()),
-            None => listener.endpoint(),
+    let describe = |endpoint: &Endpoint| {
+        let who = match &endpoint.name {
+            Some(name) => format!("{name} ({})", endpoint.addr_label()),
+            None => endpoint.addr_label(),
         };
-        (who, count(listener.open_count(), "open connection"))
+        (who, count(endpoint.open_count(), "open connection"))
     };
-    let listener = |id: ListenerId| app.listener(id).map(describe);
+    let endpoint = |id: EndpointId| app.endpoint(id).map(describe);
     let text = match *confirm {
-        Confirm::Close(Target::Listener(id)) => {
-            listener(id).map(|(who, open)| (" Close listener?", format!(" {who} has {open}.")))
+        Confirm::Close(Target::Endpoint(id)) => {
+            endpoint(id).map(|(who, open)| (" Close listener?", format!(" {who} has {open}.")))
         }
-        Confirm::Restart(ref form, _) => form.target.and_then(listener).map(|(who, open)| {
+        Confirm::Restart(ref form, _) => form.target.and_then(endpoint).map(|(who, open)| {
             (
                 " Apply settings?",
                 format!(" Restarting {who} drops its {open}."),
@@ -319,17 +319,17 @@ pub(super) fn render_confirm(
         }),
         Confirm::Quit => {
             let live: Vec<_> = app
-                .listeners
+                .endpoints
                 .iter()
-                .filter(|listener| listener.open_count() > 0)
+                .filter(|endpoint| endpoint.open_count() > 0)
                 .collect();
             let detail = match live[..] {
-                [listener] => {
-                    let (who, open) = describe(listener);
+                [endpoint] => {
+                    let (who, open) = describe(endpoint);
                     format!(" {who} has {open}.")
                 }
                 _ => {
-                    let open = live.iter().map(|listener| listener.open_count()).sum();
+                    let open = live.iter().map(|endpoint| endpoint.open_count()).sum();
                     format!(
                         " {} across {}.",
                         count(open, "open connection"),

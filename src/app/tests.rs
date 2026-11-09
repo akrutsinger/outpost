@@ -66,7 +66,7 @@ fn data(app: &mut App, sess: SessId, bytes: &[u8]) {
 }
 
 fn transcript(app: &App, listener: usize, tab: usize) -> Vec<(Dir, String)> {
-    app.listeners[listener].sessions[tab]
+    app.endpoints[listener].sessions[tab]
         .lines
         .iter()
         .map(|line| (line.dir, line.text.clone()))
@@ -101,7 +101,7 @@ fn incoming_data_splits_lines_and_drops_carriage_returns() {
     let (mut app, sess, _out) = one_session();
     data(&mut app, sess, b"one\r\ntwo\n\nthree\n");
     assert_eq!(incoming(&app, 0, 0), ["one", "two", "", "three"]);
-    assert_eq!(app.listeners[0].sessions[0].bytes_in, 16);
+    assert_eq!(app.endpoints[0].sessions[0].bytes_in, 16);
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn transcript_is_capped() {
     let (mut app, sess, _out) = one_session();
     let flood = "x\n".repeat(MAX_LINES + 50);
     data(&mut app, sess, flood.as_bytes());
-    assert_eq!(app.listeners[0].sessions[0].lines.len(), MAX_LINES);
+    assert_eq!(app.endpoints[0].sessions[0].lines.len(), MAX_LINES);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn enter_sends_input_line_to_focused_session() {
     key(&mut app, KeyCode::Enter);
 
     assert_eq!(out.try_recv().unwrap(), b"hi ther\n");
-    let s = &app.listeners[0].sessions[0];
+    let s = &app.endpoints[0].sessions[0];
     assert_eq!(s.input, "");
     assert_eq!(s.bytes_out, 8);
     assert_eq!(
@@ -165,7 +165,7 @@ fn typing_is_ignored_once_the_peer_disconnects() {
     type_str(&mut app, "hello");
     key(&mut app, KeyCode::Enter);
 
-    let s = &app.listeners[0].sessions[0];
+    let s = &app.endpoints[0].sessions[0];
     assert!(!s.is_open());
     assert_eq!(s.input, "");
     assert!(out.try_recv().is_err());
@@ -184,7 +184,7 @@ fn send_failure_closes_the_session() {
     drop(out); // The connection task is gone.
     type_str(&mut app, "hello");
     key(&mut app, KeyCode::Enter);
-    let s = &app.listeners[0].sessions[0];
+    let s = &app.endpoints[0].sessions[0];
     assert!(!s.is_open());
     assert_eq!(s.bytes_out, 0);
 }
@@ -197,17 +197,17 @@ fn background_activity_is_unread_until_focused() {
     let (second, _b) = app.add_test_session(listener, "10.0.0.6:2000");
 
     // A brand-new background connection counts as unread; the focused one doesn't.
-    assert!(!app.listeners[0].sessions[0].unread);
-    assert!(app.listeners[0].sessions[1].unread);
-    assert_eq!(app.listeners[0].status(), Status::Unread);
+    assert!(!app.endpoints[0].sessions[0].unread);
+    assert!(app.endpoints[0].sessions[1].unread);
+    assert_eq!(app.endpoints[0].status(), Status::Unread);
 
     prefix(&mut app, 'n');
-    assert!(!app.listeners[0].sessions[1].unread);
+    assert!(!app.endpoints[0].sessions[1].unread);
 
     data(&mut app, first, b"ping\n");
     data(&mut app, second, b"pong\n");
-    assert!(app.listeners[0].sessions[0].unread);
-    assert!(!app.listeners[0].sessions[1].unread);
+    assert!(app.endpoints[0].sessions[0].unread);
+    assert!(!app.endpoints[0].sessions[1].unread);
 }
 
 #[test]
@@ -219,14 +219,14 @@ fn prefix_keys_switch_tabs() {
         .collect();
 
     prefix(&mut app, 'n');
-    assert_eq!(app.listeners[0].active_tab, 1);
+    assert_eq!(app.endpoints[0].active_tab, 1);
     prefix(&mut app, 'p');
     prefix(&mut app, 'p');
-    assert_eq!(app.listeners[0].active_tab, 2, "wraps backwards");
+    assert_eq!(app.endpoints[0].active_tab, 2, "wraps backwards");
     prefix(&mut app, '1');
-    assert_eq!(app.listeners[0].active_tab, 0);
+    assert_eq!(app.endpoints[0].active_tab, 0);
     prefix(&mut app, '9');
-    assert_eq!(app.listeners[0].active_tab, 0, "out of range is ignored");
+    assert_eq!(app.endpoints[0].active_tab, 0, "out of range is ignored");
     assert!(matches!(app.mode, Mode::Normal));
 }
 
@@ -261,8 +261,8 @@ fn close_tab_disconnects_and_keeps_a_valid_focus() {
     key(&mut app, KeyCode::Enter);
     // Dropping the outlet is what tells the connection task to hang up.
     assert_eq!(out_b.try_recv(), Err(TryRecvError::Disconnected));
-    assert_eq!(app.listeners[0].sessions.len(), 1);
-    assert_eq!(app.listeners[0].active_tab, 0);
+    assert_eq!(app.endpoints[0].sessions.len(), 1);
+    assert_eq!(app.endpoints[0].active_tab, 0);
 
     // A late event for the removed session is ignored.
     data(&mut app, b, b"late\n");
@@ -279,7 +279,7 @@ fn close_listener_drops_its_sessions() {
 
     prefix(&mut app, 'D');
     assert!(
-        matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Listener(listener))
+        matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Endpoint(listener))
     );
     assert!(
         out.try_recv().is_err_and(|e| e == TryRecvError::Empty),
@@ -287,7 +287,7 @@ fn close_listener_drops_its_sessions() {
     );
     key(&mut app, KeyCode::Enter);
     assert_eq!(out.try_recv(), Err(TryRecvError::Disconnected));
-    assert_eq!(app.listeners.len(), 1);
+    assert_eq!(app.endpoints.len(), 1);
     assert_eq!(app.active, 0);
 }
 
@@ -352,7 +352,7 @@ fn datagrams_map_to_one_session_per_peer() {
             bytes: bytes.as_bytes().to_vec(),
         }));
     }
-    assert_eq!(app.listeners[0].sessions.len(), 2);
+    assert_eq!(app.endpoints[0].sessions.len(), 2);
     assert_eq!(incoming(&app, 0, 0), ["one", "three"]);
     assert_eq!(incoming(&app, 0, 1), ["two"]);
 
@@ -372,7 +372,7 @@ fn datagrams_are_ignored_until_the_socket_is_bound() {
         peer: "10.0.0.5:1000".parse().unwrap(),
         bytes: b"early".to_vec(),
     }));
-    assert!(app.listeners[0].sessions.is_empty());
+    assert!(app.endpoints[0].sessions.is_empty());
 }
 
 #[test]
@@ -433,7 +433,7 @@ fn invalid_form_stays_open_with_an_error() {
     type_str(&mut app, "4444");
     key(&mut app, KeyCode::Enter);
     assert_eq!(form(&app).error.as_deref(), Some("invalid address"));
-    assert!(app.listeners.is_empty());
+    assert!(app.endpoints.is_empty());
 }
 
 #[test]
@@ -448,7 +448,7 @@ fn duplicate_listener_is_rejected() {
         form(&app).error.as_deref(),
         Some("a listener already uses that address")
     );
-    assert_eq!(app.listeners.len(), 1);
+    assert_eq!(app.endpoints.len(), 1);
 }
 
 #[test]
@@ -459,7 +459,7 @@ fn settings_without_changes_leave_the_listener_alone() {
     assert_eq!(form(&app).port, "4444");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(matches!(app.listeners[0].state, ListenState::Listening));
+    assert!(matches!(app.endpoints[0].state, ListenState::Listening));
 }
 
 #[tokio::test]
@@ -480,14 +480,14 @@ async fn submitting_the_form_starts_a_real_listener() {
     key(&mut app, KeyCode::Enter);
 
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(matches!(app.listeners[0].state, ListenState::Binding));
+    assert!(matches!(app.endpoints[0].state, ListenState::Binding));
 
     let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .expect("listener reported in time")
         .expect("event");
     app.handle(ev);
-    let listener = &app.listeners[0];
+    let listener = &app.endpoints[0];
     assert!(matches!(listener.state, ListenState::Listening));
     assert_ne!(listener.config.addr.port(), 0, "real port recorded");
 }
@@ -505,7 +505,7 @@ fn clicking_a_session_row_focuses_its_listener_and_tab() {
     let (rect, ..) = app.hits.sessions[2];
     click(&mut app, rect);
     assert_eq!(app.active, 1);
-    assert_eq!(app.listeners[1].active_tab, 1);
+    assert_eq!(app.endpoints[1].active_tab, 1);
 
     type_str(&mut app, "x");
     key(&mut app, KeyCode::Enter);
@@ -524,9 +524,9 @@ fn clicking_tabs_and_listener_rows() {
     render_rows(&mut app, 120, 32);
     let (rect, _) = app.hits.tabs[2];
     click(&mut app, rect);
-    assert_eq!(app.listeners[0].active_tab, 2);
+    assert_eq!(app.endpoints[0].active_tab, 2);
 
-    let (rect, _) = app.hits.listeners[1];
+    let (rect, _) = app.hits.endpoints[1];
     click(&mut app, rect);
     assert_eq!(app.active, 1);
 }
@@ -543,10 +543,10 @@ fn clicks_on_rows_removed_since_the_last_frame_are_ignored() {
         .collect();
     prefix(&mut app, 'j');
     render_rows(&mut app, 120, 32);
-    let (last_row, _) = app.hits.listeners[1];
+    let (last_row, _) = app.hits.endpoints[1];
     let (last_session, ..) = app.hits.sessions[1];
 
-    app.close_target(Target::Listener(listener));
+    app.close_target(Target::Endpoint(listener));
     click(&mut app, last_row);
     right_click(&mut app, last_row);
     click(&mut app, last_session);
@@ -568,7 +568,7 @@ fn clicking_new_and_settings_open_the_form() {
 
     let settings = app.hits.settings;
     click(&mut app, settings);
-    assert_eq!(form(&app).target, Some(app.listeners[0].id));
+    assert_eq!(form(&app).target, Some(app.endpoints[0].id));
     assert_eq!(form(&app).protocol, Protocol::Udp);
 }
 
@@ -579,7 +579,7 @@ fn clicks_are_ignored_while_a_modal_is_open() {
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:5555");
     render_rows(&mut app, 120, 32);
     prefix(&mut app, '?');
-    let (rect, _) = app.hits.listeners[1];
+    let (rect, _) = app.hits.endpoints[1];
     click(&mut app, rect);
     assert_eq!(app.active, 0);
     assert!(matches!(app.mode, Mode::Help));
@@ -587,7 +587,7 @@ fn clicks_are_ignored_while_a_modal_is_open() {
 
 // ---- listener right-click menu ----
 
-fn three_listeners() -> (App, [ListenerId; 3]) {
+fn three_listeners() -> (App, [EndpointId; 3]) {
     let (mut app, _rx) = App::test_new();
     let ids = [
         app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444"),
@@ -614,7 +614,7 @@ fn rename_input(app: &App) -> &str {
 
 /// Right-clicks listener `index`, renders the menu, and clicks `item`.
 fn menu_pick(app: &mut App, index: usize, item: MenuItem) {
-    let (row, _) = app.hits.listeners[index];
+    let (row, _) = app.hits.endpoints[index];
     right_click(app, row);
     render_rows(app, 120, 32);
     let pos = MenuItem::ALL.iter().position(|&i| i == item).unwrap();
@@ -625,9 +625,9 @@ fn menu_pick(app: &mut App, index: usize, item: MenuItem) {
 #[test]
 fn right_click_opens_menu_for_that_listener_without_focusing_it() {
     let (mut app, ids) = three_listeners();
-    let (row, _) = app.hits.listeners[1];
+    let (row, _) = app.hits.endpoints[1];
     right_click(&mut app, row);
-    assert_eq!(menu(&app).target, Target::Listener(ids[1]));
+    assert_eq!(menu(&app).target, Target::Endpoint(ids[1]));
     assert_eq!((menu(&app).x, menu(&app).y), (row.x, row.y));
     assert_eq!(app.active, 0);
 }
@@ -656,15 +656,15 @@ fn rename_from_menu_sets_a_custom_name() {
     type_str(&mut app, "  web server ");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[1].name.as_deref(), Some("web server"));
-    assert_eq!(app.listeners[1].label(), "web server");
+    assert_eq!(app.endpoints[1].name.as_deref(), Some("web server"));
+    assert_eq!(app.endpoints[1].label(), "web server");
     assert_eq!(app.active, 0);
 }
 
 #[test]
 fn renaming_to_empty_or_the_default_clears_the_name() {
     let (mut app, _ids) = three_listeners();
-    app.listeners[0].name = Some("old".into());
+    app.endpoints[0].name = Some("old".into());
 
     prefix(&mut app, 'W');
     assert_eq!(rename_input(&app), "old");
@@ -672,11 +672,11 @@ fn renaming_to_empty_or_the_default_clears_the_name() {
         key(&mut app, KeyCode::Backspace);
     }
     key(&mut app, KeyCode::Enter);
-    assert_eq!(app.listeners[0].name, None);
+    assert_eq!(app.endpoints[0].name, None);
 
     prefix(&mut app, 'W');
     key(&mut app, KeyCode::Enter); // Unchanged default label.
-    assert_eq!(app.listeners[0].name, None);
+    assert_eq!(app.endpoints[0].name, None);
 }
 
 #[test]
@@ -686,7 +686,7 @@ fn escape_cancels_a_rename() {
     type_str(&mut app, "!!!");
     key(&mut app, KeyCode::Esc);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[0].name, None);
+    assert_eq!(app.endpoints[0].name, None);
 }
 
 #[test]
@@ -696,17 +696,17 @@ fn close_from_menu_removes_that_listener_and_keeps_focus() {
     prefix(&mut app, 'j');
     prefix(&mut app, 'j');
     render_rows(&mut app, 120, 32);
-    assert_eq!(app.listeners[app.active].id, ids[2]);
+    assert_eq!(app.endpoints[app.active].id, ids[2]);
 
     menu_pick(&mut app, 0, MenuItem::Close);
-    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Listener(ids[0])));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Endpoint(ids[0])));
     render_rows(&mut app, 120, 32);
     let confirm = app.hits.confirm;
     click(&mut app, confirm);
     assert!(matches!(app.mode, Mode::Normal));
-    let remaining: Vec<ListenerId> = app.listeners.iter().map(|listener| listener.id).collect();
+    let remaining: Vec<EndpointId> = app.endpoints.iter().map(|listener| listener.id).collect();
     assert_eq!(remaining, [ids[1], ids[2]]);
-    assert_eq!(app.listeners[app.active].id, ids[2], "focus stays put");
+    assert_eq!(app.endpoints[app.active].id, ids[2], "focus stays put");
     assert_eq!(out.try_recv(), Err(TryRecvError::Disconnected));
 }
 
@@ -716,14 +716,14 @@ fn closing_the_focused_listener_from_the_menu() {
     prefix(&mut app, 'j');
     render_rows(&mut app, 120, 32);
     menu_pick(&mut app, 1, MenuItem::Close);
-    assert_eq!(app.listeners.len(), 2);
-    assert_eq!(app.listeners[app.active].id, ids[2]);
+    assert_eq!(app.endpoints.len(), 2);
+    assert_eq!(app.endpoints[app.active].id, ids[2]);
 }
 
 #[test]
 fn menu_works_from_the_keyboard() {
     let (mut app, ids) = three_listeners();
-    let (row, _) = app.hits.listeners[2];
+    let (row, _) = app.hits.endpoints[2];
     right_click(&mut app, row);
     key(&mut app, KeyCode::Down);
     assert_eq!(menu(&app).highlighted, 1);
@@ -731,19 +731,19 @@ fn menu_works_from_the_keyboard() {
     assert_eq!(menu(&app).highlighted, 0, "wraps");
     key(&mut app, KeyCode::Up);
     key(&mut app, KeyCode::Enter); // Close
-    assert!(app.listeners.iter().all(|listener| listener.id != ids[2]));
+    assert!(app.endpoints.iter().all(|listener| listener.id != ids[2]));
 
-    let (row, _) = app.hits.listeners[0];
+    let (row, _) = app.hits.endpoints[0];
     right_click(&mut app, row);
     key(&mut app, KeyCode::Esc);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners.len(), 2);
+    assert_eq!(app.endpoints.len(), 2);
 }
 
 #[test]
 fn hovering_highlights_menu_items() {
     let (mut app, _ids) = three_listeners();
-    let (row, _) = app.hits.listeners[0];
+    let (row, _) = app.hits.endpoints[0];
     right_click(&mut app, row);
     render_rows(&mut app, 120, 32);
     let (close, _) = app.hits.menu_items[1];
@@ -754,15 +754,15 @@ fn hovering_highlights_menu_items() {
 #[test]
 fn clicking_outside_the_menu_only_dismisses_it() {
     let (mut app, _ids) = three_listeners();
-    let (row, _) = app.hits.listeners[0];
+    let (row, _) = app.hits.endpoints[0];
     right_click(&mut app, row);
     render_rows(&mut app, 120, 32);
     // The click lands on another listener row but must not focus it.
-    let (other, _) = app.hits.listeners[2];
+    let (other, _) = app.hits.endpoints[2];
     click(&mut app, other);
     assert!(matches!(app.mode, Mode::Normal));
     assert_eq!(app.active, 0);
-    assert_eq!(app.listeners.len(), 3);
+    assert_eq!(app.endpoints.len(), 3);
 }
 
 // ---- clicking in the settings form ----
@@ -839,7 +839,7 @@ fn clicks_outside_the_form_are_ignored() {
     render_rows(&mut app, 120, 32);
     let new = app.hits.new_listener;
     click(&mut app, new);
-    assert_eq!(form(&app).target, Some(app.listeners[0].id));
+    assert_eq!(form(&app).target, Some(app.endpoints[0].id));
 }
 
 // ---- close confirmation ----
@@ -851,7 +851,7 @@ fn closing_a_listener_without_open_connections_skips_confirmation() {
     app.handle(Event::Net(NetEvent::Closed { sess, error: None }));
     prefix(&mut app, 'D');
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners.len(), 2);
+    assert_eq!(app.endpoints.len(), 2);
 }
 
 #[test]
@@ -884,7 +884,7 @@ fn cancelling_the_confirmation_keeps_everything() {
     click(&mut app, cancel);
     assert!(matches!(app.mode, Mode::Normal));
 
-    assert_eq!(app.listeners.len(), 3);
+    assert_eq!(app.endpoints.len(), 3);
     assert_eq!(out.try_recv(), Err(TryRecvError::Empty));
 }
 
@@ -916,25 +916,25 @@ async fn restarting_a_udp_listener_with_sessions_asks_first() {
     );
     key(&mut app, KeyCode::Esc);
     assert_eq!(form(&app).port, "0");
-    assert_eq!(app.listeners[0].config.addr.port(), 5555);
-    assert!(app.listeners[0].sessions[0].is_open());
+    assert_eq!(app.endpoints[0].config.addr.port(), 5555);
+    assert!(app.endpoints[0].sessions[0].is_open());
 
     // Confirming applies it and drops the session.
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[0].config.addr.port(), 0);
-    assert!(!app.listeners[0].sessions[0].is_open());
+    assert_eq!(app.endpoints[0].config.addr.port(), 0);
+    assert!(!app.endpoints[0].sessions[0].is_open());
     let ev = next_event(&mut rx).await;
     app.handle(ev);
-    assert!(matches!(app.listeners[0].state, ListenState::Listening));
+    assert!(matches!(app.endpoints[0].state, ListenState::Listening));
 }
 
 #[tokio::test]
 async fn restart_confirmation_buttons_work_with_the_mouse() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Quic, "127.0.0.1:4433");
-    app.listeners[0].config.tls.alpn = vec!["h3".into()];
+    app.endpoints[0].config.tls.alpn = vec!["h3".into()];
     let (_sess, _out) = app.add_test_quic_session(listener, "10.0.0.5:1000");
     change_port(&mut app, "0");
     key(&mut app, KeyCode::Enter);
@@ -950,8 +950,8 @@ async fn restart_confirmation_buttons_work_with_the_mouse() {
     let confirm = app.hits.confirm;
     click(&mut app, confirm);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[0].config.addr.port(), 0);
-    assert!(!app.listeners[0].sessions[0].is_open());
+    assert_eq!(app.endpoints[0].config.addr.port(), 0);
+    assert!(!app.endpoints[0].sessions[0].is_open());
 }
 
 #[tokio::test]
@@ -963,7 +963,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     change_port(&mut app, "0");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(app.listeners[0].sessions[0].is_open());
+    assert!(app.endpoints[0].sessions[0].is_open());
 
     // An unchanged UDP listener doesn't restart.
     let udp = app.add_test_listener(Protocol::Udp, "127.0.0.1:5555");
@@ -972,7 +972,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     prefix(&mut app, 's');
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(app.listeners[1].sessions[0].is_open());
+    assert!(app.endpoints[1].sessions[0].is_open());
 
     // A UDP listener whose sessions have all gone has nothing to drop.
     let idle = app.add_test_listener(Protocol::Udp, "127.0.0.1:6666");
@@ -982,7 +982,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     change_port(&mut app, "0");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[2].config.addr.port(), 0);
+    assert_eq!(app.endpoints[2].config.addr.port(), 0);
 }
 
 // ---- cursor movement in text fields ----
@@ -1091,7 +1091,7 @@ fn rename_supports_cursor_movement_and_clicks() {
     key(&mut app, KeyCode::Delete);
     type_str(&mut app, "M");
     key(&mut app, KeyCode::Enter);
-    assert_eq!(app.listeners[0].name.as_deref(), Some("My tcp :4444"));
+    assert_eq!(app.endpoints[0].name.as_deref(), Some("My tcp :4444"));
 }
 
 // ---- tab right-click menu ----
@@ -1127,7 +1127,7 @@ fn right_click_opens_menu_for_that_tab_without_focusing_it() {
     let (tab, _) = app.hits.tabs[2];
     right_click(&mut app, tab);
     assert_eq!(menu(&app).target, Target::Session(ids[2]));
-    assert_eq!(app.listeners[0].active_tab, 0);
+    assert_eq!(app.endpoints[0].active_tab, 0);
 }
 
 #[test]
@@ -1148,9 +1148,9 @@ fn close_tab_from_menu_disconnects_that_session_and_keeps_focus() {
     click(&mut app, confirm);
     assert!(matches!(app.mode, Mode::Normal));
     assert_eq!(outs[0].try_recv(), Err(TryRecvError::Disconnected));
-    let remaining: Vec<SessId> = app.listeners[0].sessions.iter().map(|s| s.id).collect();
+    let remaining: Vec<SessId> = app.endpoints[0].sessions.iter().map(|s| s.id).collect();
     assert_eq!(remaining, [ids[1], ids[2]]);
-    let listener = &app.listeners[0];
+    let listener = &app.endpoints[0];
     assert_eq!(
         listener.sessions[listener.active_tab].id, ids[2],
         "focus stays put"
@@ -1165,7 +1165,7 @@ fn closing_the_last_tab_from_the_menu_moves_focus_left() {
     render_rows(&mut app, 120, 32);
     tab_menu_pick(&mut app, 2, MenuItem::Close);
     key(&mut app, KeyCode::Enter);
-    let listener = &app.listeners[0];
+    let listener = &app.endpoints[0];
     assert_eq!(listener.sessions.len(), 2);
     assert_eq!(listener.sessions[listener.active_tab].id, ids[1]);
 }
@@ -1184,27 +1184,27 @@ fn rename_tab_from_menu_sets_a_custom_name() {
     type_str(&mut app, "db ");
     key(&mut app, KeyCode::Enter);
     assert_eq!(
-        app.listeners[0].sessions[1].name.as_deref(),
+        app.endpoints[0].sessions[1].name.as_deref(),
         Some("db 10.0.0.2:1000")
     );
-    assert_eq!(app.listeners[0].active_tab, 0);
+    assert_eq!(app.endpoints[0].active_tab, 0);
 }
 
 #[test]
 fn renaming_a_tab_to_empty_or_its_peer_clears_the_name() {
     let (mut app, _ids, _outs) = three_tabs();
-    app.listeners[0].sessions[0].name = Some("db".into());
+    app.endpoints[0].sessions[0].name = Some("db".into());
 
     prefix(&mut app, 'T');
     assert_eq!(rename_input(&app), "db");
     key(&mut app, KeyCode::Backspace);
     key(&mut app, KeyCode::Backspace);
     key(&mut app, KeyCode::Enter);
-    assert_eq!(app.listeners[0].sessions[0].name, None);
+    assert_eq!(app.endpoints[0].sessions[0].name, None);
 
     prefix(&mut app, 'T');
     key(&mut app, KeyCode::Enter); // Unchanged peer address.
-    assert_eq!(app.listeners[0].sessions[0].name, None);
+    assert_eq!(app.endpoints[0].sessions[0].name, None);
 }
 
 #[test]
@@ -1213,10 +1213,10 @@ fn sessions_list_has_no_right_click_menu() {
     let (row, ..) = app.hits.sessions[1];
     right_click(&mut app, row);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[0].active_tab, 0, "right-click doesn't focus");
+    assert_eq!(app.endpoints[0].active_tab, 0, "right-click doesn't focus");
 
     click(&mut app, row);
-    assert_eq!(app.listeners[0].active_tab, 1, "left-click does");
+    assert_eq!(app.endpoints[0].active_tab, 1, "left-click does");
 }
 
 #[test]
@@ -1228,7 +1228,7 @@ fn closing_a_disconnected_tab_skips_confirmation() {
     }));
     prefix(&mut app, 'X');
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[0].sessions.len(), 2);
+    assert_eq!(app.endpoints[0].sessions.len(), 2);
 
     app.handle(Event::Net(NetEvent::Closed {
         sess: ids[2],
@@ -1237,7 +1237,7 @@ fn closing_a_disconnected_tab_skips_confirmation() {
     render_rows(&mut app, 120, 32);
     tab_menu_pick(&mut app, 1, MenuItem::Close);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.listeners[0].sessions.len(), 1);
+    assert_eq!(app.endpoints[0].sessions.len(), 1);
 }
 
 #[test]
@@ -1251,7 +1251,7 @@ fn cancelling_a_tab_close_keeps_the_connection() {
     click(&mut app, cancel);
 
     assert!(matches!(app.mode, Mode::Normal));
-    let remaining: Vec<SessId> = app.listeners[0].sessions.iter().map(|s| s.id).collect();
+    let remaining: Vec<SessId> = app.endpoints[0].sessions.iter().map(|s| s.id).collect();
     assert_eq!(remaining, ids);
     for out in &mut outs {
         assert_eq!(out.try_recv(), Err(TryRecvError::Empty));
@@ -1267,7 +1267,7 @@ fn a_tab_that_disconnects_while_asking_still_closes_on_confirm() {
         error: None,
     }));
     key(&mut app, KeyCode::Enter);
-    assert_eq!(app.listeners[0].sessions.len(), 2);
+    assert_eq!(app.endpoints[0].sessions.len(), 2);
 }
 
 // ---- dragging the sidebar dividers ----
@@ -1373,7 +1373,7 @@ fn dragging_across_other_targets_does_not_click_them() {
     let (mut app, listener) = three_listeners();
     let (_sess, _out) = app.add_test_session(listener[0], "10.0.0.5:1000");
     render_rows(&mut app, 120, 32);
-    let other = app.hits.listeners[2].0;
+    let other = app.hits.endpoints[2].0;
     let tab = app.hits.tabs[0].0;
 
     let divider = app.hits.section_divider;
@@ -1422,7 +1422,7 @@ async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Eve
 }
 
 fn fingerprint(app: &App) -> String {
-    app.listeners[0]
+    app.endpoints[0]
         .tls
         .as_ref()
         .expect("TLS listener has a certificate")
@@ -1509,7 +1509,7 @@ fn cert_files_are_required_and_must_exist() {
     key(&mut app, KeyCode::Enter);
     let error = form(&app).error.clone().unwrap();
     assert!(error.starts_with("cert file: "), "{error}");
-    assert!(app.listeners.is_empty());
+    assert!(app.endpoints.is_empty());
 }
 
 #[tokio::test]
@@ -1523,7 +1523,7 @@ async fn submitting_a_tls_form_serves_a_self_signed_certificate() {
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
 
-    let listener = &app.listeners[0];
+    let listener = &app.endpoints[0];
     assert_eq!(listener.config.protocol, Protocol::Tls);
     assert_eq!(
         listener.config.tls,
@@ -1541,12 +1541,12 @@ async fn submitting_a_tls_form_serves_a_self_signed_certificate() {
 
     let ev = next_event(&mut rx).await;
     app.handle(ev);
-    let listener = &app.listeners[0];
+    let listener = &app.endpoints[0];
     assert!(matches!(listener.state, ListenState::Listening));
     assert!(
-        listener.endpoint().starts_with("tls :"),
+        listener.addr_label().starts_with("tls :"),
         "{}",
-        listener.endpoint()
+        listener.addr_label()
     );
 }
 
@@ -1568,7 +1568,7 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
     }
     type_str(&mut app, "0");
     key(&mut app, KeyCode::Enter);
-    assert!(matches!(app.listeners[0].state, ListenState::Binding));
+    assert!(matches!(app.endpoints[0].state, ListenState::Binding));
     let ev = next_event(&mut rx).await;
     app.handle(ev);
     assert_eq!(fingerprint(&app), original);
@@ -1587,7 +1587,7 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
 fn settings_show_a_tls_listener_as_configured() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tls, "0.0.0.0:8443");
-    app.listeners[0].config.tls = TlsConfig {
+    app.endpoints[0].config.tls = TlsConfig {
         cert: CertSource::Files {
             cert: "/etc/outpost/cert.pem".into(),
             key: "/etc/outpost/key.pem".into(),
@@ -1687,7 +1687,7 @@ fn ctrl_d(app: &mut App) {
 }
 
 fn streams(app: &App) -> &Streams {
-    app.listeners[0].sessions[0]
+    app.endpoints[0].sessions[0]
         .streams
         .as_ref()
         .expect("QUIC session")
@@ -1702,7 +1702,7 @@ fn write(stream: StreamId, text: &str) -> QuicOut {
 
 /// Transcript lines as (dir, stream, text), skipping the connect line.
 fn stream_lines(app: &App) -> Vec<(Dir, Option<StreamId>, String)> {
-    app.listeners[0].sessions[0].lines[1..]
+    app.endpoints[0].sessions[0].lines[1..]
         .iter()
         .map(|line| (line.dir, line.stream, line.text.clone()))
         .collect()
@@ -1913,7 +1913,7 @@ fn quic_needs_alpn() {
         form(&app).error.as_deref(),
         Some("quic needs an alpn protocol, e.g. h3")
     );
-    assert!(app.listeners.is_empty());
+    assert!(app.endpoints.is_empty());
 }
 
 #[tokio::test]
@@ -1935,7 +1935,7 @@ async fn switching_tls_to_quic_keeps_the_certificate() {
     assert!(matches!(app.mode, Mode::Normal));
     let ev = next_event(&mut rx).await;
     app.handle(ev);
-    let listener = &app.listeners[0];
+    let listener = &app.endpoints[0];
     assert_eq!(listener.config.protocol, Protocol::Quic);
     assert!(matches!(listener.state, ListenState::Listening));
     assert_eq!(fingerprint(&app), original);
@@ -1946,6 +1946,6 @@ fn stopping_a_quic_listener_closes_its_sessions() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Quic, "0.0.0.0:4433");
     let (_sess, _out) = app.add_test_quic_session(listener, "10.0.0.5:1000");
-    app.listeners[0].stop();
-    assert!(!app.listeners[0].sessions[0].is_open());
+    app.endpoints[0].stop();
+    assert!(!app.endpoints[0].sessions[0].is_open());
 }

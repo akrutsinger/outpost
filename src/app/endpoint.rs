@@ -1,5 +1,6 @@
-//! Listeners: one bound socket each, its listening task, and the sessions it
-//! accepted.
+//! Endpoints: the sidebar rows that own sessions. Every endpoint is a
+//! listener for now: one bound socket, its listening task, and the sessions
+//! it accepted.
 
 use std::net::SocketAddr;
 
@@ -9,7 +10,7 @@ use tokio::task::AbortHandle;
 use super::Session;
 use crate::Event;
 use crate::net::tls::{TlsConfig, TlsServer};
-use crate::net::{self, ListenerId, Protocol, UdpOut};
+use crate::net::{self, EndpointId, Protocol, UdpOut};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ListenerConfig {
@@ -25,7 +26,7 @@ pub enum ListenState {
     Failed(String),
 }
 
-/// Drives the sidebar icon/color for both listeners and sessions.
+/// Drives the sidebar icon/color for both endpoints and sessions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Unread,
@@ -47,8 +48,8 @@ impl Status {
     }
 }
 
-pub struct Listener {
-    pub id: ListenerId,
+pub struct Endpoint {
+    pub id: EndpointId,
     /// User-chosen name; `None` shows the endpoint.
     pub name: Option<String>,
     pub config: ListenerConfig,
@@ -61,8 +62,8 @@ pub struct Listener {
     pub(super) udp_out: Option<UdpOut>,
 }
 
-impl Listener {
-    /// A listener that isn't listening yet; [`Listener::start`] binds it.
+impl Endpoint {
+    /// An endpoint that isn't listening yet; [`Endpoint::start`] binds it.
     pub(super) fn new(config: ListenerConfig, tls: Option<TlsServer>) -> Self {
         Self {
             id: net::next_id(),
@@ -78,11 +79,11 @@ impl Listener {
     }
 
     pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.endpoint())
+        self.name.clone().unwrap_or_else(|| self.addr_label())
     }
 
     /// Protocol and port, e.g. `tcp :4444`.
-    pub fn endpoint(&self) -> String {
+    pub fn addr_label(&self) -> String {
         format!(
             "{} :{}",
             self.config.protocol.label(),
@@ -143,7 +144,7 @@ impl Listener {
     }
 }
 
-impl Drop for Listener {
+impl Drop for Endpoint {
     fn drop(&mut self) {
         if let Some(handle) = self.task.take() {
             handle.abort();
