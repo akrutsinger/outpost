@@ -66,7 +66,7 @@ fn data(app: &mut App, sess: SessId, bytes: &[u8]) {
 }
 
 fn transcript(app: &App, listener: usize, tab: usize) -> Vec<(Dir, String)> {
-    app.endpoints[listener].sessions[tab]
+    app.test_session(listener, tab)
         .lines
         .iter()
         .map(|line| (line.dir, line.text.clone()))
@@ -101,7 +101,7 @@ fn incoming_data_splits_lines_and_drops_carriage_returns() {
     let (mut app, sess, _out) = one_session();
     data(&mut app, sess, b"one\r\ntwo\n\nthree\n");
     assert_eq!(incoming(&app, 0, 0), ["one", "two", "", "three"]);
-    assert_eq!(app.endpoints[0].sessions[0].bytes_in, 16);
+    assert_eq!(app.test_session(0, 0).bytes_in, 16);
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn transcript_is_capped() {
     let (mut app, sess, _out) = one_session();
     let flood = "x\n".repeat(MAX_LINES + 50);
     data(&mut app, sess, flood.as_bytes());
-    assert_eq!(app.endpoints[0].sessions[0].lines.len(), MAX_LINES);
+    assert_eq!(app.test_session(0, 0).lines.len(), MAX_LINES);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn enter_sends_input_line_to_focused_session() {
     key(&mut app, KeyCode::Enter);
 
     assert_eq!(out.try_recv().unwrap(), b"hi ther\n");
-    let s = &app.endpoints[0].sessions[0];
+    let s = &app.test_session(0, 0);
     assert_eq!(s.input, "");
     assert_eq!(s.bytes_out, 8);
     assert_eq!(
@@ -165,7 +165,7 @@ fn typing_is_ignored_once_the_peer_disconnects() {
     type_str(&mut app, "hello");
     key(&mut app, KeyCode::Enter);
 
-    let s = &app.endpoints[0].sessions[0];
+    let s = &app.test_session(0, 0);
     assert!(!s.is_open());
     assert_eq!(s.input, "");
     assert!(out.try_recv().is_err());
@@ -184,7 +184,7 @@ fn send_failure_closes_the_session() {
     drop(out); // The connection task is gone.
     type_str(&mut app, "hello");
     key(&mut app, KeyCode::Enter);
-    let s = &app.endpoints[0].sessions[0];
+    let s = &app.test_session(0, 0);
     assert!(!s.is_open());
     assert_eq!(s.bytes_out, 0);
 }
@@ -197,17 +197,17 @@ fn background_activity_is_unread_until_focused() {
     let (second, _b) = app.add_test_session(listener, "10.0.0.6:2000");
 
     // A brand-new background connection counts as unread; the focused one doesn't.
-    assert!(!app.endpoints[0].sessions[0].unread);
-    assert!(app.endpoints[0].sessions[1].unread);
+    assert!(!app.test_session(0, 0).unread);
+    assert!(app.test_session(0, 1).unread);
     assert_eq!(app.endpoints[0].status(), Status::Unread);
 
     prefix(&mut app, 'n');
-    assert!(!app.endpoints[0].sessions[1].unread);
+    assert!(!app.test_session(0, 1).unread);
 
     data(&mut app, first, b"ping\n");
     data(&mut app, second, b"pong\n");
-    assert!(app.endpoints[0].sessions[0].unread);
-    assert!(!app.endpoints[0].sessions[1].unread);
+    assert!(app.test_session(0, 0).unread);
+    assert!(!app.test_session(0, 1).unread);
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn close_tab_disconnects_and_keeps_a_valid_focus() {
     prefix(&mut app, 'n');
 
     prefix(&mut app, 'X');
-    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Session(b)));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Tab(b)));
     assert_eq!(
         out_b.try_recv(),
         Err(TryRecvError::Empty),
@@ -261,7 +261,7 @@ fn close_tab_disconnects_and_keeps_a_valid_focus() {
     key(&mut app, KeyCode::Enter);
     // Dropping the outlet is what tells the connection task to hang up.
     assert_eq!(out_b.try_recv(), Err(TryRecvError::Disconnected));
-    assert_eq!(app.endpoints[0].sessions.len(), 1);
+    assert_eq!(app.endpoints[0].tabs.len(), 1);
     assert_eq!(app.endpoints[0].active_tab, 0);
 
     // A late event for the removed session is ignored.
@@ -352,7 +352,7 @@ fn datagrams_map_to_one_session_per_peer() {
             bytes: bytes.as_bytes().to_vec(),
         }));
     }
-    assert_eq!(app.endpoints[0].sessions.len(), 2);
+    assert_eq!(app.endpoints[0].tabs.len(), 2);
     assert_eq!(incoming(&app, 0, 0), ["one", "three"]);
     assert_eq!(incoming(&app, 0, 1), ["two"]);
 
@@ -372,7 +372,7 @@ fn datagrams_are_ignored_until_the_socket_is_bound() {
         peer: "10.0.0.5:1000".parse().unwrap(),
         bytes: b"early".to_vec(),
     }));
-    assert!(app.endpoints[0].sessions.is_empty());
+    assert!(app.endpoints[0].tabs.is_empty());
 }
 
 #[test]
@@ -459,7 +459,7 @@ fn settings_without_changes_leave_the_listener_alone() {
     assert_eq!(form(&app).port, "4444");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(matches!(app.endpoints[0].state, ListenState::Listening));
+    assert!(matches!(app.test_listener(0).state, ListenState::Listening));
 }
 
 #[tokio::test]
@@ -480,14 +480,14 @@ async fn submitting_the_form_starts_a_real_listener() {
     key(&mut app, KeyCode::Enter);
 
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(matches!(app.endpoints[0].state, ListenState::Binding));
+    assert!(matches!(app.test_listener(0).state, ListenState::Binding));
 
     let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .expect("listener reported in time")
         .expect("event");
     app.handle(ev);
-    let listener = &app.endpoints[0];
+    let listener = app.test_listener(0);
     assert!(matches!(listener.state, ListenState::Listening));
     assert_ne!(listener.config.addr.port(), 0, "real port recorded");
 }
@@ -916,25 +916,25 @@ async fn restarting_a_udp_listener_with_sessions_asks_first() {
     );
     key(&mut app, KeyCode::Esc);
     assert_eq!(form(&app).port, "0");
-    assert_eq!(app.endpoints[0].config.addr.port(), 5555);
-    assert!(app.endpoints[0].sessions[0].is_open());
+    assert_eq!(app.test_listener(0).config.addr.port(), 5555);
+    assert!(app.test_session(0, 0).is_open());
 
     // Confirming applies it and drops the session.
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.endpoints[0].config.addr.port(), 0);
-    assert!(!app.endpoints[0].sessions[0].is_open());
+    assert_eq!(app.test_listener(0).config.addr.port(), 0);
+    assert!(!app.test_session(0, 0).is_open());
     let ev = next_event(&mut rx).await;
     app.handle(ev);
-    assert!(matches!(app.endpoints[0].state, ListenState::Listening));
+    assert!(matches!(app.test_listener(0).state, ListenState::Listening));
 }
 
 #[tokio::test]
 async fn restart_confirmation_buttons_work_with_the_mouse() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Quic, "127.0.0.1:4433");
-    app.endpoints[0].config.tls.alpn = vec!["h3".into()];
+    app.test_listener_mut(0).config.tls.alpn = vec!["h3".into()];
     let (_sess, _out) = app.add_test_quic_session(listener, "10.0.0.5:1000");
     change_port(&mut app, "0");
     key(&mut app, KeyCode::Enter);
@@ -950,8 +950,8 @@ async fn restart_confirmation_buttons_work_with_the_mouse() {
     let confirm = app.hits.confirm;
     click(&mut app, confirm);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.endpoints[0].config.addr.port(), 0);
-    assert!(!app.endpoints[0].sessions[0].is_open());
+    assert_eq!(app.test_listener(0).config.addr.port(), 0);
+    assert!(!app.test_session(0, 0).is_open());
 }
 
 #[tokio::test]
@@ -963,7 +963,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     change_port(&mut app, "0");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(app.endpoints[0].sessions[0].is_open());
+    assert!(app.test_session(0, 0).is_open());
 
     // An unchanged UDP listener doesn't restart.
     let udp = app.add_test_listener(Protocol::Udp, "127.0.0.1:5555");
@@ -972,7 +972,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     prefix(&mut app, 's');
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(app.endpoints[1].sessions[0].is_open());
+    assert!(app.test_session(1, 0).is_open());
 
     // A UDP listener whose sessions have all gone has nothing to drop.
     let idle = app.add_test_listener(Protocol::Udp, "127.0.0.1:6666");
@@ -982,7 +982,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     change_port(&mut app, "0");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.endpoints[2].config.addr.port(), 0);
+    assert_eq!(app.test_listener(2).config.addr.port(), 0);
 }
 
 // ---- cursor movement in text fields ----
@@ -1126,7 +1126,7 @@ fn right_click_opens_menu_for_that_tab_without_focusing_it() {
     let (mut app, ids, _outs) = three_tabs();
     let (tab, _) = app.hits.tabs[2];
     right_click(&mut app, tab);
-    assert_eq!(menu(&app).target, Target::Session(ids[2]));
+    assert_eq!(menu(&app).target, Target::Tab(ids[2]));
     assert_eq!(app.endpoints[0].active_tab, 0);
 }
 
@@ -1137,7 +1137,7 @@ fn close_tab_from_menu_disconnects_that_session_and_keeps_focus() {
     render_rows(&mut app, 120, 32);
 
     tab_menu_pick(&mut app, 0, MenuItem::Close);
-    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Session(ids[0])));
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Tab(ids[0])));
     assert_eq!(
         outs[0].try_recv(),
         Err(TryRecvError::Empty),
@@ -1148,11 +1148,12 @@ fn close_tab_from_menu_disconnects_that_session_and_keeps_focus() {
     click(&mut app, confirm);
     assert!(matches!(app.mode, Mode::Normal));
     assert_eq!(outs[0].try_recv(), Err(TryRecvError::Disconnected));
-    let remaining: Vec<SessId> = app.endpoints[0].sessions.iter().map(|s| s.id).collect();
+    let remaining: Vec<SessId> = app.endpoints[0].tabs.iter().map(Tab::id).collect();
     assert_eq!(remaining, [ids[1], ids[2]]);
     let listener = &app.endpoints[0];
     assert_eq!(
-        listener.sessions[listener.active_tab].id, ids[2],
+        listener.tabs[listener.active_tab].id(),
+        ids[2],
         "focus stays put"
     );
     assert_eq!(outs[2].try_recv(), Err(TryRecvError::Empty));
@@ -1166,8 +1167,8 @@ fn closing_the_last_tab_from_the_menu_moves_focus_left() {
     tab_menu_pick(&mut app, 2, MenuItem::Close);
     key(&mut app, KeyCode::Enter);
     let listener = &app.endpoints[0];
-    assert_eq!(listener.sessions.len(), 2);
-    assert_eq!(listener.sessions[listener.active_tab].id, ids[1]);
+    assert_eq!(listener.tabs.len(), 2);
+    assert_eq!(listener.tabs[listener.active_tab].id(), ids[1]);
 }
 
 #[test]
@@ -1184,7 +1185,7 @@ fn rename_tab_from_menu_sets_a_custom_name() {
     type_str(&mut app, "db ");
     key(&mut app, KeyCode::Enter);
     assert_eq!(
-        app.endpoints[0].sessions[1].name.as_deref(),
+        app.test_session(0, 1).name.as_deref(),
         Some("db 10.0.0.2:1000")
     );
     assert_eq!(app.endpoints[0].active_tab, 0);
@@ -1193,18 +1194,18 @@ fn rename_tab_from_menu_sets_a_custom_name() {
 #[test]
 fn renaming_a_tab_to_empty_or_its_peer_clears_the_name() {
     let (mut app, _ids, _outs) = three_tabs();
-    app.endpoints[0].sessions[0].name = Some("db".into());
+    app.test_session_mut(0, 0).name = Some("db".into());
 
     prefix(&mut app, 'T');
     assert_eq!(rename_input(&app), "db");
     key(&mut app, KeyCode::Backspace);
     key(&mut app, KeyCode::Backspace);
     key(&mut app, KeyCode::Enter);
-    assert_eq!(app.endpoints[0].sessions[0].name, None);
+    assert_eq!(app.test_session(0, 0).name, None);
 
     prefix(&mut app, 'T');
     key(&mut app, KeyCode::Enter); // Unchanged peer address.
-    assert_eq!(app.endpoints[0].sessions[0].name, None);
+    assert_eq!(app.test_session(0, 0).name, None);
 }
 
 #[test]
@@ -1228,7 +1229,7 @@ fn closing_a_disconnected_tab_skips_confirmation() {
     }));
     prefix(&mut app, 'X');
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.endpoints[0].sessions.len(), 2);
+    assert_eq!(app.endpoints[0].tabs.len(), 2);
 
     app.handle(Event::Net(NetEvent::Closed {
         sess: ids[2],
@@ -1237,7 +1238,7 @@ fn closing_a_disconnected_tab_skips_confirmation() {
     render_rows(&mut app, 120, 32);
     tab_menu_pick(&mut app, 1, MenuItem::Close);
     assert!(matches!(app.mode, Mode::Normal));
-    assert_eq!(app.endpoints[0].sessions.len(), 1);
+    assert_eq!(app.endpoints[0].tabs.len(), 1);
 }
 
 #[test]
@@ -1251,7 +1252,7 @@ fn cancelling_a_tab_close_keeps_the_connection() {
     click(&mut app, cancel);
 
     assert!(matches!(app.mode, Mode::Normal));
-    let remaining: Vec<SessId> = app.endpoints[0].sessions.iter().map(|s| s.id).collect();
+    let remaining: Vec<SessId> = app.endpoints[0].tabs.iter().map(Tab::id).collect();
     assert_eq!(remaining, ids);
     for out in &mut outs {
         assert_eq!(out.try_recv(), Err(TryRecvError::Empty));
@@ -1267,7 +1268,7 @@ fn a_tab_that_disconnects_while_asking_still_closes_on_confirm() {
         error: None,
     }));
     key(&mut app, KeyCode::Enter);
-    assert_eq!(app.endpoints[0].sessions.len(), 2);
+    assert_eq!(app.endpoints[0].tabs.len(), 2);
 }
 
 // ---- dragging the sidebar dividers ----
@@ -1422,7 +1423,7 @@ async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Eve
 }
 
 fn fingerprint(app: &App) -> String {
-    app.endpoints[0]
+    app.test_listener(0)
         .tls
         .as_ref()
         .expect("TLS listener has a certificate")
@@ -1523,7 +1524,7 @@ async fn submitting_a_tls_form_serves_a_self_signed_certificate() {
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
 
-    let listener = &app.endpoints[0];
+    let listener = app.test_listener(0);
     assert_eq!(listener.config.protocol, Protocol::Tls);
     assert_eq!(
         listener.config.tls,
@@ -1541,12 +1542,12 @@ async fn submitting_a_tls_form_serves_a_self_signed_certificate() {
 
     let ev = next_event(&mut rx).await;
     app.handle(ev);
-    let listener = &app.endpoints[0];
+    let listener = app.test_listener(0);
     assert!(matches!(listener.state, ListenState::Listening));
     assert!(
-        listener.addr_label().starts_with("tls :"),
+        app.endpoints[0].addr_label().starts_with("tls :"),
         "{}",
-        listener.addr_label()
+        app.endpoints[0].addr_label()
     );
 }
 
@@ -1568,7 +1569,7 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
     }
     type_str(&mut app, "0");
     key(&mut app, KeyCode::Enter);
-    assert!(matches!(app.endpoints[0].state, ListenState::Binding));
+    assert!(matches!(app.test_listener(0).state, ListenState::Binding));
     let ev = next_event(&mut rx).await;
     app.handle(ev);
     assert_eq!(fingerprint(&app), original);
@@ -1587,7 +1588,7 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
 fn settings_show_a_tls_listener_as_configured() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tls, "0.0.0.0:8443");
-    app.endpoints[0].config.tls = TlsConfig {
+    app.test_listener_mut(0).config.tls = TlsConfig {
         cert: CertSource::Files {
             cert: "/etc/outpost/cert.pem".into(),
             key: "/etc/outpost/key.pem".into(),
@@ -1687,7 +1688,7 @@ fn ctrl_d(app: &mut App) {
 }
 
 fn streams(app: &App) -> &Streams {
-    app.endpoints[0].sessions[0]
+    app.test_session(0, 0)
         .streams
         .as_ref()
         .expect("QUIC session")
@@ -1702,7 +1703,7 @@ fn write(stream: StreamId, text: &str) -> QuicOut {
 
 /// Transcript lines as (dir, stream, text), skipping the connect line.
 fn stream_lines(app: &App) -> Vec<(Dir, Option<StreamId>, String)> {
-    app.endpoints[0].sessions[0].lines[1..]
+    app.test_session(0, 0).lines[1..]
         .iter()
         .map(|line| (line.dir, line.stream, line.text.clone()))
         .collect()
@@ -1935,7 +1936,7 @@ async fn switching_tls_to_quic_keeps_the_certificate() {
     assert!(matches!(app.mode, Mode::Normal));
     let ev = next_event(&mut rx).await;
     app.handle(ev);
-    let listener = &app.endpoints[0];
+    let listener = app.test_listener(0);
     assert_eq!(listener.config.protocol, Protocol::Quic);
     assert!(matches!(listener.state, ListenState::Listening));
     assert_eq!(fingerprint(&app), original);
@@ -1947,5 +1948,5 @@ fn stopping_a_quic_listener_closes_its_sessions() {
     let listener = app.add_test_listener(Protocol::Quic, "0.0.0.0:4433");
     let (_sess, _out) = app.add_test_quic_session(listener, "10.0.0.5:1000");
     app.endpoints[0].stop();
-    assert!(!app.endpoints[0].sessions[0].is_open());
+    assert!(!app.test_session(0, 0).is_open());
 }

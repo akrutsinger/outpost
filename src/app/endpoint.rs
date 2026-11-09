@@ -1,6 +1,6 @@
-//! Endpoints: the sidebar rows that own sessions. Every endpoint is a
-//! listener for now: one bound socket, its listening task, and the sessions
-//! it accepted.
+//! Endpoints: the sidebar rows that own tabs. Every endpoint is a listener
+//! for now: one bound socket, its listening task, and the sessions it
+//! accepted.
 
 use std::net::SocketAddr;
 
@@ -10,7 +10,7 @@ use tokio::task::AbortHandle;
 use super::Session;
 use crate::Event;
 use crate::net::tls::{TlsConfig, TlsServer};
-use crate::net::{self, EndpointId, Protocol, UdpOut};
+use crate::net::{self, EndpointId, Protocol, SessId, UdpOut};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ListenerConfig {
@@ -50,31 +50,105 @@ impl Status {
 
 pub struct Endpoint {
     pub id: EndpointId,
-    /// User-chosen name; `None` shows the endpoint.
+    /// User-chosen name; `None` shows the address.
     pub name: Option<String>,
+    pub kind: Kind,
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+}
+
+/// What an endpoint is, holding what only that kind has.
+pub enum Kind {
+    Listener(Listener),
+}
+
+/// A bound socket and its listening task.
+pub struct Listener {
     pub config: ListenerConfig,
     pub state: ListenState,
-    pub sessions: Vec<Session>,
-    pub active_tab: usize,
     /// The certificate in use, built from `config.tls`. TLS listeners only.
     pub tls: Option<TlsServer>,
     pub(super) task: Option<AbortHandle>,
     pub(super) udp_out: Option<UdpOut>,
 }
 
+/// One tab of an endpoint.
+pub enum Tab {
+    Session(Session),
+}
+
+impl Tab {
+    pub fn id(&self) -> SessId {
+        match self {
+            Tab::Session(s) => s.id,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Tab::Session(s) => s.label(),
+        }
+    }
+
+    /// What the tab is called without a custom name.
+    pub(super) fn default_label(&self) -> String {
+        match self {
+            Tab::Session(s) => s.peer.to_string(),
+        }
+    }
+
+    pub(super) fn set_name(&mut self, name: Option<String>) {
+        match self {
+            Tab::Session(s) => s.name = name,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        match self {
+            Tab::Session(s) => s.is_open(),
+        }
+    }
+
+    pub fn unread(&self) -> bool {
+        match self {
+            Tab::Session(s) => s.unread,
+        }
+    }
+
+    pub(super) fn mark_read(&mut self) {
+        match self {
+            Tab::Session(s) => s.unread = false,
+        }
+    }
+
+    pub fn session(&self) -> Option<&Session> {
+        match self {
+            Tab::Session(s) => Some(s),
+        }
+    }
+
+    pub fn session_mut(&mut self) -> Option<&mut Session> {
+        match self {
+            Tab::Session(s) => Some(s),
+        }
+    }
+}
+
 impl Endpoint {
-    /// An endpoint that isn't listening yet; [`Endpoint::start`] binds it.
-    pub(super) fn new(config: ListenerConfig, tls: Option<TlsServer>) -> Self {
+    /// A listener that isn't listening yet; [`Endpoint::start`] binds it.
+    pub(super) fn new_listener(config: ListenerConfig, tls: Option<TlsServer>) -> Self {
         Self {
             id: net::next_id(),
             name: None,
-            config,
-            state: ListenState::Binding,
-            sessions: Vec::new(),
+            kind: Kind::Listener(Listener {
+                config,
+                state: ListenState::Binding,
+                tls,
+                task: None,
+                udp_out: None,
+            }),
+            tabs: Vec::new(),
             active_tab: 0,
-            tls,
-            task: None,
-            udp_out: None,
         }
     }
 
@@ -84,67 +158,88 @@ impl Endpoint {
 
     /// Protocol and port, e.g. `tcp :4444`.
     pub fn addr_label(&self) -> String {
-        format!(
-            "{} :{}",
-            self.config.protocol.label(),
-            self.config.addr.port()
-        )
+        match &self.kind {
+            Kind::Listener(listener) => format!(
+                "{} :{}",
+                listener.config.protocol.label(),
+                listener.config.addr.port()
+            ),
+        }
+    }
+
+    pub fn listener(&self) -> Option<&Listener> {
+        match &self.kind {
+            Kind::Listener(listener) => Some(listener),
+        }
+    }
+
+    pub fn listener_mut(&mut self) -> Option<&mut Listener> {
+        match &mut self.kind {
+            Kind::Listener(listener) => Some(listener),
+        }
     }
 
     pub fn open_count(&self) -> usize {
-        self.sessions.iter().filter(|s| s.is_open()).count()
+        self.tabs.iter().filter(|tab| tab.is_open()).count()
     }
 
     pub fn status(&self) -> Status {
-        match self.state {
+        let Kind::Listener(listener) = &self.kind;
+        match listener.state {
             ListenState::Failed(_) => Status::Failed,
             ListenState::Binding => Status::Closed,
-            ListenState::Listening if self.sessions.iter().any(|s| s.unread) => Status::Unread,
+            ListenState::Listening if self.tabs.iter().any(Tab::unread) => Status::Unread,
             ListenState::Listening if self.open_count() > 0 => Status::Open,
             ListenState::Listening => Status::Idle,
         }
     }
 
     pub(super) fn start(&mut self, events: &UnboundedSender<Event>) {
-        self.state = ListenState::Binding;
-        self.task = Some(net::spawn_listener(
+        let Kind::Listener(listener) = &mut self.kind;
+        listener.state = ListenState::Binding;
+        listener.task = Some(net::spawn_listener(
             self.id,
-            self.config.protocol,
-            self.config.addr,
-            self.tls.as_ref().map(|tls| tls.config.clone()),
+            listener.config.protocol,
+            listener.config.addr,
+            listener.tls.as_ref().map(|tls| tls.config.clone()),
             events.clone(),
         ));
     }
 
-    /// Whether applying `config` stops and restarts the listening task.
-    pub(super) fn restarts_for(&self, config: &ListenerConfig) -> bool {
-        self.config != *config || matches!(self.state, ListenState::Failed(_))
-    }
-
     /// Whether restarting with `config` would drop open sessions.
     pub(super) fn restart_drops_sessions(&self, config: &ListenerConfig) -> bool {
-        self.restarts_for(config) && self.sessions_share_socket() && self.open_count() > 0
-    }
-
-    /// TCP connections outlive the listening task; UDP and QUIC sessions share its socket.
-    fn sessions_share_socket(&self) -> bool {
-        matches!(self.config.protocol, Protocol::Udp | Protocol::Quic)
+        self.listener().is_some_and(|listener| {
+            listener.restarts_for(config) && listener.sessions_share_socket()
+        }) && self.open_count() > 0
     }
 
     pub(super) fn stop(&mut self) {
-        if let Some(handle) = self.task.take() {
+        let Kind::Listener(listener) = &mut self.kind;
+        if let Some(handle) = listener.task.take() {
             handle.abort();
         }
-        self.udp_out = None;
-        if self.sessions_share_socket() {
-            for s in &mut self.sessions {
+        listener.udp_out = None;
+        if listener.sessions_share_socket() {
+            for s in self.tabs.iter_mut().filter_map(Tab::session_mut) {
                 s.close(Some("listener stopped".into()));
             }
         }
     }
 }
 
-impl Drop for Endpoint {
+impl Listener {
+    /// Whether applying `config` stops and restarts the listening task.
+    pub(super) fn restarts_for(&self, config: &ListenerConfig) -> bool {
+        self.config != *config || matches!(self.state, ListenState::Failed(_))
+    }
+
+    /// TCP connections outlive the listening task; UDP and QUIC sessions share its socket.
+    fn sessions_share_socket(&self) -> bool {
+        matches!(self.config.protocol, Protocol::Udp | Protocol::Quic)
+    }
+}
+
+impl Drop for Listener {
     fn drop(&mut self) {
         if let Some(handle) = self.task.take() {
             handle.abort();

@@ -7,16 +7,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Widget};
 
 use super::{Hits, TextTarget, human, put, put_right, render_input, status_glyph};
-use crate::app::{App, Dir, ListenState, Mode, Session, Target};
+use crate::app::{App, Dir, Kind, ListenState, Mode, Session, Tab, Target};
 use crate::theme::*;
 
 const MIN_TAB_WIDTH: u16 = 8;
 
-fn tab_label(s: &Session) -> String {
-    if s.unread {
-        format!("● {}", s.label())
+fn tab_label(tab: &Tab) -> String {
+    if tab.unread() {
+        format!("● {}", tab.label())
     } else {
-        s.label()
+        tab.label()
     }
 }
 
@@ -26,10 +26,11 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         return;
     };
 
+    let Kind::Listener(listener) = &endpoint.kind;
     let status = format!(
         "{} {}",
-        endpoint.config.protocol.label(),
-        endpoint.config.addr
+        listener.config.protocol.label(),
+        listener.config.addr
     );
     let status_width = status.chars().count() as u16;
     let mut tabs_right = area.right();
@@ -44,7 +45,7 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         tabs_right = area.right() - status_width - 1;
     }
 
-    let labels: Vec<String> = endpoint.sessions.iter().map(tab_label).collect();
+    let labels: Vec<String> = endpoint.tabs.iter().map(tab_label).collect();
     let widths: Vec<u16> = labels
         .iter()
         .map(|label| (label.chars().count() as u16 + 4).max(MIN_TAB_WIDTH))
@@ -67,21 +68,21 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
         if width == 0 {
             break;
         }
-        let s = &endpoint.sessions[index];
+        let tab = &endpoint.tabs[index];
         let style = if index == endpoint.active_tab {
             Style::new().fg(PANEL_BG).bg(ACCENT)
-        } else if target == Some(Target::Session(s.id)) {
+        } else if target == Some(Target::Tab(tab.id())) {
             // The tab an overlay is acting on stands out like a selection.
             Style::new()
                 .fg(TEXT)
                 .bg(SURFACE1)
                 .add_modifier(Modifier::BOLD)
-        } else if !s.is_open() {
+        } else if !tab.is_open() {
             Style::new()
                 .fg(OVERLAY0)
                 .bg(SURFACE0)
                 .add_modifier(Modifier::DIM)
-        } else if s.unread {
+        } else if tab.unread() {
             Style::new().fg(YELLOW).bg(SURFACE0)
         } else {
             Style::new().fg(OVERLAY1).bg(SURFACE0)
@@ -150,13 +151,19 @@ pub(super) fn render_pane(
         );
         return None;
     };
+    let Kind::Listener(listener) = &endpoint.kind;
     let listen = format!(
         "{} {}",
-        endpoint.config.protocol.label(),
-        endpoint.config.addr
+        listener.config.protocol.label(),
+        listener.config.addr
     );
-    let Some(s) = endpoint.sessions.get_mut(endpoint.active_tab) else {
-        let lines = match &endpoint.state {
+    let state = &listener.state;
+    let Some(s) = endpoint
+        .tabs
+        .get_mut(endpoint.active_tab)
+        .and_then(Tab::session_mut)
+    else {
+        let lines = match state {
             ListenState::Listening => vec![
                 format!("listening on {listen}"),
                 "waiting for connections…".into(),

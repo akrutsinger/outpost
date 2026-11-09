@@ -48,8 +48,10 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 - `src/app.rs`: `App` and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
   `Target` names what a menu, rename, or close acts on (endpoint or tab).
-  - `app/endpoint.rs`: `Endpoint` (a sidebar row: for now, one bound socket
-    and its sessions) and starting/stopping its listening task.
+  - `app/endpoint.rs`: `Endpoint` (a sidebar row and its `Tab`s), and its
+    `Kind`, which holds what only that kind has. For now every endpoint is a
+    `Listener`: one bound socket, its listening task, and the sessions it
+    accepted. `Endpoint::listener()` reaches it.
   - `app/session.rs`: `Session` (transcript, input line, byte counts) and a
     QUIC session's `Streams`.
   - `app/settings.rs`: `SettingsForm`: building it, editing rules per field,

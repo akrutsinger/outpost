@@ -5,7 +5,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::app::{App, CertKind, Field, Mode, Status};
+use crate::app::{App, CertKind, Endpoint, Field, Mode, Status};
 use crate::net::Protocol;
 use crate::text_input::TextInput;
 use crate::theme::*;
@@ -104,7 +104,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             let fingerprint = form
                 .target
                 .and_then(|id| app.endpoint(id))
-                .and_then(|endpoint| endpoint.tls.as_ref())
+                .and_then(Endpoint::listener)
+                .and_then(|listener| listener.tls.as_ref())
                 .map(|tls| tls.fingerprint.as_str());
             cursor = render_settings(buf, area, form, fingerprint, &mut hits);
         }

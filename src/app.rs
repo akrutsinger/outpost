@@ -20,7 +20,7 @@ mod endpoint;
 mod session;
 mod settings;
 
-pub use endpoint::{Endpoint, ListenState, ListenerConfig, Status};
+pub use endpoint::{Endpoint, Kind, ListenState, Listener, ListenerConfig, Status, Tab};
 pub use session::{Dir, Session};
 pub use settings::{Applied, CertKind, Field, SettingsForm};
 
@@ -50,8 +50,7 @@ fn hit<T: Copy>(targets: &[(Rect, T)], pos: Position) -> Option<T> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     Endpoint(EndpointId),
-    /// A tab.
-    Session(SessId),
+    Tab(SessId),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -174,36 +173,48 @@ impl App {
             Event::Net(ev) => self.on_net(ev),
         }
         // Whatever is on screen has been seen.
-        if let Some(s) = self.focused_session_mut() {
-            s.unread = false;
+        if let Some(tab) = self.focused_tab_mut() {
+            tab.mark_read();
         }
     }
 
-    fn focused_session_mut(&mut self) -> Option<&mut Session> {
+    fn focused_tab_mut(&mut self) -> Option<&mut Tab> {
         let endpoint = self.endpoints.get_mut(self.active)?;
-        endpoint.sessions.get_mut(endpoint.active_tab)
+        endpoint.tabs.get_mut(endpoint.active_tab)
+    }
+
+    fn focused_session_mut(&mut self) -> Option<&mut Session> {
+        self.focused_tab_mut()?.session_mut()
     }
 
     pub fn endpoint(&self, id: EndpointId) -> Option<&Endpoint> {
         self.endpoints.iter().find(|endpoint| endpoint.id == id)
     }
 
-    pub fn session(&self, id: SessId) -> Option<&Session> {
+    pub fn tab(&self, id: SessId) -> Option<&Tab> {
         self.endpoints
             .iter()
-            .flat_map(|endpoint| &endpoint.sessions)
-            .find(|s| s.id == id)
+            .flat_map(|endpoint| &endpoint.tabs)
+            .find(|tab| tab.id() == id)
+    }
+
+    fn tab_mut(&mut self, id: SessId) -> Option<&mut Tab> {
+        self.endpoints
+            .iter_mut()
+            .flat_map(|endpoint| endpoint.tabs.iter_mut())
+            .find(|tab| tab.id() == id)
     }
 
     fn session_mut(&mut self, id: SessId) -> Option<&mut Session> {
-        self.endpoints
-            .iter_mut()
-            .flat_map(|endpoint| endpoint.sessions.iter_mut())
-            .find(|s| s.id == id)
+        self.tab_mut(id)?.session_mut()
     }
 
     fn endpoint_mut(&mut self, id: EndpointId) -> Option<&mut Endpoint> {
         self.endpoints.iter_mut().find(|endpoint| endpoint.id == id)
+    }
+
+    fn listener_mut(&mut self, id: EndpointId) -> Option<&mut Listener> {
+        self.endpoint_mut(id)?.listener_mut()
     }
 
     fn on_net(&mut self, ev: NetEvent) {
@@ -213,19 +224,19 @@ impl App {
                 local,
                 udp,
             } => {
-                if let Some(endpoint) = self.endpoint_mut(id) {
-                    endpoint.state = ListenState::Listening;
-                    endpoint.config.addr = local;
-                    endpoint.udp_out = udp;
+                if let Some(listener) = self.listener_mut(id) {
+                    listener.state = ListenState::Listening;
+                    listener.config.addr = local;
+                    listener.udp_out = udp;
                 }
             }
             NetEvent::ListenFailed {
                 listener: id,
                 error,
             } => {
-                if let Some(endpoint) = self.endpoint_mut(id) {
-                    endpoint.state = ListenState::Failed(error);
-                    endpoint.task = None;
+                if let Some(listener) = self.listener_mut(id) {
+                    listener.state = ListenState::Failed(error);
+                    listener.task = None;
                 }
             }
             NetEvent::Accepted {
@@ -236,7 +247,9 @@ impl App {
             } => {
                 // If the endpoint is gone, dropping the outlet closes the connection.
                 if let Some(endpoint) = self.endpoint_mut(id) {
-                    endpoint.sessions.push(Session::new(sess, peer, outlet));
+                    endpoint
+                        .tabs
+                        .push(Tab::Session(Session::new(sess, peer, outlet)));
                 }
             }
             NetEvent::Secured { sess, summary } => {
@@ -276,24 +289,23 @@ impl App {
                 let Some(endpoint) = self.endpoint_mut(id) else {
                     return;
                 };
-                let Some(tx) = endpoint.udp_out.clone() else {
+                let Some(tx) = endpoint.listener().and_then(|l| l.udp_out.clone()) else {
                     return;
                 };
-                let index = match endpoint
-                    .sessions
-                    .iter()
-                    .position(|s| s.is_open() && s.peer == peer)
-                {
-                    Some(index) => index,
+                let open = endpoint
+                    .tabs
+                    .iter_mut()
+                    .filter_map(Tab::session_mut)
+                    .find(|s| s.is_open() && s.peer == peer);
+                match open {
+                    Some(s) => s.receive(&bytes),
                     None => {
                         let outlet = Outlet::Udp { tx, peer };
-                        endpoint
-                            .sessions
-                            .push(Session::new(net::next_id(), peer, outlet));
-                        endpoint.sessions.len() - 1
+                        let mut s = Session::new(net::next_id(), peer, outlet);
+                        s.receive(&bytes);
+                        endpoint.tabs.push(Tab::Session(s));
                     }
-                };
-                endpoint.sessions[index].receive(&bytes);
+                }
             }
         }
     }
@@ -366,7 +378,7 @@ impl App {
             KeyCode::Char('X') => {
                 if let Some(s) = self.focused_session_mut() {
                     let id = s.id;
-                    self.request_close(Target::Session(id));
+                    self.request_close(Target::Tab(id));
                 }
             }
             KeyCode::Char('D') => {
@@ -382,7 +394,7 @@ impl App {
             KeyCode::Char('T') => {
                 if let Some(s) = self.focused_session_mut() {
                     let id = s.id;
-                    self.open_rename(Target::Session(id));
+                    self.open_rename(Target::Tab(id));
                 }
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -460,9 +472,9 @@ impl App {
                             endpoint.name = custom(endpoint.addr_label());
                         }
                     }
-                    Target::Session(id) => {
-                        if let Some(s) = self.session_mut(id) {
-                            s.name = custom(s.peer.to_string());
+                    Target::Tab(id) => {
+                        if let Some(tab) = self.tab_mut(id) {
+                            tab.set_name(custom(tab.default_label()));
                         }
                     }
                 }
@@ -625,8 +637,8 @@ impl App {
                 .map(|endpoint| Target::Endpoint(endpoint.id));
         }
         let tab = hit(&self.hits.tabs, pos)?;
-        let s = self.endpoints.get(self.active)?.sessions.get(tab)?;
-        Some(Target::Session(s.id))
+        let tab = self.endpoints.get(self.active)?.tabs.get(tab)?;
+        Some(Target::Tab(tab.id()))
     }
 
     fn left_click(&mut self, pos: Position) {
@@ -655,7 +667,7 @@ impl App {
             }
         } else if let Some((index, tab)) = hit(&self.hits.sessions, pos) {
             if let Some(endpoint) = self.endpoints.get_mut(index)
-                && tab < endpoint.sessions.len()
+                && tab < endpoint.tabs.len()
             {
                 endpoint.active_tab = tab;
                 self.active = index;
@@ -703,7 +715,7 @@ impl App {
     fn open_rename(&mut self, target: Target) {
         let label = match target {
             Target::Endpoint(id) => self.endpoint(id).map(Endpoint::label),
-            Target::Session(id) => self.session(id).map(Session::label),
+            Target::Tab(id) => self.tab(id).map(Tab::label),
         };
         if let Some(label) = label {
             self.mode = Mode::Rename(RenameForm {
@@ -713,16 +725,16 @@ impl App {
         }
     }
 
-    /// (endpoint index, tab index) of a session.
-    fn locate_session(&self, id: SessId) -> Option<(usize, usize)> {
+    /// (endpoint index, tab index) of a tab.
+    fn locate_tab(&self, id: SessId) -> Option<(usize, usize)> {
         self.endpoints
             .iter()
             .enumerate()
             .find_map(|(index, endpoint)| {
                 endpoint
-                    .sessions
+                    .tabs
                     .iter()
-                    .position(|s| s.id == id)
+                    .position(|tab| tab.id() == id)
                     .map(|tab| (index, tab))
             })
     }
@@ -732,8 +744,9 @@ impl App {
     }
 
     fn open_settings_form(&mut self) {
-        let form = match self.endpoints.get(self.active) {
-            Some(endpoint) => SettingsForm::edit(endpoint),
+        let active = self.endpoints.get(self.active);
+        let form = match active.and_then(|endpoint| Some((endpoint.id, endpoint.listener()?))) {
+            Some((id, listener)) => SettingsForm::edit(id, listener),
             None => SettingsForm::new(&self.endpoints),
         };
         self.mode = Mode::Settings(form);
@@ -751,7 +764,7 @@ impl App {
     fn apply(&mut self, target: Option<EndpointId>, Applied { config, tls }: Applied) {
         match target {
             None => {
-                let mut endpoint = Endpoint::new(config, tls);
+                let mut endpoint = Endpoint::new_listener(config, tls);
                 endpoint.start(&self.events);
                 self.endpoints.push(endpoint);
                 self.active = self.endpoints.len() - 1;
@@ -761,10 +774,15 @@ impl App {
                 let Some(endpoint) = self.endpoint_mut(id) else {
                     return;
                 };
-                if endpoint.restarts_for(&config) {
+                if endpoint
+                    .listener()
+                    .is_some_and(|listener| listener.restarts_for(&config))
+                {
                     endpoint.stop();
-                    endpoint.config = config;
-                    endpoint.tls = tls;
+                    if let Some(listener) = endpoint.listener_mut() {
+                        listener.config = config;
+                        listener.tls = tls;
+                    }
                     endpoint.start(&events);
                 }
             }
@@ -773,15 +791,15 @@ impl App {
 
     fn cycle_tab(&mut self, delta: isize) {
         if let Some(endpoint) = self.endpoints.get_mut(self.active)
-            && !endpoint.sessions.is_empty()
+            && !endpoint.tabs.is_empty()
         {
-            endpoint.active_tab = wrap(endpoint.active_tab, delta, endpoint.sessions.len());
+            endpoint.active_tab = wrap(endpoint.active_tab, delta, endpoint.tabs.len());
         }
     }
 
     fn select_tab(&mut self, index: usize) {
         if let Some(endpoint) = self.endpoints.get_mut(self.active)
-            && index < endpoint.sessions.len()
+            && index < endpoint.tabs.len()
         {
             endpoint.active_tab = index;
         }
@@ -793,22 +811,22 @@ impl App {
         }
     }
 
-    /// Disconnects (if still open) and removes a session, keeping focus on
+    /// Disconnects (if still open) and removes a tab, keeping focus on
     /// the same tab when another one is removed.
-    fn remove_session(&mut self, endpoint: usize, index: usize) {
+    fn remove_tab(&mut self, endpoint: usize, index: usize) {
         let Some(endpoint) = self.endpoints.get_mut(endpoint) else {
             return;
         };
-        if index >= endpoint.sessions.len() {
+        if index >= endpoint.tabs.len() {
             return;
         }
-        endpoint.sessions.remove(index);
+        endpoint.tabs.remove(index);
         if index < endpoint.active_tab {
             endpoint.active_tab -= 1;
         }
         endpoint.active_tab = endpoint
             .active_tab
-            .min(endpoint.sessions.len().saturating_sub(1));
+            .min(endpoint.tabs.len().saturating_sub(1));
     }
 
     /// Closes an endpoint or tab, asking first if that would drop live connections.
@@ -817,7 +835,7 @@ impl App {
             Target::Endpoint(id) => self
                 .endpoint(id)
                 .is_some_and(|endpoint| endpoint.open_count() > 0),
-            Target::Session(id) => self.session(id).is_some_and(Session::is_open),
+            Target::Tab(id) => self.tab(id).is_some_and(Tab::is_open),
         };
         if live {
             self.mode = Mode::Confirm(Confirm::Close(target));
@@ -862,9 +880,9 @@ impl App {
                     self.remove_endpoint(index);
                 }
             }
-            Target::Session(id) => {
-                if let Some((endpoint, index)) = self.locate_session(id) {
-                    self.remove_session(endpoint, index);
+            Target::Tab(id) => {
+                if let Some((endpoint, index)) = self.locate_tab(id) {
+                    self.remove_tab(endpoint, index);
                 }
             }
         }
@@ -902,11 +920,35 @@ impl App {
             addr: addr.parse().expect("test address"),
             tls: crate::net::tls::TlsConfig::default(),
         };
-        let mut listener = Endpoint::new(config, None);
-        listener.state = ListenState::Listening;
-        let id = listener.id;
-        self.endpoints.push(listener);
+        let mut endpoint = Endpoint::new_listener(config, None);
+        if let Some(listener) = endpoint.listener_mut() {
+            listener.state = ListenState::Listening;
+        }
+        let id = endpoint.id;
+        self.endpoints.push(endpoint);
         id
+    }
+
+    /// The listener behind endpoint `index`.
+    pub fn test_listener(&self, index: usize) -> &Listener {
+        self.endpoints[index].listener().expect("a listener")
+    }
+
+    pub fn test_listener_mut(&mut self, index: usize) -> &mut Listener {
+        self.endpoints[index].listener_mut().expect("a listener")
+    }
+
+    /// The transcript session in tab `tab` of endpoint `index`.
+    pub fn test_session(&self, index: usize, tab: usize) -> &Session {
+        self.endpoints[index].tabs[tab]
+            .session()
+            .expect("a session")
+    }
+
+    pub fn test_session_mut(&mut self, index: usize, tab: usize) -> &mut Session {
+        self.endpoints[index].tabs[tab]
+            .session_mut()
+            .expect("a session")
     }
 
     /// Accepts a TCP session into `listener`, as the listener would. The receiver gets

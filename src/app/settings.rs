@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use super::{Endpoint, ListenerConfig, wrap};
+use super::{Endpoint, Listener, ListenerConfig, wrap};
 use crate::net::tls::{self, CertSource, TlsConfig, TlsServer};
 use crate::net::{EndpointId, Protocol};
 use crate::text_input::TextInput;
@@ -97,13 +97,10 @@ pub struct Applied {
 }
 
 impl SettingsForm {
-    /// A form for a new listener, suggesting the next port none of `endpoints` uses.
+    /// A form for a new listener, suggesting the next port no listener uses.
     pub(super) fn new(endpoints: &[Endpoint]) -> Self {
         let mut port = DEFAULT_PORT;
-        while endpoints
-            .iter()
-            .any(|endpoint| endpoint.config.addr.port() == port)
-        {
+        while listeners(endpoints).any(|(_, listener)| listener.config.addr.port() == port) {
             port = port.wrapping_add(1);
         }
         Self {
@@ -120,9 +117,9 @@ impl SettingsForm {
         }
     }
 
-    /// A form showing `endpoint`'s current settings.
-    pub(super) fn edit(endpoint: &Endpoint) -> Self {
-        let (cert, cert_file, key_file) = match &endpoint.config.tls.cert {
+    /// A form showing the current settings of `listener`, endpoint `id`.
+    pub(super) fn edit(id: EndpointId, listener: &Listener) -> Self {
+        let (cert, cert_file, key_file) = match &listener.config.tls.cert {
             CertSource::SelfSigned => (CertKind::SelfSigned, String::new(), String::new()),
             CertSource::Files { cert, key } => (
                 CertKind::Files,
@@ -131,21 +128,21 @@ impl SettingsForm {
             ),
         };
         Self {
-            target: Some(endpoint.id),
-            protocol: endpoint.config.protocol,
-            address: endpoint.config.addr.ip().to_string().into(),
-            port: endpoint.config.addr.port().to_string().into(),
+            target: Some(id),
+            protocol: listener.config.protocol,
+            address: listener.config.addr.ip().to_string().into(),
+            port: listener.config.addr.port().to_string().into(),
             cert,
             cert_file: cert_file.into(),
             key_file: key_file.into(),
-            alpn: endpoint.config.tls.alpn.join(", ").into(),
+            alpn: listener.config.tls.alpn.join(", ").into(),
             field: Field::Protocol,
             error: None,
         }
     }
 
-    /// Validates the form against the other `endpoints` and builds its
-    /// certificate, without changing anything.
+    /// Validates the form against the other listeners in `endpoints` and
+    /// builds its certificate, without changing anything.
     pub(super) fn check(&self, endpoints: &[Endpoint]) -> Result<Applied, String> {
         let ip: IpAddr = self
             .address
@@ -171,24 +168,21 @@ impl SettingsForm {
         if config.protocol == Protocol::Quic && config.tls.alpn.is_empty() {
             return Err("quic needs an alpn protocol, e.g. h3".into());
         }
-        if endpoints.iter().any(|endpoint| {
-            Some(endpoint.id) != self.target
-                && endpoint.config.protocol == config.protocol
-                && endpoint.config.addr == config.addr
+        if listeners(endpoints).any(|(id, listener)| {
+            Some(id) != self.target
+                && listener.config.protocol == config.protocol
+                && listener.config.addr == config.addr
         }) {
             return Err("a listener already uses that address".into());
         }
         // Keep the certificate while its settings are unchanged, so a
         // self-signed fingerprint survives edits to the address or port.
-        let tls = match endpoints
-            .iter()
-            .find(|endpoint| Some(endpoint.id) == self.target)
-        {
+        let tls = match listeners(endpoints).find(|&(id, _)| Some(id) == self.target) {
             _ if !config.protocol.uses_tls() => None,
-            Some(endpoint)
-                if endpoint.config.protocol.uses_tls() && endpoint.config.tls == config.tls =>
+            Some((_, listener))
+                if listener.config.protocol.uses_tls() && listener.config.tls == config.tls =>
             {
-                match &endpoint.tls {
+                match &listener.tls {
                     Some(tls) => Some(tls.clone()),
                     None => Some(tls::build(&config.tls)?),
                 }
@@ -262,6 +256,13 @@ impl SettingsForm {
             .collect();
         Ok(TlsConfig { cert, alpn })
     }
+}
+
+/// The listeners among `endpoints`, with their endpoint IDs.
+fn listeners(endpoints: &[Endpoint]) -> impl Iterator<Item = (EndpointId, &Listener)> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| Some((endpoint.id, endpoint.listener()?)))
 }
 
 /// A path typed into the form; a leading `~/` means the home directory.

@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use super::{FormHit, Hits, TextTarget, put, render_input};
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Endpoint, Field, MenuItem, RenameForm, SettingsForm,
+    App, CertKind, Confirm, ContextMenu, Endpoint, Field, MenuItem, RenameForm, SettingsForm, Tab,
     Target,
 };
 use crate::net::{EndpointId, Protocol};
@@ -260,7 +260,7 @@ pub(super) fn render_rename(
     Clear.render(rect, buf);
     let block = overlay_block(match form.target {
         Target::Endpoint(_) => "rename listener",
-        Target::Session(_) => "rename tab",
+        Target::Tab(_) => "rename tab",
     });
     let inner = block.inner(rect);
     block.render(rect, buf);
@@ -339,7 +339,7 @@ pub(super) fn render_confirm(
             };
             Some((" Quit outpost?", detail))
         }
-        Confirm::Close(Target::Session(id)) => app.session(id).map(|s| {
+        Confirm::Close(Target::Tab(id)) => app.tab(id).and_then(Tab::session).map(|s| {
             let who = match &s.name {
                 Some(name) => format!("{name} ({})", s.peer),
                 None => s.peer.to_string(),

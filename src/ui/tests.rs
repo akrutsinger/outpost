@@ -153,8 +153,8 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
     let listener = app.add_test_listener(Protocol::Tls, "0.0.0.0:8443");
     let server = tls::build(&TlsConfig::default()).unwrap();
     let fingerprint = server.fingerprint.clone();
-    app.endpoints[0].tls = Some(server);
-    app.endpoints[0].config.tls.cert = CertSource::Files {
+    app.test_listener_mut(0).tls = Some(server);
+    app.test_listener_mut(0).config.tls.cert = CertSource::Files {
         cert: "/etc/outpost/server.pem".into(),
         key: "/etc/outpost/server.key".into(),
     };
@@ -273,13 +273,13 @@ fn transcript_follows_tail_and_scrolls_back() {
     assert!(text.contains("line 099"));
     assert!(!text.contains("line 000"));
 
-    app.endpoints[0].sessions[0].scroll = 1_000;
+    app.test_session_mut(0, 0).scroll = 1_000;
     let text = render_rows(&mut app, W, H).join("\n");
     assert!(text.contains("line 000"), "scrolled to the top");
     assert!(!text.contains("line 099"));
     assert!(text.contains("more "), "scroll indicator shown");
     // Overscroll is clamped to the top of the transcript.
-    assert!(app.endpoints[0].sessions[0].scroll < 1_000);
+    assert!(app.test_session(0, 0).scroll < 1_000);
 }
 
 #[test]
@@ -363,13 +363,13 @@ fn long_input_scrolls_to_keep_the_cursor_visible() {
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.add_test_session(listener, "10.0.0.5:51234");
     let text: String = ('a'..='z').cycle().take(200).collect();
-    app.endpoints[0].sessions[0].input = text.as_str().into();
+    app.test_session_mut(0, 0).input = text.as_str().into();
     let rows = render_rows(&mut app, W, H);
     // The end is visible while typing at the end...
     assert!(row_with(&rows, "❯ ").contains(&text[190..]));
 
     // ...and the start once the cursor moves home.
-    app.endpoints[0].sessions[0].input.set_cursor(0);
+    app.test_session_mut(0, 0).input.set_cursor(0);
     let rows = render_rows(&mut app, W, H);
     assert!(row_with(&rows, "❯ ").contains("❯ abcdefgh"));
 }
@@ -379,7 +379,7 @@ fn renamed_tab_shows_its_name_everywhere() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.add_test_session(listener, "10.0.0.5:51234");
-    app.endpoints[0].sessions[0].name = Some("db".into());
+    app.test_session_mut(0, 0).name = Some("db".into());
     let rows = render_rows(&mut app, W, H);
     assert!(rows[0].contains(" db "), "tab bar: {:?}", rows[0]);
     assert!(
@@ -398,7 +398,7 @@ fn rename_overlay_title_matches_its_target() {
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     let (sess, _out) = app.add_test_session(listener, "10.0.0.5:51234");
     app.mode = Mode::Rename(RenameForm {
-        target: Target::Session(sess),
+        target: Target::Tab(sess),
         input: "db".into(),
     });
     let rows = render_rows(&mut app, W, H);
@@ -410,8 +410,8 @@ fn confirm_close_for_a_tab_names_the_peer() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     let (sess, _out) = app.add_test_session(listener, "255.255.255.255:65535");
-    app.endpoints[0].sessions[0].name = Some("db".into());
-    app.mode = Mode::Confirm(Confirm::Close(Target::Session(sess)));
+    app.test_session_mut(0, 0).name = Some("db".into());
+    app.mode = Mode::Confirm(Confirm::Close(Target::Tab(sess)));
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Close tab?");
     row_with(&rows, " db (255.255.255.255:65535) is still connected.");

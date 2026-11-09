@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use super::{Hits, human, put, put_right, status_glyph};
-use crate::app::{App, ListenState, Target};
+use crate::app::{App, Kind, ListenState, Target};
 use crate::theme::*;
 
 const ENDPOINT_HEADER_ROWS: u16 = 2;
@@ -116,7 +116,8 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         );
 
         let secondary = Style::new().fg(if focused { MAUVE } else { OVERLAY0 });
-        let (detail, style) = match &endpoint.state {
+        let Kind::Listener(listener) = &endpoint.kind;
+        let (detail, style) = match &listener.state {
             ListenState::Failed(error) => (error.clone(), Style::new().fg(RED)),
             ListenState::Binding => ("binding…".to_string(), secondary),
             // A custom name hides the port, so show it here instead of the IP.
@@ -127,7 +128,7 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             ListenState::Listening => (
                 format!(
                     "{} · {} open",
-                    endpoint.config.addr.ip(),
+                    listener.config.addr.ip(),
                     endpoint.open_count()
                 ),
                 secondary,
@@ -216,18 +217,19 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
     }
 
     let mut y = body.y;
-    for (listener_index, endpoint) in app.endpoints.iter().enumerate() {
+    for (endpoint_index, endpoint) in app.endpoints.iter().enumerate() {
         for (tab, s) in endpoint
-            .sessions
+            .tabs
             .iter()
             .enumerate()
+            .filter_map(|(tab, t)| Some((tab, t.session()?)))
             .filter(|(_, s)| s.is_open())
         {
             if y + 2 > body.bottom() {
                 return;
             }
             let rect = Rect::new(body.x, y, body.width, 2);
-            let focused = listener_index == app.active && tab == endpoint.active_tab;
+            let focused = endpoint_index == app.active && tab == endpoint.active_tab;
             if focused {
                 buf.set_style(rect, Style::new().bg(ACTIVE_ROW_BG));
             }
@@ -266,7 +268,7 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
                 Style::new().fg(OVERLAY0),
             );
             put(buf, state_x, y + 1, right, state, Style::new().fg(color));
-            hits.sessions.push((rect, (listener_index, tab)));
+            hits.sessions.push((rect, (endpoint_index, tab)));
             y += 2;
         }
     }
