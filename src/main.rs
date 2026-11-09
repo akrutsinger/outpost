@@ -1,5 +1,6 @@
 mod app;
 mod net;
+mod pty;
 mod text_input;
 mod theme;
 mod ui;
@@ -11,10 +12,12 @@ use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-/// Everything the main loop reacts to: terminal input and network activity.
+/// Everything the main loop reacts to: terminal input, network activity,
+/// and the programs in terminal tabs.
 pub enum Event {
     Input(event::Event),
     Net(net::NetEvent),
+    Pty(pty::PtyEvent),
 }
 
 #[tokio::main]
@@ -46,7 +49,10 @@ async fn run(
 ) -> io::Result<()> {
     let mut app = app::App::new(tx);
     loop {
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        terminal.draw(|frame| {
+            app.fit_terminals(ui::terminal_area(frame.area(), &app));
+            ui::render(frame, &mut app);
+        })?;
         let Some(ev) = rx.recv().await else { break };
         app.handle(ev);
         // Coalesce bursts (e.g. a flood of incoming data) into a single redraw.

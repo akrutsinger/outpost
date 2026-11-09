@@ -34,15 +34,21 @@ outpost
 press `ctrl+b N` (or click **new**) and pick a protocol, address, and port.
 connections show up as tabs: type a line and press `enter` to send it.
 
-| key            | action                   |
-| -------------- | ------------------------ |
-| `ctrl+b N`     | new listener             |
-| `ctrl+b s`     | listener settings        |
-| `ctrl+b j / k` | next / previous listener |
-| `ctrl+b n / p` | next / previous tab      |
-| `ctrl+b X`     | close tab (disconnects)  |
-| `ctrl+b D`     | close listener           |
-| `ctrl+b ?`     | all keybindings          |
-| `ctrl+b q`     | quit                     |
+press `ctrl+b c` (or click **+** in the tab bar) for a shell tab. shells live
+under the **local** endpoint, and every key but the prefix goes to the shell;
+press the prefix twice to send `ctrl+b` itself.
 
-right-click a listener or tab to rename or close it.
+| key             | action                   |
+| --------------- | ------------------------ |
+| `ctrl+b c`      | new shell                |
+| `ctrl+b N`      | new listener             |
+| `ctrl+b s`      | listener settings        |
+| `ctrl+b j / k`  | next / previous endpoint |
+| `ctrl+b n / p`  | next / previous tab      |
+| `ctrl+b X`      | close tab                |
+| `ctrl+b D`      | close endpoint           |
+| `ctrl+b ctrl+b` | send `ctrl+b` to a shell |
+| `ctrl+b ?`      | all keybindings          |
+| `ctrl+b q`      | quit                     |
+
+right-click an endpoint or tab to rename or close it.

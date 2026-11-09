@@ -1950,3 +1950,150 @@ fn stopping_a_quic_listener_closes_its_sessions() {
     app.endpoints[0].stop();
     assert!(!app.test_session(0, 0).is_open());
 }
+
+fn ctrl(app: &mut App, c: char) {
+    app.handle(Event::Input(TermEvent::Key(KeyEvent::new(
+        KeyCode::Char(c),
+        KeyModifiers::CONTROL,
+    ))));
+}
+
+fn shell_output(app: &mut App, tab: SessId, bytes: &[u8]) {
+    app.handle(Event::Pty(crate::pty::PtyEvent::Output {
+        tab,
+        bytes: bytes.to_vec(),
+    }));
+}
+
+fn shell_exit(app: &mut App, tab: SessId, status: &str) {
+    app.handle(Event::Pty(crate::pty::PtyEvent::Exited {
+        tab,
+        status: status.into(),
+    }));
+}
+
+/// Everything written to the shell so far, as one byte string.
+fn written(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+    let mut all = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        all.extend(bytes);
+    }
+    all
+}
+
+#[test]
+fn shells_go_under_one_local_endpoint_listed_first() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (first, _a) = app.add_test_terminal();
+    assert!(matches!(app.endpoints[0].kind, Kind::Local));
+    assert_eq!(app.endpoints[0].label(), "local");
+    assert_eq!(app.active, 0);
+
+    app.active = 1;
+    let (second, _b) = app.add_test_terminal();
+    assert_eq!(app.endpoints.len(), 2, "the same local endpoint");
+    let ids: Vec<SessId> = app.endpoints[0].tabs.iter().map(Tab::id).collect();
+    assert_eq!(ids, [first, second]);
+    assert_eq!((app.active, app.endpoints[0].active_tab), (0, 1));
+}
+
+#[test]
+fn keys_in_a_shell_tab_go_to_the_shell() {
+    let (mut app, _rx) = App::test_new();
+    let (_tab, mut shell) = app.add_test_terminal();
+    type_str(&mut app, "ls");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Up);
+    ctrl(&mut app, 'c');
+    assert_eq!(written(&mut shell), b"ls\r\x1b[A\x03");
+
+    // The prefix still drives outpost; pressing it twice sends it on.
+    prefix(&mut app, '?');
+    assert!(matches!(app.mode, Mode::Help));
+    key(&mut app, KeyCode::Esc);
+    ctrl(&mut app, 'b');
+    ctrl(&mut app, 'b');
+    assert_eq!(written(&mut shell), [0x02]);
+}
+
+#[test]
+fn shell_output_is_unread_until_its_tab_is_seen() {
+    let (mut app, _rx) = App::test_new();
+    let (first, _a) = app.add_test_terminal();
+    let (_second, _b) = app.add_test_terminal();
+    shell_output(&mut app, first, b"done\r\n");
+    assert!(app.endpoints[0].tabs[0].unread());
+    assert_eq!(app.endpoints[0].status(), Status::Unread);
+    prefix(&mut app, '1');
+    assert!(!app.endpoints[0].tabs[0].unread());
+}
+
+#[test]
+fn an_exited_shell_stays_as_a_closed_tab() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, mut shell) = app.add_test_terminal();
+    shell_output(&mut app, tab, b"bye");
+    shell_exit(&mut app, tab, "exited 0");
+    let Tab::Terminal(t) = &app.endpoints[0].tabs[0] else {
+        panic!("expected a terminal tab");
+    };
+    assert!(!t.is_open());
+    assert_eq!(t.exit.as_deref(), Some("exited 0"));
+    assert!(t.parser.screen().contents().starts_with("bye"));
+
+    type_str(&mut app, "ls");
+    assert!(
+        written(&mut shell).is_empty(),
+        "nothing goes to a dead shell"
+    );
+    // Nothing is running, so closing doesn't ask.
+    prefix(&mut app, 'X');
+    assert!(app.endpoints[0].tabs.is_empty());
+}
+
+#[test]
+fn closing_a_running_shell_asks_first() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    prefix(&mut app, 'X');
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Tab(tab)));
+    key(&mut app, KeyCode::Enter);
+    assert!(app.endpoints[0].tabs.is_empty());
+}
+
+#[test]
+fn renaming_a_shell_tab_and_resetting_it() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_terminal();
+    prefix(&mut app, 'T');
+    let Mode::Rename(form) = &mut app.mode else {
+        panic!("expected rename");
+    };
+    form.input = "proxmox".into();
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.endpoints[0].tabs[0].label(), "proxmox");
+
+    prefix(&mut app, 'T');
+    let Mode::Rename(form) = &mut app.mode else {
+        panic!("expected rename");
+    };
+    form.input = "".into();
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.endpoints[0].tabs[0].label(), "sh");
+}
+
+#[test]
+fn fitting_resizes_every_shell_and_new_ones() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_terminal();
+    app.fit_terminals(Rect::new(0, 0, 50, 10));
+    app.add_test_terminal();
+    for tab in &app.endpoints[0].tabs {
+        let Tab::Terminal(t) = tab else {
+            panic!("expected a terminal tab");
+        };
+        let (rows, cols) = t.parser.screen().size();
+        assert_eq!((rows.get(), cols.get()), (10, 50));
+    }
+}

@@ -23,10 +23,10 @@ fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a str {
 fn empty_app_explains_how_to_start() {
     let (mut app, _rx) = App::test_new();
     let text = screen(&mut app);
-    assert!(text.contains(" listeners"));
-    assert!(text.contains("no listeners"));
+    assert!(text.contains(" endpoints"));
+    assert!(text.contains("no endpoints"));
     assert!(text.contains("no connections"));
-    assert!(text.contains("ctrl+b N or click new to open a listener"));
+    assert!(text.contains("ctrl+b c for a shell · ctrl+b N for a listener"));
 }
 
 #[test]
@@ -118,8 +118,9 @@ fn prefix_mode_shows_mode_bar_on_last_row() {
     let rows = render_rows(&mut app, W, H);
     let last = rows.last().unwrap();
     assert!(last.contains(" PREFIX "));
-    assert!(last.contains("N new"));
-    assert!(last.contains("D close listener"));
+    assert!(last.contains("c shell"));
+    assert!(last.contains("N listener"));
+    assert!(last.contains("D close endpoint"));
 }
 
 #[test]
@@ -337,7 +338,7 @@ fn rename_overlay_shows_the_input() {
         input: "web".into(),
     });
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, "╭ rename listener ");
+    row_with(&rows, "╭ rename endpoint ");
     row_with(&rows, "│  web ");
     row_with(&rows, "enter save · esc cancel · empty resets");
 }
@@ -436,7 +437,7 @@ fn confirm_quit_names_one_listener_or_counts_several() {
     let dns = app.add_test_listener(Protocol::Udp, "0.0.0.0:5353");
     let _c = app.add_test_session(dns, "10.0.0.7:1000");
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, " 3 open connections across 2 listeners.");
+    row_with(&rows, " 3 open connections across 2 endpoints.");
 }
 
 #[test]
@@ -512,4 +513,99 @@ fn human_formats_byte_counts() {
     assert_eq!(human(1023), "1023B");
     assert_eq!(human(1536), "1.5K");
     assert_eq!(human(3 * 1024 * 1024), "3.0M");
+}
+
+fn shell_output(app: &mut App, tab: crate::net::SessId, bytes: &[u8]) {
+    app.handle(Event::Pty(crate::pty::PtyEvent::Output {
+        tab,
+        bytes: bytes.to_vec(),
+    }));
+}
+
+#[test]
+fn shell_tab_draws_its_screen_under_the_local_endpoint() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    // Size the shell to the pane first, as the main loop does before drawing.
+    render_rows(&mut app, W, H);
+    shell_output(&mut app, tab, b"$ echo \x1b[31mred\x1b[0m\r\nred\r\n$ ");
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, " endpoints");
+    row_with(&rows, "local");
+    row_with(&rows, "1 open");
+    // Shells aren't connections.
+    row_with(&rows, "no connections");
+    row_with(&rows, "╭ sh ");
+    row_with(&rows, " open ");
+    row_with(&rows, "│$ echo red");
+    // The tab bar has the shell's tab, then `+`.
+    let bar = &rows[0];
+    let sh = bar.find(" sh ").expect("shell tab");
+    assert!(bar[sh..].contains(" + "), "{bar:?}");
+}
+
+#[test]
+fn plus_in_the_tab_bar_is_clickable_with_no_endpoints() {
+    let (mut app, _rx) = App::test_new();
+    render_rows(&mut app, W, H);
+    let plus = app.hits.new_tab;
+    assert_eq!(plus.width, 3);
+    let rows = render_rows(&mut app, W, H);
+    let drawn: String = rows[0]
+        .chars()
+        .skip(plus.x as usize)
+        .take(plus.width as usize)
+        .collect();
+    assert_eq!(drawn, " + ");
+}
+
+#[test]
+fn exited_shell_says_how_and_how_to_close_it() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    app.handle(Event::Pty(crate::pty::PtyEvent::Exited {
+        tab,
+        status: "exited 130".into(),
+    }));
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, " exited 130 ");
+    row_with(&rows, " ctrl+b X closes the tab ");
+    row_with(&rows, "0 open");
+}
+
+#[test]
+fn confirms_count_shells_apart_from_connections() {
+    let (mut app, _rx) = App::test_new();
+    let web = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let _a = app.add_test_session(web, "10.0.0.5:1000");
+    let (tab, _shell) = app.add_test_terminal();
+
+    app.mode = Mode::Confirm(Confirm::Quit);
+    let rows = render_rows(&mut app, W, H);
+    row_with(
+        &rows,
+        " 1 open connection and 1 running shell across 2 endpoints.",
+    );
+
+    let local = app.endpoints[0].id;
+    app.mode = Mode::Confirm(Confirm::Close(Target::Endpoint(local)));
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, "│ Close all shells?");
+    row_with(&rows, " local has 1 running shell.");
+
+    app.mode = Mode::Confirm(Confirm::Close(Target::Tab(tab)));
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, " sh is still running.");
+}
+
+#[test]
+fn settings_button_shows_only_for_listeners() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.active = 0;
+    render_rows(&mut app, W, H);
+    assert_ne!(app.hits.settings.width, 0);
+    app.add_test_terminal();
+    render_rows(&mut app, W, H);
+    assert_eq!(app.hits.settings.width, 0);
 }

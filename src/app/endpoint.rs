@@ -1,13 +1,13 @@
-//! Endpoints: the sidebar rows that own tabs. Every endpoint is a listener
-//! for now: one bound socket, its listening task, and the sessions it
-//! accepted.
+//! Endpoints: the sidebar rows that own tabs. An endpoint is a listener (one
+//! bound socket, its listening task, and the sessions it accepted) or the
+//! local machine, whose tabs are shells.
 
 use std::net::SocketAddr;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
 
-use super::Session;
+use super::{Session, Terminal};
 use crate::Event;
 use crate::net::tls::{TlsConfig, TlsServer};
 use crate::net::{self, EndpointId, Protocol, SessId, UdpOut};
@@ -60,6 +60,8 @@ pub struct Endpoint {
 /// What an endpoint is, holding what only that kind has.
 pub enum Kind {
     Listener(Listener),
+    /// This machine. Its tabs are shells.
+    Local,
 }
 
 /// A bound socket and its listening task.
@@ -73,20 +75,26 @@ pub struct Listener {
 }
 
 /// One tab of an endpoint.
+// A terminal (its emulator's screen) is a few hundred bytes bigger than a
+// session; an endpoint holds a handful of tabs, so boxing buys nothing.
+#[expect(clippy::large_enum_variant)]
 pub enum Tab {
     Session(Session),
+    Terminal(Terminal),
 }
 
 impl Tab {
     pub fn id(&self) -> SessId {
         match self {
             Tab::Session(s) => s.id,
+            Tab::Terminal(t) => t.id,
         }
     }
 
     pub fn label(&self) -> String {
         match self {
             Tab::Session(s) => s.label(),
+            Tab::Terminal(t) => t.label(),
         }
     }
 
@@ -94,42 +102,56 @@ impl Tab {
     pub(super) fn default_label(&self) -> String {
         match self {
             Tab::Session(s) => s.peer.to_string(),
+            Tab::Terminal(t) => t.default_label(),
         }
     }
 
     pub(super) fn set_name(&mut self, name: Option<String>) {
         match self {
             Tab::Session(s) => s.name = name,
+            Tab::Terminal(t) => t.name = name,
         }
     }
 
     pub fn is_open(&self) -> bool {
         match self {
             Tab::Session(s) => s.is_open(),
+            Tab::Terminal(t) => t.is_open(),
         }
     }
 
     pub fn unread(&self) -> bool {
         match self {
             Tab::Session(s) => s.unread,
+            Tab::Terminal(t) => t.unread,
         }
     }
 
     pub(super) fn mark_read(&mut self) {
         match self {
             Tab::Session(s) => s.unread = false,
+            Tab::Terminal(t) => t.unread = false,
         }
     }
 
     pub fn session(&self) -> Option<&Session> {
         match self {
             Tab::Session(s) => Some(s),
+            Tab::Terminal(_) => None,
         }
     }
 
     pub fn session_mut(&mut self) -> Option<&mut Session> {
         match self {
             Tab::Session(s) => Some(s),
+            Tab::Terminal(_) => None,
+        }
+    }
+
+    pub fn terminal_mut(&mut self) -> Option<&mut Terminal> {
+        match self {
+            Tab::Terminal(t) => Some(t),
+            Tab::Session(_) => None,
         }
     }
 }
@@ -152,11 +174,22 @@ impl Endpoint {
         }
     }
 
+    /// The local endpoint, with no shells yet.
+    pub(super) fn new_local() -> Self {
+        Self {
+            id: net::next_id(),
+            name: None,
+            kind: Kind::Local,
+            tabs: Vec::new(),
+            active_tab: 0,
+        }
+    }
+
     pub fn label(&self) -> String {
         self.name.clone().unwrap_or_else(|| self.addr_label())
     }
 
-    /// Protocol and port, e.g. `tcp :4444`.
+    /// A listener's protocol and port, e.g. `tcp :4444`, or `local`.
     pub fn addr_label(&self) -> String {
         match &self.kind {
             Kind::Listener(listener) => format!(
@@ -164,18 +197,21 @@ impl Endpoint {
                 listener.config.protocol.label(),
                 listener.config.addr.port()
             ),
+            Kind::Local => "local".into(),
         }
     }
 
     pub fn listener(&self) -> Option<&Listener> {
         match &self.kind {
             Kind::Listener(listener) => Some(listener),
+            Kind::Local => None,
         }
     }
 
     pub fn listener_mut(&mut self) -> Option<&mut Listener> {
         match &mut self.kind {
             Kind::Listener(listener) => Some(listener),
+            Kind::Local => None,
         }
     }
 
@@ -184,18 +220,19 @@ impl Endpoint {
     }
 
     pub fn status(&self) -> Status {
-        let Kind::Listener(listener) = &self.kind;
-        match listener.state {
-            ListenState::Failed(_) => Status::Failed,
-            ListenState::Binding => Status::Closed,
-            ListenState::Listening if self.tabs.iter().any(Tab::unread) => Status::Unread,
-            ListenState::Listening if self.open_count() > 0 => Status::Open,
-            ListenState::Listening => Status::Idle,
+        match self.listener().map(|listener| &listener.state) {
+            Some(ListenState::Failed(_)) => Status::Failed,
+            Some(ListenState::Binding) => Status::Closed,
+            _ if self.tabs.iter().any(Tab::unread) => Status::Unread,
+            _ if self.open_count() > 0 => Status::Open,
+            _ => Status::Idle,
         }
     }
 
     pub(super) fn start(&mut self, events: &UnboundedSender<Event>) {
-        let Kind::Listener(listener) = &mut self.kind;
+        let Kind::Listener(listener) = &mut self.kind else {
+            return;
+        };
         listener.state = ListenState::Binding;
         listener.task = Some(net::spawn_listener(
             self.id,
@@ -214,7 +251,9 @@ impl Endpoint {
     }
 
     pub(super) fn stop(&mut self) {
-        let Kind::Listener(listener) = &mut self.kind;
+        let Kind::Listener(listener) = &mut self.kind else {
+            return;
+        };
         if let Some(handle) = listener.task.take() {
             handle.abort();
         }

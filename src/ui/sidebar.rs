@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use super::{Hits, human, put, put_right, status_glyph};
-use crate::app::{App, Kind, ListenState, Target};
+use crate::app::{App, Kind, ListenState, Tab, Target};
 use crate::theme::*;
 
 const ENDPOINT_HEADER_ROWS: u16 = 2;
@@ -56,7 +56,7 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         area.x,
         area.y,
         area.right(),
-        " listeners",
+        " endpoints",
         header_style(),
     );
     let body = Rect::new(
@@ -71,7 +71,7 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             body.x,
             body.y,
             body.right(),
-            " no listeners",
+            " no endpoints",
             Style::new().fg(OVERLAY0).add_modifier(Modifier::DIM),
         );
     }
@@ -116,23 +116,25 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         );
 
         let secondary = Style::new().fg(if focused { MAUVE } else { OVERLAY0 });
-        let Kind::Listener(listener) = &endpoint.kind;
-        let (detail, style) = match &listener.state {
-            ListenState::Failed(error) => (error.clone(), Style::new().fg(RED)),
-            ListenState::Binding => ("binding…".to_string(), secondary),
-            // A custom name hides the port, so show it here instead of the IP.
-            ListenState::Listening if endpoint.name.is_some() => (
-                format!("{} · {} open", endpoint.addr_label(), endpoint.open_count()),
-                secondary,
-            ),
-            ListenState::Listening => (
-                format!(
-                    "{} · {} open",
-                    listener.config.addr.ip(),
-                    endpoint.open_count()
+        let (detail, style) = match &endpoint.kind {
+            Kind::Local => (format!("{} open", endpoint.open_count()), secondary),
+            Kind::Listener(listener) => match &listener.state {
+                ListenState::Failed(error) => (error.clone(), Style::new().fg(RED)),
+                ListenState::Binding => ("binding…".to_string(), secondary),
+                // A custom name hides the port, so show it here instead of the IP.
+                ListenState::Listening if endpoint.name.is_some() => (
+                    format!("{} · {} open", endpoint.addr_label(), endpoint.open_count()),
+                    secondary,
                 ),
-                secondary,
-            ),
+                ListenState::Listening => (
+                    format!(
+                        "{} · {} open",
+                        listener.config.addr.ip(),
+                        endpoint.open_count()
+                    ),
+                    secondary,
+                ),
+            },
         };
         put(buf, rect.x + 3, y + 1, right, &detail, style);
         hits.endpoints.push((rect, index));
@@ -150,7 +152,12 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             " new",
             Style::new().fg(OVERLAY0),
         );
-        if !app.endpoints.is_empty() {
+        // Only listeners have settings.
+        if app
+            .endpoints
+            .get(app.active)
+            .is_some_and(|endpoint| endpoint.listener().is_some())
+        {
             let label = "settings";
             let width = (label.len() as u16).min(area.width);
             hits.settings = Rect::new(area.right() - width, footer_y, width, 1);
@@ -182,11 +189,14 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         " sessions",
         header_style(),
     );
-    let open: usize = app
+    // Connections only: shells aren't sessions.
+    let open = app
         .endpoints
         .iter()
-        .map(|endpoint| endpoint.open_count())
-        .sum();
+        .flat_map(|endpoint| &endpoint.tabs)
+        .filter_map(Tab::session)
+        .filter(|s| s.is_open())
+        .count();
     put_right(
         buf,
         area,

@@ -4,6 +4,7 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::Block;
 
 use crate::app::{App, CertKind, Endpoint, Field, Mode, Status};
 use crate::net::Protocol;
@@ -47,6 +48,8 @@ pub struct Hits {
     /// (row, (endpoint index, tab index))
     pub sessions: Vec<(Rect, (usize, usize))>,
     pub tabs: Vec<(Rect, usize)>,
+    /// The tab bar's `+`, which opens a shell.
+    pub new_tab: Rect,
     pub new_listener: Rect,
     pub settings: Rect,
     pub pane: Rect,
@@ -69,9 +72,8 @@ pub struct Hits {
     pub cancel: Rect,
 }
 
-pub fn render(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
-    let mut hits = Hits::default();
+/// Splits the screen into the sidebar and the main column.
+fn layout(area: Rect, app: &App) -> (Rect, Rect) {
     let sidebar_width = app.sidebar_width.min(area.width / 2);
     let sidebar = Rect {
         width: sidebar_width,
@@ -82,17 +84,36 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         width: area.width - sidebar_width,
         ..area
     };
+    (sidebar, main)
+}
+
+/// The main column below the tab bar.
+fn pane_area(main: Rect) -> Rect {
+    Rect {
+        y: main.y + 1,
+        height: main.height.saturating_sub(1),
+        ..main
+    }
+}
+
+/// Where a terminal tab's screen goes when the screen is `area`: the pane,
+/// inside its border.
+pub fn terminal_area(area: Rect, app: &App) -> Rect {
+    let (_, main) = layout(area, app);
+    Block::bordered().inner(pane_area(main))
+}
+
+pub fn render(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let mut hits = Hits::default();
+    let (sidebar, main) = layout(area, app);
 
     let buf = frame.buffer_mut();
     render_sidebar(buf, sidebar, app, &mut hits);
     let mut cursor = None;
     if main.height > 1 {
         let tab_bar = Rect { height: 1, ..main };
-        let pane = Rect {
-            y: main.y + 1,
-            height: main.height - 1,
-            ..main
-        };
+        let pane = pane_area(main);
         render_tab_bar(buf, tab_bar, app, &mut hits);
         cursor = render_pane(buf, pane, app, &mut hits);
         if matches!(app.mode, Mode::Prefix) {
@@ -210,12 +231,12 @@ fn render_prefix_bar(buf: &mut Buffer, pane: Rect) {
     );
     for (k, label) in [
         ("esc", "cancel"),
-        ("N", "new"),
-        ("s", "settings"),
+        ("c", "shell"),
+        ("N", "listener"),
         ("n/p", "tab"),
-        ("j/k", "listener"),
+        ("j/k", "endpoint"),
         ("X", "close tab"),
-        ("D", "close listener"),
+        ("D", "close endpoint"),
         ("?", "keybinds"),
         ("q", "quit"),
     ] {
@@ -231,7 +252,12 @@ fn render_prefix_bar(buf: &mut Buffer, pane: Rect) {
 pub fn render_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
-    terminal.draw(|frame| render(frame, app)).expect("draw");
+    terminal
+        .draw(|frame| {
+            app.fit_terminals(terminal_area(frame.area(), app));
+            render(frame, app);
+        })
+        .expect("draw");
     terminal
         .backend()
         .buffer()

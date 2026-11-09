@@ -223,7 +223,26 @@ async fn udp_restart_and_close_ask_before_dropping_peers() {
     app.prefix("D");
     app.wait_for("Close listener?").await;
     app.keys(ENTER);
-    app.wait_for("no listeners").await;
+    app.wait_for("no endpoints").await;
     eventually("the port to be freed", || !udp_port_bound(new)).await;
+    app.quit().await;
+}
+
+/// A shell tab runs a real shell sized to the pane, takes typed commands,
+/// and stays as a closed tab once the shell exits.
+#[tokio::test]
+async fn shell_tab_runs_commands_at_the_pane_size() {
+    let mut app = Outpost::start();
+    app.wait_for("no endpoints").await;
+    app.prefix("c");
+    app.wait_for("╭ sh ").await;
+    // The typed line shows the expression; only the shell's output has its value.
+    app.keys("echo outpost-$((6*7)); stty size\r");
+    app.wait_for("outpost-42").await;
+    // 120×32, less the 26-column sidebar, the tab bar, and the pane border.
+    app.wait_for("29 92").await;
+    app.keys("exit\r");
+    app.wait_for(" exited 0 ").await;
+    app.wait_for("0 open").await;
     app.quit().await;
 }

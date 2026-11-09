@@ -1,5 +1,5 @@
-//! Application state and input handling. The endpoint, session, and
-//! settings-form types live in submodules; this module owns `App`, its
+//! Application state and input handling. The endpoint, session, terminal,
+//! and settings-form types live in submodules; this module owns `App`, its
 //! overlays (`Mode`), and how keys and clicks drive them.
 
 use std::time::{Duration, Instant};
@@ -13,16 +13,19 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Event;
 use crate::net::{self, EndpointId, NetEvent, Outlet, SessId};
+use crate::pty::{self, Pty, PtyEvent};
 use crate::text_input::TextInput;
 use crate::ui::{FormHit, Hits, TextTarget};
 
 mod endpoint;
 mod session;
 mod settings;
+mod terminal;
 
 pub use endpoint::{Endpoint, Kind, ListenState, Listener, ListenerConfig, Status, Tab};
 pub use session::{Dir, Session};
 pub use settings::{Applied, CertKind, Field, SettingsForm};
+pub use terminal::Terminal;
 
 /// Sidebar width limits, matching herdr's defaults.
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
@@ -144,6 +147,8 @@ pub struct App {
     pub sidebar_split: f32,
     drag: Option<Drag>,
     last_divider_click: Option<Instant>,
+    /// Rows and columns a terminal tab gets: the pane, inside its border.
+    terminal_size: (u16, u16),
     events: UnboundedSender<Event>,
 }
 
@@ -159,6 +164,7 @@ impl App {
             sidebar_split: DEFAULT_SIDEBAR_SPLIT,
             drag: None,
             last_divider_click: None,
+            terminal_size: (24, 80),
             events,
         }
     }
@@ -171,6 +177,7 @@ impl App {
             Event::Input(TermEvent::Mouse(mouse)) => self.on_mouse(mouse),
             Event::Input(_) => {}
             Event::Net(ev) => self.on_net(ev),
+            Event::Pty(ev) => self.on_pty(ev),
         }
         // Whatever is on screen has been seen.
         if let Some(tab) = self.focused_tab_mut() {
@@ -215,6 +222,25 @@ impl App {
 
     fn listener_mut(&mut self, id: EndpointId) -> Option<&mut Listener> {
         self.endpoint_mut(id)?.listener_mut()
+    }
+
+    fn terminal_mut(&mut self, id: SessId) -> Option<&mut Terminal> {
+        self.tab_mut(id)?.terminal_mut()
+    }
+
+    fn on_pty(&mut self, ev: PtyEvent) {
+        match ev {
+            PtyEvent::Output { tab, bytes } => {
+                if let Some(t) = self.terminal_mut(tab) {
+                    t.receive(&bytes);
+                }
+            }
+            PtyEvent::Exited { tab, status } => {
+                if let Some(t) = self.terminal_mut(tab) {
+                    t.exited(status);
+                }
+            }
+        }
     }
 
     fn on_net(&mut self, ev: NetEvent) {
@@ -332,6 +358,11 @@ impl App {
             self.mode = Mode::Prefix;
             return;
         }
+        // Everything but the prefix goes to the shell.
+        if let Some(t) = self.focused_tab_mut().and_then(Tab::terminal_mut) {
+            t.send_key(key);
+            return;
+        }
         let Some(s) = self.focused_session_mut() else {
             return;
         };
@@ -358,6 +389,13 @@ impl App {
 
     fn prefix_key(&mut self, key: KeyEvent) {
         match key.code {
+            // The prefix twice sends it to the shell, as in tmux.
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(t) = self.focused_tab_mut().and_then(Tab::terminal_mut) {
+                    t.send(&[0x02]);
+                }
+            }
+            KeyCode::Char('c') => self.open_shell(),
             KeyCode::Char('N') => self.open_new_form(),
             KeyCode::Char('s') => self.open_settings_form(),
             KeyCode::Char('n') => self.cycle_tab(1),
@@ -376,8 +414,8 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.cycle_endpoint(1),
             KeyCode::Char('k') | KeyCode::Up => self.cycle_endpoint(-1),
             KeyCode::Char('X') => {
-                if let Some(s) = self.focused_session_mut() {
-                    let id = s.id;
+                if let Some(tab) = self.focused_tab_mut() {
+                    let id = tab.id();
                     self.request_close(Target::Tab(id));
                 }
             }
@@ -392,8 +430,8 @@ impl App {
                 }
             }
             KeyCode::Char('T') => {
-                if let Some(s) = self.focused_session_mut() {
-                    let id = s.id;
+                if let Some(tab) = self.focused_tab_mut() {
+                    let id = tab.id();
                     self.open_rename(Target::Tab(id));
                 }
             }
@@ -659,6 +697,8 @@ impl App {
             self.set_sidebar_split(pos.y);
         } else if self.hits.new_listener.contains(pos) {
             self.open_new_form();
+        } else if self.hits.new_tab.contains(pos) {
+            self.open_shell();
         } else if self.hits.settings.contains(pos) {
             self.open_settings_form();
         } else if let Some(index) = hit(&self.hits.endpoints, pos) {
@@ -737,6 +777,48 @@ impl App {
                     .position(|tab| tab.id() == id)
                     .map(|tab| (index, tab))
             })
+    }
+
+    /// Opens a shell tab under the local endpoint and focuses it.
+    fn open_shell(&mut self) {
+        let id = net::next_id();
+        let (rows, cols) = self.terminal_size;
+        let pty = Pty::shell(id, rows, cols, self.events.clone());
+        self.add_terminal(Terminal::new(id, pty::shell_name(), pty, rows, cols));
+    }
+
+    /// Adds a terminal tab to the local endpoint, which comes first in the
+    /// sidebar and exists once there is a shell, and focuses it.
+    fn add_terminal(&mut self, terminal: Terminal) {
+        let index = match self
+            .endpoints
+            .iter()
+            .position(|endpoint| matches!(endpoint.kind, Kind::Local))
+        {
+            Some(index) => index,
+            None => {
+                self.endpoints.insert(0, Endpoint::new_local());
+                0
+            }
+        };
+        let endpoint = &mut self.endpoints[index];
+        endpoint.tabs.push(Tab::Terminal(terminal));
+        endpoint.active_tab = endpoint.tabs.len() - 1;
+        self.active = index;
+    }
+
+    /// Sizes every terminal tab to `area`, the pane inside its border. Every
+    /// tab shares the pane, so a hidden shell is ready when it's shown.
+    pub fn fit_terminals(&mut self, area: Rect) {
+        self.terminal_size = (area.height, area.width);
+        for t in self
+            .endpoints
+            .iter_mut()
+            .flat_map(|endpoint| endpoint.tabs.iter_mut())
+            .filter_map(Tab::terminal_mut)
+        {
+            t.resize(area.height, area.width);
+        }
     }
 
     fn open_new_form(&mut self) {
@@ -968,6 +1050,16 @@ impl App {
             outlet: Outlet::Tcp(tx),
         }));
         (sess, rx)
+    }
+
+    /// Opens a shell tab with no program behind it, as `ctrl+b c` would. The
+    /// receiver gets every write to the shell.
+    pub fn add_test_terminal(&mut self) -> (SessId, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (pty, rx) = Pty::test();
+        let id = net::next_id();
+        let (rows, cols) = self.terminal_size;
+        self.add_terminal(Terminal::new(id, "sh".into(), Ok(pty), rows, cols));
+        (id, rx)
     }
 
     /// Like [`App::add_test_session`] for a QUIC connection: the receiver gets

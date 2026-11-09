@@ -72,6 +72,8 @@ impl Outpost {
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_outpost"));
         cmd.env("TERM", "xterm-256color");
+        // Shell tabs run a plain shell, not whatever the user has configured.
+        cmd.env("SHELL", "/bin/sh");
         let child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);
 

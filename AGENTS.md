@@ -7,8 +7,11 @@ goal is a TUI that feels almost identical to herdr.
 
 ## Vocabulary
 
-- **Endpoint**: a sidebar row that owns sessions. Every endpoint is a listener for now.
+- **Endpoint**: a sidebar row that owns tabs: a listener, or the **local** endpoint (this machine),
+  listed first once it has a shell.
 - **Listener**: an endpoint with one socket bound to `IP:PORT`: TCP, UDP, TLS, or QUIC.
+- **Terminal tab**: the user's login shell in a PTY, drawn by an emulator (vt100). Every key but the
+  prefix goes to the shell. Shells are not sessions: the sidebar's sessions list shows connections.
 - **Session**: one connection to a listener. For UDP, each distinct peer address is a session. Each
   session is shown as a **tab** (herdr: agent / tab).
 - **Stream**: QUIC only. One session carries many; its transcript tags lines `[sN]` by stream ID
@@ -34,7 +37,8 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 
 - `src/main.rs`: terminal setup, one event channel, the draw/handle loop.
   Input comes from a blocking crossterm reader thread; bursts are coalesced
-  into one redraw.
+  into one redraw. Before each draw, `App::fit_terminals` sizes every shell
+  to `ui::terminal_area`, the same geometry render uses.
 - `src/net.rs`: listener and connection tasks (tokio). Talks to the app only
   through `NetEvent`s. A session's write side is an `Outlet`; dropping it
   closes a TCP connection.
@@ -45,22 +49,29 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
 - `src/net/quic.rs`: QUIC listener and connections (quinn), reusing the TLS
   config. The app predicts the IDs of streams it opens (`server_bidi`), so
   `QuicOut::Write` to a new ID opens that stream.
+- `src/pty.rs`: a program in a PTY (portable-pty). A reader thread per PTY
+  sends `PtyEvent`s (output, then the exit status). Dropping a `Pty` hangs
+  up on the program.
 - `src/app.rs`: `App` and input handling. Everything enters through
   `App::handle(Event)`. Modes (`Mode`) are the overlays plus normal/prefix.
   `Target` names what a menu, rename, or close acts on (endpoint or tab).
   - `app/endpoint.rs`: `Endpoint` (a sidebar row and its `Tab`s), and its
-    `Kind`, which holds what only that kind has. For now every endpoint is a
-    `Listener`: one bound socket, its listening task, and the sessions it
-    accepted. `Endpoint::listener()` reaches it.
+    `Kind`, which holds what only that kind has: a `Listener` (one bound
+    socket, its listening task, and the sessions it accepted;
+    `Endpoint::listener()` reaches it) or `Local`. A `Tab` is a transcript
+    `Session` or a `Terminal`.
   - `app/session.rs`: `Session` (transcript, input line, byte counts) and a
     QUIC session's `Streams`.
+  - `app/terminal.rs`: `Terminal` (a shell's PTY and screen) and
+    `encode_key`, which turns keys into the bytes an xterm sends.
   - `app/settings.rs`: `SettingsForm`: building it, editing rules per field,
     and `check`, which validates it into an `Applied` config.
 - `src/ui.rs`: rendering entry point and shared drawing helpers. Records
   clickable regions in `Hits`, which the next mouse event resolves against.
   Split like herdr's shell:
   - `ui/sidebar.rs`: endpoints over sessions, and the dividers.
-  - `ui/tabs.rs`: the tab bar and the focused tab's transcript and input.
+  - `ui/tabs.rs`: the tab bar (with herdr's `+`, which opens a shell) and the
+    focused tab: a transcript and input, or a terminal's screen.
   - `ui/overlays.rs`: settings form, menu, rename, confirmation, help
     (`render_help`).
 - `src/text_input.rs`: single-line text with a movable cursor, used by every

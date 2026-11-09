@@ -8,8 +8,8 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use super::{FormHit, Hits, TextTarget, put, render_input};
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Endpoint, Field, MenuItem, RenameForm, SettingsForm, Tab,
-    Target,
+    App, CertKind, Confirm, ContextMenu, Endpoint, Field, Kind, MenuItem, RenameForm, SettingsForm,
+    Tab, Target,
 };
 use crate::net::{EndpointId, Protocol};
 use crate::theme::*;
@@ -259,7 +259,7 @@ pub(super) fn render_rename(
     let rect = centered(area, 46, 7);
     Clear.render(rect, buf);
     let block = overlay_block(match form.target {
-        Target::Endpoint(_) => "rename listener",
+        Target::Endpoint(_) => "rename endpoint",
         Target::Tab(_) => "rename tab",
     });
     let inner = block.inner(rect);
@@ -298,18 +298,27 @@ pub(super) fn render_confirm(
     hits: &mut Hits,
 ) {
     let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    // What an endpoint's open tabs are: connections, or shells.
+    let noun = |endpoint: &Endpoint| match endpoint.kind {
+        Kind::Listener(_) => "open connection",
+        Kind::Local => "running shell",
+    };
     // e.g. `web (tcp :4444)` and `2 open connections`.
     let describe = |endpoint: &Endpoint| {
         let who = match &endpoint.name {
             Some(name) => format!("{name} ({})", endpoint.addr_label()),
             None => endpoint.addr_label(),
         };
-        (who, count(endpoint.open_count(), "open connection"))
+        (who, count(endpoint.open_count(), noun(endpoint)))
     };
     let endpoint = |id: EndpointId| app.endpoint(id).map(describe);
     let text = match *confirm {
         Confirm::Close(Target::Endpoint(id)) => {
-            endpoint(id).map(|(who, open)| (" Close listener?", format!(" {who} has {open}.")))
+            let title = match app.endpoint(id).map(|endpoint| &endpoint.kind) {
+                Some(Kind::Local) => " Close all shells?",
+                _ => " Close listener?",
+            };
+            endpoint(id).map(|(who, open)| (title, format!(" {who} has {open}.")))
         }
         Confirm::Restart(ref form, _) => form.target.and_then(endpoint).map(|(who, open)| {
             (
@@ -329,22 +338,36 @@ pub(super) fn render_confirm(
                     format!(" {who} has {open}.")
                 }
                 _ => {
-                    let open = live.iter().map(|endpoint| endpoint.open_count()).sum();
+                    // e.g. `3 open connections and 1 running shell`.
+                    let mut parts = Vec::new();
+                    for what in ["open connection", "running shell"] {
+                        let open: usize = live
+                            .iter()
+                            .filter(|endpoint| noun(endpoint) == what)
+                            .map(|endpoint| endpoint.open_count())
+                            .sum();
+                        if open > 0 {
+                            parts.push(count(open, what));
+                        }
+                    }
                     format!(
                         " {} across {}.",
-                        count(open, "open connection"),
-                        count(live.len(), "listener")
+                        parts.join(" and "),
+                        count(live.len(), "endpoint")
                     )
                 }
             };
             Some((" Quit outpost?", detail))
         }
-        Confirm::Close(Target::Tab(id)) => app.tab(id).and_then(Tab::session).map(|s| {
-            let who = match &s.name {
-                Some(name) => format!("{name} ({})", s.peer),
-                None => s.peer.to_string(),
-            };
-            (" Close tab?", format!(" {who} is still connected."))
+        Confirm::Close(Target::Tab(id)) => app.tab(id).map(|tab| match tab {
+            Tab::Session(s) => {
+                let who = match &s.name {
+                    Some(name) => format!("{name} ({})", s.peer),
+                    None => s.peer.to_string(),
+                };
+                (" Close tab?", format!(" {who} is still connected."))
+            }
+            Tab::Terminal(t) => (" Close tab?", format!(" {} is still running.", t.label())),
         }),
     };
     let Some((title, detail)) = text else {
@@ -419,17 +442,19 @@ pub(super) fn render_confirm(
 pub(super) fn render_help(buf: &mut Buffer, area: Rect) {
     const KEYS: &[(&str, &str)] = &[
         ("ctrl+b", "prefix"),
+        ("prefix c", "new shell"),
         ("prefix N", "new listener"),
         ("prefix s", "listener settings"),
-        ("prefix j / k", "next / previous listener"),
+        ("prefix j / k", "next / previous endpoint"),
         ("prefix n / p", "next / previous tab"),
         ("prefix 1..9", "jump to tab"),
         ("prefix X", "close tab (disconnects)"),
-        ("prefix D", "close listener"),
-        ("prefix W", "rename listener"),
+        ("prefix D", "close endpoint"),
+        ("prefix W", "rename endpoint"),
         ("prefix T", "rename tab"),
         ("right-click", "rename / close menu"),
         ("prefix q", "quit"),
+        ("prefix ctrl+b", "send ctrl+b to the shell"),
         ("enter", "send input line"),
         ("prefix (⇧)tab", "quic: cycle send stream"),
         ("ctrl+d", "quic: finish send stream"),
