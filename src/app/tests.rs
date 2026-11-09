@@ -455,7 +455,7 @@ fn duplicate_listener_is_rejected() {
 fn settings_without_changes_leave_the_listener_alone() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     assert_eq!(form(&app).port, "4444");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
@@ -556,7 +556,7 @@ fn clicks_on_rows_removed_since_the_last_frame_are_ignored() {
 }
 
 #[test]
-fn clicking_new_and_settings_open_the_form() {
+fn clicking_new_or_a_listeners_settings_opens_the_form() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Udp, "0.0.0.0:5555");
     render_rows(&mut app, 120, 32);
@@ -566,8 +566,8 @@ fn clicking_new_and_settings_open_the_form() {
     assert_eq!(form(&app).target, None);
     key(&mut app, KeyCode::Esc);
 
-    let settings = app.hits.settings;
-    click(&mut app, settings);
+    // A listener's settings are in its right-click menu.
+    menu_pick(&mut app, 0, MenuItem::ListenerSettings);
     assert_eq!(form(&app).target, Some(app.endpoints[0].id));
     assert_eq!(form(&app).protocol, Protocol::Udp);
 }
@@ -617,7 +617,7 @@ fn menu_pick(app: &mut App, index: usize, item: MenuItem) {
     let (row, _) = app.hits.endpoints[index];
     right_click(app, row);
     render_rows(app, 120, 32);
-    let pos = MenuItem::ALL.iter().position(|&i| i == item).unwrap();
+    let pos = menu(app).items.iter().position(|&i| i == item).unwrap();
     let (rect, _) = app.hits.menu_items[pos];
     click(app, rect);
 }
@@ -627,7 +627,7 @@ fn right_click_opens_menu_for_that_listener_without_focusing_it() {
     let (mut app, ids) = three_listeners();
     let (row, _) = app.hits.endpoints[1];
     right_click(&mut app, row);
-    assert_eq!(menu(&app).target, Target::Endpoint(ids[1]));
+    assert_eq!(menu(&app).target, Some(Target::Endpoint(ids[1])));
     assert_eq!((menu(&app).x, menu(&app).y), (row.x, row.y));
     assert_eq!(app.active, 0);
 }
@@ -725,8 +725,10 @@ fn menu_works_from_the_keyboard() {
     let (mut app, ids) = three_listeners();
     let (row, _) = app.hits.endpoints[2];
     right_click(&mut app, row);
+    // A listener's menu: Rename, Settings, Close.
     key(&mut app, KeyCode::Down);
     assert_eq!(menu(&app).highlighted, 1);
+    key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     assert_eq!(menu(&app).highlighted, 0, "wraps");
     key(&mut app, KeyCode::Up);
@@ -835,7 +837,7 @@ fn clicks_outside_the_form_are_ignored() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     render_rows(&mut app, 120, 32);
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     render_rows(&mut app, 120, 32);
     let new = app.hits.new_listener;
     click(&mut app, new);
@@ -890,7 +892,7 @@ fn cancelling_the_confirmation_keeps_everything() {
 
 /// Opens settings for the active listener and changes its port to `port`.
 fn change_port(app: &mut App, port: &str) {
-    prefix(app, 's');
+    prefix(app, 'e');
     key(app, KeyCode::Tab); // -> address
     key(app, KeyCode::Tab); // -> port
     for _ in 0..5 {
@@ -969,7 +971,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     let udp = app.add_test_listener(Protocol::Udp, "127.0.0.1:5555");
     let (_b, _out_b) = app.add_test_session(udp, "10.0.0.5:1000");
     app.active = 1;
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
     assert!(app.test_session(1, 0).is_open());
@@ -1116,7 +1118,7 @@ fn tab_menu_pick(app: &mut App, index: usize, item: MenuItem) {
     let (tab, _) = app.hits.tabs[index];
     right_click(app, tab);
     render_rows(app, 120, 32);
-    let pos = MenuItem::ALL.iter().position(|&i| i == item).unwrap();
+    let pos = menu(app).items.iter().position(|&i| i == item).unwrap();
     let (rect, _) = app.hits.menu_items[pos];
     click(app, rect);
 }
@@ -1126,7 +1128,7 @@ fn right_click_opens_menu_for_that_tab_without_focusing_it() {
     let (mut app, ids, _outs) = three_tabs();
     let (tab, _) = app.hits.tabs[2];
     right_click(&mut app, tab);
-    assert_eq!(menu(&app).target, Target::Tab(ids[2]));
+    assert_eq!(menu(&app).target, Some(Target::Tab(ids[2])));
     assert_eq!(app.endpoints[0].active_tab, 0);
 }
 
@@ -1561,7 +1563,7 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
     let original = fingerprint(&app);
 
     // A new port restarts the listener on the same certificate.
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     key(&mut app, KeyCode::Tab); // -> address
     key(&mut app, KeyCode::Tab); // -> port
     for _ in 0..5 {
@@ -1575,7 +1577,7 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
     assert_eq!(fingerprint(&app), original);
 
     // Changing ALPN builds a new one.
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     for _ in 0..4 {
         key(&mut app, KeyCode::Tab); // -> alpn
     }
@@ -1595,7 +1597,7 @@ fn settings_show_a_tls_listener_as_configured() {
         },
         alpn: vec!["h2".into(), "http/1.1".into()],
     };
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     let form = form(&app);
     assert_eq!(form.protocol, Protocol::Tls);
     assert_eq!(form.cert, CertKind::Files);
@@ -1930,7 +1932,7 @@ async fn switching_tls_to_quic_keeps_the_certificate() {
     app.handle(ev);
     let original = fingerprint(&app);
 
-    prefix(&mut app, 's');
+    prefix(&mut app, 'e');
     key(&mut app, KeyCode::Right); // tls -> quic
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
@@ -2240,4 +2242,81 @@ fn an_exited_shell_stays_where_it_was() {
     // With no shell, a check sees no command, but a closed tab isn't moved.
     app.handle(Event::Tick);
     assert_eq!(ssh_endpoints(&app), ["nas"]);
+}
+
+/// Clicks the footer's `menu`, renders the menu, and clicks `item`.
+fn global_menu_pick(app: &mut App, item: MenuItem) {
+    render_rows(app, 120, 32);
+    let footer = app.hits.menu;
+    click(app, footer);
+    assert_eq!(menu(app).target, None);
+    render_rows(app, 120, 32);
+    let pos = menu(app).items.iter().position(|&i| i == item).unwrap();
+    let (rect, _) = app.hits.menu_items[pos];
+    click(app, rect);
+}
+
+#[test]
+fn prefix_s_opens_settings_until_esc_or_close() {
+    let (mut app, _rx) = App::test_new();
+    prefix(&mut app, 's');
+    assert!(matches!(app.mode, Mode::AppSettings));
+    // Nothing else dismisses it: not other keys, not stray clicks.
+    type_str(&mut app, "q");
+    key(&mut app, KeyCode::Enter);
+    render_rows(&mut app, 120, 32);
+    click(&mut app, Rect::new(0, 0, 1, 1));
+    assert!(matches!(app.mode, Mode::AppSettings));
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+
+    prefix(&mut app, 's');
+    render_rows(&mut app, 120, 32);
+    let close = app.hits.cancel;
+    click(&mut app, close);
+    assert!(matches!(app.mode, Mode::Normal));
+}
+
+#[test]
+fn the_global_menu_opens_settings_keybinds_and_quits() {
+    let (mut app, _rx) = App::test_new();
+    global_menu_pick(&mut app, MenuItem::Settings);
+    assert!(matches!(app.mode, Mode::AppSettings));
+    key(&mut app, KeyCode::Esc);
+
+    global_menu_pick(&mut app, MenuItem::Keybinds);
+    assert!(matches!(app.mode, Mode::Help));
+    key(&mut app, KeyCode::Esc);
+
+    // Quitting asks first while something is open, like `prefix q`.
+    let (_tab, _shell) = app.add_test_terminal();
+    global_menu_pick(&mut app, MenuItem::Quit);
+    assert!(matches!(app.mode, Mode::Confirm(Confirm::Quit)));
+    key(&mut app, KeyCode::Esc);
+    prefix(&mut app, 'X');
+    key(&mut app, KeyCode::Enter);
+    global_menu_pick(&mut app, MenuItem::Quit);
+    assert!(app.quit);
+}
+
+#[test]
+fn only_listener_menus_have_settings() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_terminal();
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    render_rows(&mut app, 120, 32);
+    let (local, _) = app.hits.endpoints[0];
+    right_click(&mut app, local);
+    assert_eq!(menu(&app).items, [MenuItem::Rename, MenuItem::Close]);
+    key(&mut app, KeyCode::Esc);
+    let (listener, _) = app.hits.endpoints[1];
+    right_click(&mut app, listener);
+    assert_eq!(
+        menu(&app).items,
+        [
+            MenuItem::Rename,
+            MenuItem::ListenerSettings,
+            MenuItem::Close
+        ]
+    );
 }

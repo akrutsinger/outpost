@@ -166,17 +166,11 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             " new",
             Style::new().fg(OVERLAY0),
         );
-        // Only listeners have settings.
-        if app
-            .endpoints
-            .get(app.active)
-            .is_some_and(|endpoint| endpoint.listener().is_some())
-        {
-            let label = "settings";
-            let width = (label.len() as u16).min(area.width);
-            hits.settings = Rect::new(area.right() - width, footer_y, width, 1);
-            put_right(buf, area, footer_y, label, Style::new().fg(OVERLAY0));
-        }
+        // global menu: settings, keybinds, quit.
+        let label = "menu";
+        let width = (label.len() as u16).min(area.width);
+        hits.menu = Rect::new(area.right() - width, footer_y, width, 1);
+        put_right(buf, area, footer_y, label, Style::new().fg(OVERLAY0));
     }
 }
 

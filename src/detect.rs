@@ -16,8 +16,18 @@ pub enum Integration {
 }
 
 impl Integration {
+    /// In the order the settings overlay lists them.
+    pub const ALL: [Integration; 2] = [Integration::Ssh, Integration::Netcat];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Integration::Ssh => "ssh",
+            Integration::Netcat => "netcat",
+        }
+    }
+
     /// Only active integrations run; the rest are planned.
-    fn active(self) -> bool {
+    pub fn active(self) -> bool {
         matches!(self, Integration::Ssh)
     }
 
@@ -40,7 +50,7 @@ impl Integration {
 
 /// The active integration whose command `argv` runs, if any.
 pub fn recognize(argv: &[String]) -> Option<Integration> {
-    [Integration::Ssh, Integration::Netcat]
+    Integration::ALL
         .into_iter()
         .filter(|integration| integration.active())
         .find(|integration| integration.matches(argv))

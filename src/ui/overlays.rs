@@ -1,4 +1,5 @@
-//! Overlays drawn over everything: settings form, menu, rename, confirmation, help.
+//! Overlays drawn over everything: settings, listener settings form, menus,
+//! rename, confirmation, help.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
@@ -8,9 +9,10 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use super::{FormHit, Hits, TextTarget, put, render_input};
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Endpoint, Field, Kind, MenuItem, RenameForm, SettingsForm,
-    Tab, Target,
+    App, CertKind, Confirm, ContextMenu, Endpoint, Field, Kind, RenameForm, SettingsForm, Tab,
+    Target,
 };
+use crate::detect::Integration;
 use crate::net::{EndpointId, Protocol};
 use crate::theme::*;
 
@@ -204,15 +206,10 @@ fn render_choice(
     *row = Rect::new(next, row.y, row.right() - next, 1);
 }
 
-/// herdr-style menu: square accent border, opened at the click and kept on screen.
+/// herdr-style menu: square accent border, opened where asked and kept on screen.
 pub(super) fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits: &mut Hits) {
-    let label_width = MenuItem::ALL
-        .iter()
-        .map(|item| item.label().len())
-        .max()
-        .unwrap_or(0) as u16;
-    let width = (label_width + 4).max(14).min(area.width);
-    let height = (MenuItem::ALL.len() as u16 + 2).min(area.height);
+    let (width, height) = menu.size();
+    let (width, height) = (width.min(area.width), height.min(area.height));
     let x = menu.x.min(area.right().saturating_sub(width));
     let y = menu.y.min(area.bottom().saturating_sub(height));
     let rect = Rect::new(x, y, width, height);
@@ -223,7 +220,7 @@ pub(super) fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits
     let inner = block.inner(rect);
     block.render(rect, buf);
 
-    for (index, item) in MenuItem::ALL.iter().enumerate() {
+    for (index, item) in menu.items.iter().enumerate() {
         let row_y = inner.y + index as u16;
         if row_y >= inner.bottom() {
             break;
@@ -248,6 +245,105 @@ pub(super) fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits
         );
         hits.menu_items.push((row, index));
     }
+}
+
+/// settings overlay: a square panel with section tabs. Its only
+/// section so far lists the integrations, which always run.
+pub(super) fn render_app_settings(buf: &mut Buffer, area: Rect, hits: &mut Hits) {
+    let rect = centered(area, 76.min(area.width.saturating_sub(4)), 14);
+    Clear.render(rect, buf);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(ACCENT))
+        .style(Style::new().bg(PANEL_BG));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    if inner.width < 20 || inner.height < 12 {
+        return;
+    }
+    let bold = Style::new()
+        .fg(TEXT)
+        .bg(PANEL_BG)
+        .add_modifier(Modifier::BOLD);
+    let quiet = Style::new().fg(OVERLAY1).bg(PANEL_BG);
+    put(buf, inner.x, inner.y, inner.right(), " settings", bold);
+    // The section tabs; integrations is the only section so far.
+    put(
+        buf,
+        inner.x,
+        inner.y + 1,
+        inner.right(),
+        " integrations ",
+        Style::new()
+            .fg(PANEL_BG)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD),
+    );
+    put(
+        buf,
+        inner.x,
+        inner.y + 2,
+        inner.right(),
+        &"─".repeat(inner.width as usize),
+        Style::new().fg(SURFACE0).bg(PANEL_BG),
+    );
+
+    let top = inner.y + 4;
+    put(buf, inner.x, top, inner.right(), "integrations", bold);
+    put(
+        buf,
+        inner.x,
+        top + 1,
+        inner.right(),
+        "a shell running one of these is filed under the host it connects to",
+        quiet,
+    );
+    for (index, integration) in Integration::ALL.iter().enumerate() {
+        let y = top + 3 + index as u16;
+        let (marker, color, status) = if integration.active() {
+            ("✓", GREEN, "active")
+        } else {
+            ("–", OVERLAY0, "planned")
+        };
+        put(
+            buf,
+            inner.x,
+            y,
+            inner.x + 3,
+            &format!(" {marker}"),
+            Style::new().fg(color).bg(PANEL_BG),
+        );
+        put(
+            buf,
+            inner.x + 3,
+            y,
+            inner.x + 14,
+            integration.name(),
+            Style::new().fg(SUBTEXT0).bg(PANEL_BG),
+        );
+        put(buf, inner.x + 14, y, inner.right(), status, quiet);
+    }
+
+    // lone close button, centered on the bottom row.
+    let label = " esc close ";
+    let width = label.chars().count() as u16;
+    let button = Rect::new(
+        inner.x + inner.width.saturating_sub(width) / 2,
+        inner.bottom() - 1,
+        width,
+        1,
+    );
+    put(
+        buf,
+        button.x,
+        button.y,
+        button.right(),
+        label,
+        Style::new()
+            .fg(TEXT)
+            .bg(SURFACE0)
+            .add_modifier(Modifier::BOLD),
+    );
+    hits.cancel = button;
 }
 
 pub(super) fn render_rename(
@@ -447,7 +543,8 @@ pub(super) fn render_help(buf: &mut Buffer, area: Rect) {
         ("ctrl+b", "prefix"),
         ("prefix c", "new shell"),
         ("prefix N", "new listener"),
-        ("prefix s", "listener settings"),
+        ("prefix s", "settings (integrations)"),
+        ("prefix e", "listener settings"),
         ("prefix j / k", "next / previous endpoint"),
         ("prefix n / p", "next / previous tab"),
         ("prefix 1..9", "jump to tab"),

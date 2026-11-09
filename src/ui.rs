@@ -10,7 +10,9 @@ use crate::app::{App, CertKind, Endpoint, Field, Mode, Status};
 use crate::net::Protocol;
 use crate::text_input::TextInput;
 use crate::theme::*;
-use overlays::{render_confirm, render_help, render_menu, render_rename, render_settings};
+use overlays::{
+    render_app_settings, render_confirm, render_help, render_menu, render_rename, render_settings,
+};
 use sidebar::render_sidebar;
 use tabs::{render_pane, render_tab_bar};
 
@@ -51,13 +53,14 @@ pub struct Hits {
     /// The tab bar's `+`, which opens a shell.
     pub new_tab: Rect,
     pub new_listener: Rect,
-    pub settings: Rect,
+    /// The footer's `menu`, which opens the global menu.
+    pub menu: Rect,
     pub pane: Rect,
     /// The sidebar's vertical separator (full sidebar height).
     pub sidebar_divider: Rect,
     /// The line between the endpoints and sessions sections.
     pub section_divider: Rect,
-    /// Right-click menu rows: (row, index into `MenuItem::ALL`).
+    /// Menu rows: (row, index into the open menu's items).
     pub menu_items: Vec<(Rect, usize)>,
     /// Settings form targets; buttons come before the rows they sit in.
     pub form: Vec<(Rect, FormHit)>,
@@ -67,7 +70,7 @@ pub struct Hits {
     /// button that finishes it.
     pub send_stream: Rect,
     pub finish_stream: Rect,
-    /// Close-confirmation buttons.
+    /// Confirmation buttons; `cancel` also closes the settings overlay.
     pub confirm: Rect,
     pub cancel: Rect,
 }
@@ -141,6 +144,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         Mode::Help => {
             render_help(buf, area);
+            cursor = None;
+        }
+        Mode::AppSettings => {
+            render_app_settings(buf, area, &mut hits);
             cursor = None;
         }
         Mode::Normal | Mode::Prefix => {}

@@ -3,7 +3,7 @@
 use super::tabs::wrap;
 use super::*;
 use crate::Event;
-use crate::app::{Confirm, ContextMenu, RenameForm, SettingsForm, Target};
+use crate::app::{Confirm, ContextMenu, MenuItem, RenameForm, SettingsForm, Target};
 use crate::net::NetEvent;
 
 const W: u16 = 120;
@@ -94,7 +94,7 @@ fn failed_listener_shows_error_in_sidebar_and_pane() {
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "   Address already in us");
     row_with(&rows, "could not listen on tcp 0.0.0.0:4444");
-    row_with(&rows, "ctrl+b s to change settings");
+    row_with(&rows, "ctrl+b e to change settings");
 }
 
 #[test]
@@ -298,7 +298,8 @@ fn context_menu_opens_at_the_click_and_stays_on_screen() {
     let (mut app, _rx) = App::test_new();
     let listener = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     app.mode = Mode::Menu(ContextMenu {
-        target: Target::Endpoint(listener),
+        target: Some(Target::Endpoint(listener)),
+        items: vec![MenuItem::Rename, MenuItem::Close],
         x: 3,
         y: 2,
         highlighted: 0,
@@ -315,7 +316,8 @@ fn context_menu_opens_at_the_click_and_stays_on_screen() {
 
     // Near the bottom-right corner it shifts up and left to fit.
     app.mode = Mode::Menu(ContextMenu {
-        target: Target::Endpoint(listener),
+        target: Some(Target::Endpoint(listener)),
+        items: vec![MenuItem::Rename, MenuItem::Close],
         x: W - 1,
         y: H - 1,
         highlighted: 1,
@@ -599,15 +601,58 @@ fn confirms_count_shells_apart_from_connections() {
 }
 
 #[test]
-fn settings_button_shows_only_for_listeners() {
+fn settings_lists_the_integrations() {
     let (mut app, _rx) = App::test_new();
-    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
-    app.active = 0;
-    render_rows(&mut app, W, H);
-    assert_ne!(app.hits.settings.width, 0);
-    app.add_test_terminal();
-    render_rows(&mut app, W, H);
-    assert_eq!(app.hits.settings.width, 0);
+    app.mode = Mode::AppSettings;
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, "│ settings");
+    row_with(&rows, "│ integrations ");
+    row_with(
+        &rows,
+        "a shell running one of these is filed under the host it connects to",
+    );
+    let ssh = row_with(&rows, " ✓ ssh");
+    assert!(ssh.contains("active"), "{ssh:?}");
+    let netcat = row_with(&rows, " – netcat");
+    assert!(netcat.contains("planned"), "{netcat:?}");
+    row_with(&rows, " esc close ");
+    assert_ne!(app.hits.cancel.width, 0);
+}
+
+#[test]
+fn the_footer_menu_opens_above_itself() {
+    let (mut app, _rx) = App::test_new();
+    let rows = render_rows(&mut app, W, H);
+    let footer = app.hits.menu;
+    let drawn: String = rows[footer.y as usize]
+        .chars()
+        .skip(footer.x as usize)
+        .take(footer.width as usize)
+        .collect();
+    assert_eq!(drawn, "menu");
+
+    app.handle(Event::Input(ratatui::crossterm::event::Event::Mouse(
+        ratatui::crossterm::event::MouseEvent {
+            kind: ratatui::crossterm::event::MouseEventKind::Down(
+                ratatui::crossterm::event::MouseButton::Left,
+            ),
+            column: footer.x,
+            row: footer.y,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        },
+    )));
+    let rows = render_rows(&mut app, W, H);
+    // Three items in a bordered box, its bottom just above the footer and
+    // its right edge at the footer's.
+    let bottom = &rows[footer.y as usize - 1];
+    assert_eq!(
+        bottom.chars().nth(footer.right() as usize - 1),
+        Some('┘'),
+        "{bottom:?}"
+    );
+    row_with(&rows[..footer.y as usize], "│ settings");
+    row_with(&rows[..footer.y as usize], "│ keybinds");
+    row_with(&rows[..footer.y as usize], "│ quit");
 }
 
 /// Files the shell in `tab` under a host, as detection would: the shell

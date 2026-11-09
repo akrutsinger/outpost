@@ -316,7 +316,7 @@ fn waiting(kind: &Kind) -> Vec<String> {
         ListenState::Failed(error) => vec![
             format!("could not listen on {listen}"),
             error.clone(),
-            "ctrl+b s to change settings".into(),
+            "ctrl+b e to change settings".into(),
         ],
     }
 }

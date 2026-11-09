@@ -60,27 +60,51 @@ pub enum Target {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuItem {
     Rename,
+    /// A listener's settings form.
+    ListenerSettings,
     Close,
+    /// The global menu's items.
+    Settings,
+    Keybinds,
+    Quit,
 }
 
 impl MenuItem {
-    /// In display order.
-    pub const ALL: [MenuItem; 2] = [MenuItem::Rename, MenuItem::Close];
-
     pub fn label(self) -> &'static str {
         match self {
             MenuItem::Rename => "Rename",
+            MenuItem::ListenerSettings => "Settings",
             MenuItem::Close => "Close",
+            MenuItem::Settings => "settings",
+            MenuItem::Keybinds => "keybinds",
+            MenuItem::Quit => "quit",
         }
     }
 }
 
+/// A right-click menu, or global menu above the sidebar footer.
 pub struct ContextMenu {
-    pub target: Target,
-    /// Where the click happened; the menu opens there.
+    /// What the items act on; `None` for the global menu.
+    pub target: Option<Target>,
+    /// In display order.
+    pub items: Vec<MenuItem>,
+    /// The top-left corner it opens at, kept on screen when drawn.
     pub x: u16,
     pub y: u16,
     pub highlighted: usize,
+}
+
+impl ContextMenu {
+    /// Width and height, border included.
+    pub fn size(&self) -> (u16, u16) {
+        let label_width = self
+            .items
+            .iter()
+            .map(|item| item.label().len())
+            .max()
+            .unwrap_or(0) as u16;
+        ((label_width + 4).max(14), self.items.len() as u16 + 2)
+    }
 }
 
 pub struct RenameForm {
@@ -92,6 +116,9 @@ pub enum Mode {
     Normal,
     Prefix,
     Help,
+    /// settings overlay: for now, its integrations section.
+    AppSettings,
+    /// A listener's settings form.
     Settings(SettingsForm),
     Menu(ContextMenu),
     Rename(RenameForm),
@@ -103,13 +130,14 @@ impl Mode {
     /// The endpoint or tab the open overlay acts on, highlighted while it's open.
     pub fn target(&self) -> Option<Target> {
         match self {
-            Mode::Menu(menu) => Some(menu.target),
+            Mode::Menu(menu) => menu.target,
             Mode::Rename(form) => Some(form.target),
             Mode::Confirm(Confirm::Close(target)) => Some(*target),
             Mode::Confirm(Confirm::Restart(form, _)) => form.target.map(Target::Endpoint),
             Mode::Normal
             | Mode::Prefix
             | Mode::Help
+            | Mode::AppSettings
             | Mode::Settings(_)
             | Mode::Confirm(Confirm::Quit) => None,
         }
@@ -344,6 +372,8 @@ impl App {
             Mode::Normal => self.normal_key(key),
             Mode::Prefix => self.prefix_key(key),
             Mode::Help => {}
+            Mode::AppSettings if key.code == KeyCode::Esc => {}
+            Mode::AppSettings => self.mode = Mode::AppSettings,
             Mode::Settings(form) => self.settings_key(form, key),
             Mode::Menu(menu) => self.menu_key(menu, key),
             Mode::Rename(form) => self.rename_key(form, key),
@@ -400,7 +430,8 @@ impl App {
             }
             KeyCode::Char('c') => self.open_shell(),
             KeyCode::Char('N') => self.open_new_form(),
-            KeyCode::Char('s') => self.open_settings_form(),
+            KeyCode::Char('s') => self.mode = Mode::AppSettings,
+            KeyCode::Char('e') => self.open_settings_form(),
             KeyCode::Char('n') => self.cycle_tab(1),
             KeyCode::Char('p') => self.cycle_tab(-1),
             KeyCode::Tab => {
@@ -484,11 +515,11 @@ impl App {
     }
 
     fn menu_key(&mut self, mut menu: ContextMenu, key: KeyEvent) {
-        let len = MenuItem::ALL.len();
+        let len = menu.items.len();
         match key.code {
             KeyCode::Esc => return,
             KeyCode::Enter => {
-                self.activate_menu_item(menu.target, menu.highlighted);
+                self.activate_menu_item(&menu, menu.highlighted);
                 return;
             }
             KeyCode::Down => menu.highlighted = wrap(menu.highlighted, 1, len),
@@ -557,6 +588,8 @@ impl App {
         let left_click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Help => self.mode = Mode::Help,
+            Mode::AppSettings if left_click && self.hits.cancel.contains(pos) => {}
+            Mode::AppSettings => self.mode = Mode::AppSettings,
             Mode::Rename(mut form) => {
                 if left_click && let Some((TextTarget::Rename, cursor)) = self.text_hit(pos) {
                     form.input.set_cursor(cursor);
@@ -623,7 +656,7 @@ impl App {
             // Any click picks the item under it, or dismisses the menu.
             MouseEventKind::Down(_) => {
                 if let Some(item) = item {
-                    self.activate_menu_item(menu.target, item);
+                    self.activate_menu_item(&menu, item);
                 }
                 return;
             }
@@ -641,12 +674,7 @@ impl App {
         match kind {
             MouseEventKind::Down(MouseButton::Right) => {
                 self.mode = match self.menu_target(pos) {
-                    Some(target) => Mode::Menu(ContextMenu {
-                        target,
-                        x: pos.x,
-                        y: pos.y,
-                        highlighted: 0,
-                    }),
+                    Some(target) => Mode::Menu(self.context_menu(target, pos)),
                     None => Mode::Normal,
                 };
             }
@@ -702,8 +730,8 @@ impl App {
             self.open_new_form();
         } else if self.hits.new_tab.contains(pos) {
             self.open_shell();
-        } else if self.hits.settings.contains(pos) {
-            self.open_settings_form();
+        } else if self.hits.menu.contains(pos) {
+            self.open_global_menu();
         } else if let Some(index) = hit(&self.hits.endpoints, pos) {
             if index < self.endpoints.len() {
                 self.active = index;
@@ -746,13 +774,64 @@ impl App {
         }
     }
 
-    /// `index` is into [`MenuItem::ALL`].
-    fn activate_menu_item(&mut self, target: Target, index: usize) {
-        match MenuItem::ALL.get(index) {
-            Some(MenuItem::Rename) => self.open_rename(target),
-            Some(MenuItem::Close) => self.request_close(target),
-            None => {}
+    /// `index` is into `menu.items`.
+    fn activate_menu_item(&mut self, menu: &ContextMenu, index: usize) {
+        let Some(&item) = menu.items.get(index) else {
+            return;
+        };
+        match (item, menu.target) {
+            (MenuItem::Rename, Some(target)) => self.open_rename(target),
+            (MenuItem::Close, Some(target)) => self.request_close(target),
+            (MenuItem::ListenerSettings, Some(Target::Endpoint(id))) => {
+                if let Some(listener) = self.endpoint(id).and_then(Endpoint::listener) {
+                    self.mode = Mode::Settings(SettingsForm::edit(id, listener));
+                }
+            }
+            (MenuItem::Settings, _) => self.mode = Mode::AppSettings,
+            (MenuItem::Keybinds, _) => self.mode = Mode::Help,
+            (MenuItem::Quit, _) => self.request_quit(),
+            _ => {}
         }
+    }
+
+    /// A right-click menu at `pos` for `target`. Listeners also have settings.
+    fn context_menu(&self, target: Target, pos: Position) -> ContextMenu {
+        let listener = match target {
+            Target::Endpoint(id) => self.endpoint(id).and_then(Endpoint::listener).is_some(),
+            Target::Tab(_) => false,
+        };
+        let items = if listener {
+            vec![
+                MenuItem::Rename,
+                MenuItem::ListenerSettings,
+                MenuItem::Close,
+            ]
+        } else {
+            vec![MenuItem::Rename, MenuItem::Close]
+        };
+        ContextMenu {
+            target: Some(target),
+            items,
+            x: pos.x,
+            y: pos.y,
+            highlighted: 0,
+        }
+    }
+
+    /// global menu, right-aligned just above the footer's `menu`.
+    fn open_global_menu(&mut self) {
+        let mut menu = ContextMenu {
+            target: None,
+            items: vec![MenuItem::Settings, MenuItem::Keybinds, MenuItem::Quit],
+            x: 0,
+            y: 0,
+            highlighted: 0,
+        };
+        let (width, height) = menu.size();
+        let launcher = self.hits.menu;
+        menu.x = launcher.right().saturating_sub(width);
+        menu.y = launcher.y.saturating_sub(height);
+        self.mode = Mode::Menu(menu);
     }
 
     fn open_rename(&mut self, target: Target) {

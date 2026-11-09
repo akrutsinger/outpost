@@ -125,7 +125,7 @@ async fn tls_shows_the_handshake_and_the_fingerprint_the_client_sees() {
     app.keys("secure reply\r");
     assert_eq!(read_text(&mut client, 13).await, "secure reply\n");
 
-    app.prefix("s");
+    app.prefix("e");
     for group in 0..8 {
         app.wait_for(&fingerprint[group * 8..group * 8 + 8]).await;
     }
@@ -198,7 +198,7 @@ async fn udp_restart_and_close_ask_before_dropping_peers() {
         .local_addr()
         .unwrap()
         .port();
-    app.prefix("s");
+    app.prefix("e");
     app.wait_for("protocol").await;
     app.keys(&TAB.repeat(2)); // -> address, port
     app.keys(&BACKSPACE.repeat(5));
@@ -270,5 +270,21 @@ async fn ssh_in_a_shell_moves_the_tab_under_its_host() {
     app.wait_for("╭ sh ").await;
     app.keys("exit 0\r");
     app.wait_for(" exited 0 ").await;
+    app.quit().await;
+}
+
+/// footer menu, clicked with a real mouse, opens settings, which
+/// lists the integrations until esc.
+#[tokio::test]
+async fn footer_menu_opens_settings_with_the_integrations() {
+    let mut app = Outpost::start();
+    app.wait_for("no endpoints").await;
+    app.click_text("menu").await;
+    app.wait_for("keybinds").await;
+    app.click_text("settings").await;
+    app.wait_for("✓ ssh").await;
+    app.wait_for("– netcat").await;
+    app.keys(ESC);
+    app.wait_gone("– netcat").await;
     app.quit().await;
 }
