@@ -60,8 +60,6 @@ pub enum Target {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuItem {
     Rename,
-    /// A listener's settings form.
-    ListenerSettings,
     Close,
     /// The global menu's items.
     Settings,
@@ -73,7 +71,6 @@ impl MenuItem {
     pub fn label(self) -> &'static str {
         match self {
             MenuItem::Rename => "Rename",
-            MenuItem::ListenerSettings => "Settings",
             MenuItem::Close => "Close",
             MenuItem::Settings => "settings",
             MenuItem::Keybinds => "keybinds",
@@ -107,6 +104,56 @@ impl ContextMenu {
     }
 }
 
+/// A section of the settings overlay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
+    /// The focused listener's settings.
+    Listener,
+    Integrations,
+}
+
+impl Section {
+    pub fn label(self) -> &'static str {
+        match self {
+            Section::Listener => "listener",
+            Section::Integrations => "integrations",
+        }
+    }
+}
+
+/// The settings overlay: global settings, plus the focused listener's.
+pub struct AppSettings {
+    pub section: Section,
+    /// The focused listener's settings, if a listener is focused.
+    pub listener: Option<SettingsForm>,
+}
+
+impl AppSettings {
+    /// The sections shown, in tab order.
+    pub fn sections(&self) -> Vec<Section> {
+        match self.listener {
+            Some(_) => vec![Section::Listener, Section::Integrations],
+            None => vec![Section::Integrations],
+        }
+    }
+
+    fn cycle_section(&mut self, delta: isize) {
+        let sections = self.sections();
+        let index = sections
+            .iter()
+            .position(|&section| section == self.section)
+            .unwrap_or(0);
+        self.section = sections[wrap(index, delta, sections.len())];
+    }
+
+    /// The listener's form, while its section is showing.
+    pub fn listener_form(&self) -> Option<&SettingsForm> {
+        self.listener
+            .as_ref()
+            .filter(|_| self.section == Section::Listener)
+    }
+}
+
 pub struct RenameForm {
     pub target: Target,
     pub input: TextInput,
@@ -116,9 +163,10 @@ pub enum Mode {
     Normal,
     Prefix,
     Help,
-    /// settings overlay: for now, its integrations section.
-    AppSettings,
-    /// A listener's settings form.
+    /// The settings overlay.
+    AppSettings(AppSettings),
+    /// The new-listener form. (A listener's own settings are a section of
+    /// the settings overlay.)
     Settings(SettingsForm),
     Menu(ContextMenu),
     Rename(RenameForm),
@@ -137,7 +185,7 @@ impl Mode {
             Mode::Normal
             | Mode::Prefix
             | Mode::Help
-            | Mode::AppSettings
+            | Mode::AppSettings(_)
             | Mode::Settings(_)
             | Mode::Confirm(Confirm::Quit) => None,
         }
@@ -372,8 +420,7 @@ impl App {
             Mode::Normal => self.normal_key(key),
             Mode::Prefix => self.prefix_key(key),
             Mode::Help => {}
-            Mode::AppSettings if key.code == KeyCode::Esc => {}
-            Mode::AppSettings => self.mode = Mode::AppSettings,
+            Mode::AppSettings(settings) => self.app_settings_key(settings, key),
             Mode::Settings(form) => self.settings_key(form, key),
             Mode::Menu(menu) => self.menu_key(menu, key),
             Mode::Rename(form) => self.rename_key(form, key),
@@ -430,8 +477,7 @@ impl App {
             }
             KeyCode::Char('c') => self.open_shell(),
             KeyCode::Char('N') => self.open_new_form(),
-            KeyCode::Char('s') => self.mode = Mode::AppSettings,
-            KeyCode::Char('e') => self.open_settings_form(),
+            KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('n') => self.cycle_tab(1),
             KeyCode::Char('p') => self.cycle_tab(-1),
             KeyCode::Tab => {
@@ -475,20 +521,61 @@ impl App {
         }
     }
 
-    fn settings_key(&mut self, mut form: SettingsForm, key: KeyEvent) {
+    fn settings_key(&mut self, form: SettingsForm, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            return;
+        }
+        if let Some(form) = self.form_key(form, key) {
+            self.mode = Mode::Settings(form);
+        }
+    }
+
+    /// In the settings overlay, tab switches sections; the listener's
+    /// section takes every other key but esc.
+    fn app_settings_key(&mut self, mut settings: AppSettings, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => return,
-            KeyCode::Enter => match form.check(&self.endpoints) {
-                Ok(applied) if self.restart_drops_sessions(form.target, &applied.config) => {
-                    self.mode = Mode::Confirm(Confirm::Restart(form, applied));
+            KeyCode::Tab => settings.cycle_section(1),
+            KeyCode::BackTab => settings.cycle_section(-1),
+            _ if settings.section == Section::Listener => {
+                let Some(form) = settings.listener.take() else {
                     return;
+                };
+                match self.form_key(form, key) {
+                    Some(form) => settings.listener = Some(form),
+                    // Applied, or waiting on a confirmation.
+                    None => return,
                 }
-                Ok(applied) => {
-                    self.apply(form.target, applied);
-                    return;
-                }
-                Err(e) => form.error = Some(e),
-            },
+            }
+            _ => {}
+        }
+        self.mode = Mode::AppSettings(settings);
+    }
+
+    /// Applies `form`, asking first if that drops connections. Returns the
+    /// form if it's still open, with what was wrong.
+    fn submit_form(&mut self, mut form: SettingsForm) -> Option<SettingsForm> {
+        match form.check(&self.endpoints) {
+            Ok(applied) if self.restart_drops_sessions(form.target, &applied.config) => {
+                self.mode = Mode::Confirm(Confirm::Restart(form, applied));
+                None
+            }
+            Ok(applied) => {
+                self.apply(form.target, applied);
+                None
+            }
+            Err(e) => {
+                form.error = Some(e);
+                Some(form)
+            }
+        }
+    }
+
+    /// Edits `form` with `key`; enter submits it. Returns the form if it's
+    /// still open.
+    fn form_key(&mut self, mut form: SettingsForm, key: KeyEvent) -> Option<SettingsForm> {
+        match key.code {
+            KeyCode::Enter => return self.submit_form(form),
             KeyCode::Tab | KeyCode::Down => form.focus_next(1),
             KeyCode::BackTab | KeyCode::Up => form.focus_next(-1),
             KeyCode::Left if form.field == Field::Protocol => form.cycle_protocol(-1),
@@ -511,7 +598,7 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::Settings(form);
+        Some(form)
     }
 
     fn menu_key(&mut self, mut menu: ContextMenu, key: KeyEvent) {
@@ -588,8 +675,13 @@ impl App {
         let left_click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Help => self.mode = Mode::Help,
-            Mode::AppSettings if left_click && self.hits.cancel.contains(pos) => {}
-            Mode::AppSettings => self.mode = Mode::AppSettings,
+            Mode::AppSettings(settings) => {
+                if left_click {
+                    self.app_settings_click(settings, pos);
+                } else {
+                    self.mode = Mode::AppSettings(settings);
+                }
+            }
             Mode::Rename(mut form) => {
                 if left_click && let Some((TextTarget::Rename, cursor)) = self.text_hit(pos) {
                     form.input.set_cursor(cursor);
@@ -624,6 +716,29 @@ impl App {
             .iter()
             .find(|(r, ..)| r.contains(pos))
             .map(|&(r, target, scroll)| (target, scroll + (pos.x - r.x) as usize))
+    }
+
+    /// Its buttons close or apply, its tabs pick a section, and the
+    /// listener's section takes clicks like its form. Other clicks do nothing.
+    fn app_settings_click(&mut self, mut settings: AppSettings, pos: Position) {
+        if self.hits.cancel.contains(pos) {
+            return;
+        }
+        if self.hits.confirm.contains(pos)
+            && let Some(form) = settings.listener.take()
+        {
+            match self.submit_form(form) {
+                Some(form) => settings.listener = Some(form),
+                None => return,
+            }
+        } else if let Some(section) = hit(&self.hits.sections, pos) {
+            settings.section = section;
+        } else if settings.section == Section::Listener
+            && let Some(form) = &mut settings.listener
+        {
+            self.settings_click(form, pos);
+        }
+        self.mode = Mode::AppSettings(settings);
     }
 
     fn settings_click(&self, form: &mut SettingsForm, pos: Position) {
@@ -782,36 +897,18 @@ impl App {
         match (item, menu.target) {
             (MenuItem::Rename, Some(target)) => self.open_rename(target),
             (MenuItem::Close, Some(target)) => self.request_close(target),
-            (MenuItem::ListenerSettings, Some(Target::Endpoint(id))) => {
-                if let Some(listener) = self.endpoint(id).and_then(Endpoint::listener) {
-                    self.mode = Mode::Settings(SettingsForm::edit(id, listener));
-                }
-            }
-            (MenuItem::Settings, _) => self.mode = Mode::AppSettings,
+            (MenuItem::Settings, _) => self.open_settings(),
             (MenuItem::Keybinds, _) => self.mode = Mode::Help,
             (MenuItem::Quit, _) => self.request_quit(),
             _ => {}
         }
     }
 
-    /// A right-click menu at `pos` for `target`. Listeners also have settings.
+    /// A right-click menu at `pos` for `target`.
     fn context_menu(&self, target: Target, pos: Position) -> ContextMenu {
-        let listener = match target {
-            Target::Endpoint(id) => self.endpoint(id).and_then(Endpoint::listener).is_some(),
-            Target::Tab(_) => false,
-        };
-        let items = if listener {
-            vec![
-                MenuItem::Rename,
-                MenuItem::ListenerSettings,
-                MenuItem::Close,
-            ]
-        } else {
-            vec![MenuItem::Rename, MenuItem::Close]
-        };
         ContextMenu {
             target: Some(target),
-            items,
+            items: vec![MenuItem::Rename, MenuItem::Close],
             x: pos.x,
             y: pos.y,
             highlighted: 0,
@@ -1008,13 +1105,17 @@ impl App {
         self.mode = Mode::Settings(SettingsForm::new(&self.endpoints));
     }
 
-    fn open_settings_form(&mut self) {
-        let active = self.endpoints.get(self.active);
-        let form = match active.and_then(|endpoint| Some((endpoint.id, endpoint.listener()?))) {
-            Some((id, listener)) => SettingsForm::edit(id, listener),
-            None => SettingsForm::new(&self.endpoints),
+    /// Opens settings, on the focused listener's section if there is one.
+    fn open_settings(&mut self) {
+        let listener = self
+            .endpoints
+            .get(self.active)
+            .and_then(|endpoint| Some(SettingsForm::edit(endpoint.id, endpoint.listener()?)));
+        let section = match listener {
+            Some(_) => Section::Listener,
+            None => Section::Integrations,
         };
-        self.mode = Mode::Settings(form);
+        self.mode = Mode::AppSettings(AppSettings { section, listener });
     }
 
     /// Whether applying `config` to endpoint `target` would drop open sessions.
@@ -1137,7 +1238,13 @@ impl App {
     fn cancelled(&mut self, confirm: Confirm) {
         match confirm {
             Confirm::Close(_) | Confirm::Quit => {}
-            Confirm::Restart(form, _) => self.mode = Mode::Settings(form),
+            // Only an existing listener restarts, so its form is in settings.
+            Confirm::Restart(form, _) => {
+                self.mode = Mode::AppSettings(AppSettings {
+                    section: Section::Listener,
+                    listener: Some(form),
+                })
+            }
         }
     }
 

@@ -42,8 +42,7 @@ press the prefix twice to send `ctrl+b` itself.
 | --------------- | ------------------------ |
 | `ctrl+b c`      | new shell                |
 | `ctrl+b N`      | new listener             |
-| `ctrl+b s`      | settings (integrations)  |
-| `ctrl+b e`      | listener settings        |
+| `ctrl+b s`      | settings                 |
 | `ctrl+b j / k`  | next / previous endpoint |
 | `ctrl+b n / p`  | next / previous tab      |
 | `ctrl+b X`      | close tab                |
@@ -52,9 +51,9 @@ press the prefix twice to send `ctrl+b` itself.
 | `ctrl+b ?`      | all keybindings          |
 | `ctrl+b q`      | quit                     |
 
-right-click an endpoint or tab to rename or close it (a listener's menu also
-has its settings). **menu**, at the bottom of the sidebar, opens settings,
-keybindings, and quit.
+right-click an endpoint or tab to rename or close it. **menu**, at the bottom
+of the sidebar, opens settings, keybindings, and quit. settings has a
+**listener** tab for the focused listener, and **integrations**.
 
 running `ssh` in a shell tab files that tab under the host it connects to
 until ssh ends. settings lists these integrations: ssh now, netcat later.

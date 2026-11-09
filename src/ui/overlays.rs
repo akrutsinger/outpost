@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 
 use super::{FormHit, Hits, TextTarget, put, render_input};
 use crate::app::{
-    App, CertKind, Confirm, ContextMenu, Endpoint, Field, Kind, RenameForm, SettingsForm, Tab,
-    Target,
+    App, AppSettings, CertKind, Confirm, ContextMenu, Endpoint, Field, Kind, RenameForm,
+    SettingsForm, Tab, Target,
 };
 use crate::detect::Integration;
 use crate::net::{EndpointId, Protocol};
@@ -38,30 +38,53 @@ fn overlay_block(title: &str) -> Block<'_> {
         ))
 }
 
-/// `fingerprint` is the running certificate's, shown for TLS listeners.
+/// The new-listener form.
 pub(super) fn render_settings(
     buf: &mut Buffer,
     area: Rect,
+    form: &SettingsForm,
+    hits: &mut Hits,
+) -> Option<Position> {
+    let rows = form_rows(form, None);
+    let rect = centered(area, 58, rows + 6);
+    Clear.render(rect, buf);
+    let block = overlay_block("new listener");
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    if inner.height < rows + 4 {
+        return None;
+    }
+    let cursor = render_form(buf, inner, form, None, hits);
+    put(
+        buf,
+        inner.x + 1,
+        inner.bottom() - 1,
+        inner.right(),
+        "tab field · ←/→ choose · enter apply · esc cancel",
+        Style::new().fg(OVERLAY0),
+    );
+    cursor
+}
+
+/// How many rows a form's fields (and fingerprint) take.
+fn form_rows(form: &SettingsForm, fingerprint: Option<&str>) -> u16 {
+    let fingerprint = fingerprint.filter(|_| form.protocol.uses_tls());
+    form.fields().len() as u16 + if fingerprint.is_some() { 2 } else { 0 }
+}
+
+/// A listener form's fields from one row into `inner`, then the running
+/// certificate's `fingerprint` (TLS only) and any error. Returns where the
+/// cursor goes.
+fn render_form(
+    buf: &mut Buffer,
+    inner: Rect,
     form: &SettingsForm,
     fingerprint: Option<&str>,
     hits: &mut Hits,
 ) -> Option<Position> {
     let fields = form.fields();
     let fingerprint = fingerprint.filter(|_| form.protocol.uses_tls());
-    let rows = fields.len() as u16 + if fingerprint.is_some() { 2 } else { 0 };
-    let rect = centered(area, 58, rows + 6);
-    Clear.render(rect, buf);
-    let title = if form.target.is_some() {
-        "listener settings"
-    } else {
-        "new listener"
-    };
-    let block = overlay_block(title);
-    let inner = block.inner(rect);
-    block.render(rect, buf);
-    if inner.height < rows + 4 {
-        return None;
-    }
+    let rows = form_rows(form, fingerprint);
 
     let label_style = |field: Field| {
         if form.field == field {
@@ -173,14 +196,6 @@ pub(super) fn render_settings(
             Style::new().fg(RED),
         );
     }
-    put(
-        buf,
-        inner.x + 1,
-        inner.bottom() - 1,
-        right,
-        "tab field · ←/→ choose · enter apply · esc cancel",
-        Style::new().fg(OVERLAY0),
-    );
     cursor
 }
 
@@ -247,18 +262,34 @@ pub(super) fn render_menu(buf: &mut Buffer, area: Rect, menu: &ContextMenu, hits
     }
 }
 
-/// settings overlay: a square panel with section tabs. Its only
-/// section so far lists the integrations, which always run.
-pub(super) fn render_app_settings(buf: &mut Buffer, area: Rect, hits: &mut Hits) {
-    let rect = centered(area, 76.min(area.width.saturating_sub(4)), 14);
+/// The settings overlay: a square panel with section tabs. The focused
+/// listener's settings come first when there is one; integrations, which
+/// always run, are listed with their status.
+pub(super) fn render_app_settings(
+    buf: &mut Buffer,
+    area: Rect,
+    settings: &AppSettings,
+    fingerprint: Option<&str>,
+    hits: &mut Hits,
+) -> Option<Position> {
+    let form = settings.listener_form();
+    let content_height = match form {
+        Some(form) => form_rows(form, fingerprint) + 3,
+        None => 6,
+    };
+    let rect = centered(
+        area,
+        76.min(area.width.saturating_sub(4)),
+        content_height + 8,
+    );
     Clear.render(rect, buf);
     let block = Block::bordered()
         .border_style(Style::new().fg(ACCENT))
         .style(Style::new().bg(PANEL_BG));
     let inner = block.inner(rect);
     block.render(rect, buf);
-    if inner.width < 20 || inner.height < 12 {
-        return;
+    if inner.width < 20 || inner.height < content_height + 6 {
+        return None;
     }
     let bold = Style::new()
         .fg(TEXT)
@@ -266,18 +297,24 @@ pub(super) fn render_app_settings(buf: &mut Buffer, area: Rect, hits: &mut Hits)
         .add_modifier(Modifier::BOLD);
     let quiet = Style::new().fg(OVERLAY1).bg(PANEL_BG);
     put(buf, inner.x, inner.y, inner.right(), " settings", bold);
-    // The section tabs; integrations is the only section so far.
-    put(
-        buf,
-        inner.x,
-        inner.y + 1,
-        inner.right(),
-        " integrations ",
-        Style::new()
-            .fg(PANEL_BG)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    );
+
+    let sections = settings.sections();
+    let mut x = inner.x;
+    for &section in &sections {
+        let label = format!(" {} ", section.label());
+        let style = if section == settings.section {
+            Style::new()
+                .fg(PANEL_BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            quiet
+        };
+        let end = put(buf, x, inner.y + 1, inner.right(), &label, style);
+        hits.sections
+            .push((Rect::new(x, inner.y + 1, end - x, 1), section));
+        x = end + 1;
+    }
     put(
         buf,
         inner.x,
@@ -287,18 +324,81 @@ pub(super) fn render_app_settings(buf: &mut Buffer, area: Rect, hits: &mut Hits)
         Style::new().fg(SURFACE0).bg(PANEL_BG),
     );
 
-    let top = inner.y + 4;
-    put(buf, inner.x, top, inner.right(), "integrations", bold);
+    let content = Rect::new(inner.x, inner.y + 3, inner.width, content_height);
+    let cursor = match form {
+        Some(form) => render_form(buf, content, form, fingerprint, hits),
+        None => {
+            render_integrations(buf, content);
+            None
+        }
+    };
+
+    let hint = match form {
+        Some(_) => " ↑↓ field · ←/→ choose · tab section",
+        None if sections.len() > 1 => " tab section",
+        None => "",
+    };
+    put(buf, inner.x, inner.bottom() - 2, inner.right(), hint, quiet);
+    // Apply only means something for a form; close is always there.
+    let mut labels = vec![" esc close "];
+    if form.is_some() {
+        labels.insert(0, " ↵ apply ");
+    }
+    let width: u16 = labels
+        .iter()
+        .map(|label| label.chars().count() as u16)
+        .sum::<u16>()
+        + 2 * (labels.len() as u16 - 1);
+    let mut x = inner.x + inner.width.saturating_sub(width) / 2;
+    let y = inner.bottom() - 1;
+    for label in labels {
+        let style = if label == " esc close " {
+            Style::new()
+                .fg(TEXT)
+                .bg(SURFACE0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+                .fg(PANEL_BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        };
+        let end = put(buf, x, y, inner.right(), label, style);
+        let button = Rect::new(x, y, end - x, 1);
+        if label == " esc close " {
+            hits.cancel = button;
+        } else {
+            hits.confirm = button;
+        }
+        x = end + 2;
+    }
+    cursor
+}
+
+/// The integrations, which always run, each with its status.
+fn render_integrations(buf: &mut Buffer, area: Rect) {
+    let quiet = Style::new().fg(OVERLAY1).bg(PANEL_BG);
     put(
         buf,
-        inner.x,
-        top + 1,
-        inner.right(),
+        area.x,
+        area.y + 1,
+        area.right(),
+        "integrations",
+        Style::new()
+            .fg(TEXT)
+            .bg(PANEL_BG)
+            .add_modifier(Modifier::BOLD),
+    );
+    put(
+        buf,
+        area.x,
+        area.y + 2,
+        area.right(),
         "a shell running one of these is filed under the host it connects to",
         quiet,
     );
     for (index, integration) in Integration::ALL.iter().enumerate() {
-        let y = top + 3 + index as u16;
+        let y = area.y + 4 + index as u16;
         let (marker, color, status) = if integration.active() {
             ("✓", GREEN, "active")
         } else {
@@ -306,44 +406,22 @@ pub(super) fn render_app_settings(buf: &mut Buffer, area: Rect, hits: &mut Hits)
         };
         put(
             buf,
-            inner.x,
+            area.x,
             y,
-            inner.x + 3,
+            area.x + 3,
             &format!(" {marker}"),
             Style::new().fg(color).bg(PANEL_BG),
         );
         put(
             buf,
-            inner.x + 3,
+            area.x + 3,
             y,
-            inner.x + 14,
+            area.x + 14,
             integration.name(),
             Style::new().fg(SUBTEXT0).bg(PANEL_BG),
         );
-        put(buf, inner.x + 14, y, inner.right(), status, quiet);
+        put(buf, area.x + 14, y, area.right(), status, quiet);
     }
-
-    // lone close button, centered on the bottom row.
-    let label = " esc close ";
-    let width = label.chars().count() as u16;
-    let button = Rect::new(
-        inner.x + inner.width.saturating_sub(width) / 2,
-        inner.bottom() - 1,
-        width,
-        1,
-    );
-    put(
-        buf,
-        button.x,
-        button.y,
-        button.right(),
-        label,
-        Style::new()
-            .fg(TEXT)
-            .bg(SURFACE0)
-            .add_modifier(Modifier::BOLD),
-    );
-    hits.cancel = button;
 }
 
 pub(super) fn render_rename(
@@ -543,8 +621,7 @@ pub(super) fn render_help(buf: &mut Buffer, area: Rect) {
         ("ctrl+b", "prefix"),
         ("prefix c", "new shell"),
         ("prefix N", "new listener"),
-        ("prefix s", "settings (integrations)"),
-        ("prefix e", "listener settings"),
+        ("prefix s", "settings"),
         ("prefix j / k", "next / previous endpoint"),
         ("prefix n / p", "next / previous tab"),
         ("prefix 1..9", "jump to tab"),

@@ -3,7 +3,9 @@
 use super::tabs::wrap;
 use super::*;
 use crate::Event;
-use crate::app::{Confirm, ContextMenu, MenuItem, RenameForm, SettingsForm, Target};
+use crate::app::{
+    AppSettings, Confirm, ContextMenu, MenuItem, RenameForm, Section, SettingsForm, Target,
+};
 use crate::net::NetEvent;
 
 const W: u16 = 120;
@@ -94,7 +96,7 @@ fn failed_listener_shows_error_in_sidebar_and_pane() {
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "   Address already in us");
     row_with(&rows, "could not listen on tcp 0.0.0.0:4444");
-    row_with(&rows, "ctrl+b e to change settings");
+    row_with(&rows, "ctrl+b s to change settings");
 }
 
 #[test]
@@ -159,7 +161,7 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
         cert: "/etc/outpost/server.pem".into(),
         key: "/etc/outpost/server.key".into(),
     };
-    app.mode = Mode::Settings(SettingsForm {
+    let form = SettingsForm {
         target: Some(listener),
         protocol: Protocol::Tls,
         address: "255.255.255.255".into(),
@@ -170,9 +172,16 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
         alpn: "".into(),
         field: Field::Protocol,
         error: Some("key file: no private key found".into()),
+    };
+    app.mode = Mode::AppSettings(AppSettings {
+        section: Section::Listener,
+        listener: Some(form),
     });
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, "╭ listener settings ");
+    // The listener's section of settings, ahead of integrations.
+    row_with(&rows, "│ listener   integrations ");
+    row_with(&rows, " ↵ apply ");
+    row_with(&rows, " esc close ");
     row_with(&rows, "protocol    tcp   udp   tls ");
     row_with(&rows, "cert        self-signed   files ");
     row_with(&rows, "cert file  /etc/outpost/server.pem");
@@ -182,15 +191,15 @@ fn tls_settings_show_every_row_and_the_fingerprint() {
     row_with(&rows, &format!("sha256     {}", groups[..4].join(" ")));
     row_with(&rows, &format!("            {}", groups[4..].join(" ")));
     row_with(&rows, "key file: no private key found");
-    let hint = row_with(&rows, "tab field");
-    assert!(hint.contains("esc cancel"), "hint clipped: {hint:?}");
+    let hint = row_with(&rows, "↑↓ field");
+    assert!(hint.contains("tab section"), "hint clipped: {hint:?}");
 
     // Order: fields, then the fingerprint, then the error, then the hint.
     let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
     assert!(at("protocol") < at("alpn"));
     assert!(at("alpn") < at("sha256"));
     assert!(at("sha256") < at("no private key"));
-    assert!(at("no private key") < at("tab field"));
+    assert!(at("no private key") < at("↑↓ field"));
 }
 
 #[test]
@@ -603,7 +612,10 @@ fn confirms_count_shells_apart_from_connections() {
 #[test]
 fn settings_lists_the_integrations() {
     let (mut app, _rx) = App::test_new();
-    app.mode = Mode::AppSettings;
+    app.mode = Mode::AppSettings(AppSettings {
+        section: Section::Integrations,
+        listener: None,
+    });
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ settings");
     row_with(&rows, "│ integrations ");

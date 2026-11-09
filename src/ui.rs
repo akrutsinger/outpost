@@ -6,7 +6,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Block;
 
-use crate::app::{App, CertKind, Endpoint, Field, Mode, Status};
+use crate::app::{App, CertKind, Endpoint, Field, Mode, Section, Status};
 use crate::net::Protocol;
 use crate::text_input::TextInput;
 use crate::theme::*;
@@ -60,6 +60,8 @@ pub struct Hits {
     pub sidebar_divider: Rect,
     /// The line between the endpoints and sessions sections.
     pub section_divider: Rect,
+    /// The settings overlay's section tabs.
+    pub sections: Vec<(Rect, Section)>,
     /// Menu rows: (row, index into the open menu's items).
     pub menu_items: Vec<(Rect, usize)>,
     /// Settings form targets; buttons come before the rows they sit in.
@@ -70,7 +72,7 @@ pub struct Hits {
     /// button that finishes it.
     pub send_stream: Rect,
     pub finish_stream: Rect,
-    /// Confirmation buttons; `cancel` also closes the settings overlay.
+    /// Confirmation buttons; in the settings overlay, apply and close.
     pub confirm: Rect,
     pub cancel: Rect,
 }
@@ -124,15 +126,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
     match &app.mode {
-        Mode::Settings(form) => {
-            let fingerprint = form
-                .target
-                .and_then(|id| app.endpoint(id))
-                .and_then(Endpoint::listener)
-                .and_then(|listener| listener.tls.as_ref())
-                .map(|tls| tls.fingerprint.as_str());
-            cursor = render_settings(buf, area, form, fingerprint, &mut hits);
-        }
+        Mode::Settings(form) => cursor = render_settings(buf, area, form, &mut hits),
         Mode::Rename(form) => cursor = render_rename(buf, area, form, &mut hits),
         Mode::Confirm(confirm) => {
             render_confirm(buf, area, app, confirm, &mut hits);
@@ -146,9 +140,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_help(buf, area);
             cursor = None;
         }
-        Mode::AppSettings => {
-            render_app_settings(buf, area, &mut hits);
-            cursor = None;
+        Mode::AppSettings(settings) => {
+            // The running certificate's, for a TLS listener's section.
+            let fingerprint = settings
+                .listener_form()
+                .and_then(|form| form.target)
+                .and_then(|id| app.endpoint(id))
+                .and_then(Endpoint::listener)
+                .and_then(|listener| listener.tls.as_ref())
+                .map(|tls| tls.fingerprint.as_str());
+            cursor = render_app_settings(buf, area, settings, fingerprint, &mut hits);
         }
         Mode::Normal | Mode::Prefix => {}
     }

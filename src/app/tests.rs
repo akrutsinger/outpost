@@ -81,9 +81,11 @@ fn incoming(app: &App, listener: usize, tab: usize) -> Vec<String> {
         .collect()
 }
 
+/// The new-listener form, or the listener section of settings.
 fn form(app: &App) -> &SettingsForm {
     match &app.mode {
         Mode::Settings(form) => form,
+        Mode::AppSettings(settings) => settings.listener_form().expect("listener section showing"),
         _ => panic!("settings form is not open"),
     }
 }
@@ -455,7 +457,7 @@ fn duplicate_listener_is_rejected() {
 fn settings_without_changes_leave_the_listener_alone() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
-    prefix(&mut app, 'e');
+    prefix(&mut app, 's');
     assert_eq!(form(&app).port, "4444");
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
@@ -566,8 +568,8 @@ fn clicking_new_or_a_listeners_settings_opens_the_form() {
     assert_eq!(form(&app).target, None);
     key(&mut app, KeyCode::Esc);
 
-    // A listener's settings are in its right-click menu.
-    menu_pick(&mut app, 0, MenuItem::ListenerSettings);
+    // A listener's settings are a section of settings.
+    global_menu_pick(&mut app, MenuItem::Settings);
     assert_eq!(form(&app).target, Some(app.endpoints[0].id));
     assert_eq!(form(&app).protocol, Protocol::Udp);
 }
@@ -725,10 +727,8 @@ fn menu_works_from_the_keyboard() {
     let (mut app, ids) = three_listeners();
     let (row, _) = app.hits.endpoints[2];
     right_click(&mut app, row);
-    // A listener's menu: Rename, Settings, Close.
     key(&mut app, KeyCode::Down);
     assert_eq!(menu(&app).highlighted, 1);
-    key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     assert_eq!(menu(&app).highlighted, 0, "wraps");
     key(&mut app, KeyCode::Up);
@@ -837,7 +837,7 @@ fn clicks_outside_the_form_are_ignored() {
     let (mut app, _rx) = App::test_new();
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     render_rows(&mut app, 120, 32);
-    prefix(&mut app, 'e');
+    prefix(&mut app, 's');
     render_rows(&mut app, 120, 32);
     let new = app.hits.new_listener;
     click(&mut app, new);
@@ -892,9 +892,9 @@ fn cancelling_the_confirmation_keeps_everything() {
 
 /// Opens settings for the active listener and changes its port to `port`.
 fn change_port(app: &mut App, port: &str) {
-    prefix(app, 'e');
-    key(app, KeyCode::Tab); // -> address
-    key(app, KeyCode::Tab); // -> port
+    prefix(app, 's');
+    key(app, KeyCode::Down); // -> address
+    key(app, KeyCode::Down); // -> port
     for _ in 0..5 {
         key(app, KeyCode::Backspace);
     }
@@ -945,7 +945,8 @@ async fn restart_confirmation_buttons_work_with_the_mouse() {
     render_rows(&mut app, 120, 32);
     let cancel = app.hits.cancel;
     click(&mut app, cancel);
-    assert!(matches!(app.mode, Mode::Settings(_)));
+    // Back to the listener's section of settings.
+    assert_eq!(form(&app).port, "0");
 
     key(&mut app, KeyCode::Enter);
     render_rows(&mut app, 120, 32);
@@ -971,7 +972,7 @@ async fn settings_that_keep_connections_apply_without_asking() {
     let udp = app.add_test_listener(Protocol::Udp, "127.0.0.1:5555");
     let (_b, _out_b) = app.add_test_session(udp, "10.0.0.5:1000");
     app.active = 1;
-    prefix(&mut app, 'e');
+    prefix(&mut app, 's');
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
     assert!(app.test_session(1, 0).is_open());
@@ -1563,9 +1564,9 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
     let original = fingerprint(&app);
 
     // A new port restarts the listener on the same certificate.
-    prefix(&mut app, 'e');
-    key(&mut app, KeyCode::Tab); // -> address
-    key(&mut app, KeyCode::Tab); // -> port
+    prefix(&mut app, 's');
+    key(&mut app, KeyCode::Down); // -> address
+    key(&mut app, KeyCode::Down); // -> port
     for _ in 0..5 {
         key(&mut app, KeyCode::Backspace);
     }
@@ -1577,9 +1578,9 @@ async fn tls_edits_keep_the_certificate_unless_tls_settings_change() {
     assert_eq!(fingerprint(&app), original);
 
     // Changing ALPN builds a new one.
-    prefix(&mut app, 'e');
+    prefix(&mut app, 's');
     for _ in 0..4 {
-        key(&mut app, KeyCode::Tab); // -> alpn
+        key(&mut app, KeyCode::Down); // -> alpn
     }
     type_str(&mut app, "h2");
     key(&mut app, KeyCode::Enter);
@@ -1597,7 +1598,7 @@ fn settings_show_a_tls_listener_as_configured() {
         },
         alpn: vec!["h2".into(), "http/1.1".into()],
     };
-    prefix(&mut app, 'e');
+    prefix(&mut app, 's');
     let form = form(&app);
     assert_eq!(form.protocol, Protocol::Tls);
     assert_eq!(form.cert, CertKind::Files);
@@ -1932,7 +1933,7 @@ async fn switching_tls_to_quic_keeps_the_certificate() {
     app.handle(ev);
     let original = fingerprint(&app);
 
-    prefix(&mut app, 'e');
+    prefix(&mut app, 's');
     key(&mut app, KeyCode::Right); // tls -> quic
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal));
@@ -2260,13 +2261,13 @@ fn global_menu_pick(app: &mut App, item: MenuItem) {
 fn prefix_s_opens_settings_until_esc_or_close() {
     let (mut app, _rx) = App::test_new();
     prefix(&mut app, 's');
-    assert!(matches!(app.mode, Mode::AppSettings));
+    assert!(matches!(app.mode, Mode::AppSettings(_)));
     // Nothing else dismisses it: not other keys, not stray clicks.
     type_str(&mut app, "q");
     key(&mut app, KeyCode::Enter);
     render_rows(&mut app, 120, 32);
     click(&mut app, Rect::new(0, 0, 1, 1));
-    assert!(matches!(app.mode, Mode::AppSettings));
+    assert!(matches!(app.mode, Mode::AppSettings(_)));
     key(&mut app, KeyCode::Esc);
     assert!(matches!(app.mode, Mode::Normal));
 
@@ -2281,7 +2282,7 @@ fn prefix_s_opens_settings_until_esc_or_close() {
 fn the_global_menu_opens_settings_keybinds_and_quits() {
     let (mut app, _rx) = App::test_new();
     global_menu_pick(&mut app, MenuItem::Settings);
-    assert!(matches!(app.mode, Mode::AppSettings));
+    assert!(matches!(app.mode, Mode::AppSettings(_)));
     key(&mut app, KeyCode::Esc);
 
     global_menu_pick(&mut app, MenuItem::Keybinds);
@@ -2300,23 +2301,72 @@ fn the_global_menu_opens_settings_keybinds_and_quits() {
 }
 
 #[test]
-fn only_listener_menus_have_settings() {
+fn settings_has_a_listener_section_only_for_a_focused_listener() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_terminal();
+    let web = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    // A shell is focused: integrations only.
+    app.active = 0;
+    prefix(&mut app, 's');
+    let Mode::AppSettings(settings) = &app.mode else {
+        panic!("settings is not open");
+    };
+    assert_eq!(settings.sections(), [Section::Integrations]);
+    key(&mut app, KeyCode::Tab);
+    assert!(matches!(&app.mode, Mode::AppSettings(s) if s.section == Section::Integrations));
+    key(&mut app, KeyCode::Esc);
+
+    // A listener is focused: its section comes first and opens.
+    app.active = 1;
+    prefix(&mut app, 's');
+    assert_eq!(form(&app).target, Some(web));
+    key(&mut app, KeyCode::Tab);
+    assert!(matches!(&app.mode, Mode::AppSettings(s) if s.section == Section::Integrations));
+    key(&mut app, KeyCode::BackTab);
+    assert_eq!(form(&app).target, Some(web));
+}
+
+#[tokio::test]
+async fn settings_tabs_and_buttons_work_with_the_mouse() {
+    let (mut app, _rx) = App::test_new();
+    app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    prefix(&mut app, 's');
+    render_rows(&mut app, 120, 32);
+    let (integrations, _) = app.hits.sections[1];
+    click(&mut app, integrations);
+    assert!(matches!(&app.mode, Mode::AppSettings(s) if s.section == Section::Integrations));
+    render_rows(&mut app, 120, 32);
+    let (listener, _) = app.hits.sections[0];
+    click(&mut app, listener);
+    render_rows(&mut app, 120, 32);
+
+    // Apply with no port keeps it open with the error; a good one closes it.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    for _ in 0..4 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    let apply = app.hits.confirm;
+    click(&mut app, apply);
+    assert_eq!(form(&app).error.as_deref(), Some("invalid port"));
+    type_str(&mut app, "0");
+    render_rows(&mut app, 120, 32);
+    let apply = app.hits.confirm;
+    click(&mut app, apply);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(matches!(app.test_listener(0).state, ListenState::Binding));
+}
+
+#[test]
+fn endpoint_and_tab_menus_are_rename_and_close() {
     let (mut app, _rx) = App::test_new();
     app.add_test_terminal();
     app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
     render_rows(&mut app, 120, 32);
-    let (local, _) = app.hits.endpoints[0];
-    right_click(&mut app, local);
-    assert_eq!(menu(&app).items, [MenuItem::Rename, MenuItem::Close]);
-    key(&mut app, KeyCode::Esc);
-    let (listener, _) = app.hits.endpoints[1];
-    right_click(&mut app, listener);
-    assert_eq!(
-        menu(&app).items,
-        [
-            MenuItem::Rename,
-            MenuItem::ListenerSettings,
-            MenuItem::Close
-        ]
-    );
+    for index in 0..2 {
+        let (row, _) = app.hits.endpoints[index];
+        right_click(&mut app, row);
+        assert_eq!(menu(&app).items, [MenuItem::Rename, MenuItem::Close]);
+        key(&mut app, KeyCode::Esc);
+    }
 }

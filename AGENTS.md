@@ -82,10 +82,11 @@ Adapt, don't copy wholesale: outpost is a much smaller program.
   - `ui/sidebar.rs`: endpoints over sessions, and the dividers.
   - `ui/tabs.rs`: the tab bar (with herdr's `+`, which opens a shell) and the
     focused tab: a transcript and input, or a terminal's screen.
-  - `ui/overlays.rs`: settings (`render_app_settings`, herdr's overlay with
-    an integrations section), listener settings form, menus (right-click and
-    herdr's global menu above the footer's `menu`), rename, confirmation,
-    help (`render_help`).
+  - `ui/overlays.rs`: settings (`render_app_settings`: the focused
+    listener's section and integrations), the new-listener form (both draw
+    a listener's fields with `render_form`), menus (right-click and herdr's
+    global menu above the footer's `menu`), rename, confirmation, help
+    (`render_help`).
 - `src/text_input.rs`: single-line text with a movable cursor, used by every
   editable field.
 
@@ -99,15 +100,15 @@ outpost is mouse-first, like herdr. Every new feature should work with both
 mouse and keyboard, and reuse the existing patterns instead of inventing new
 ones:
 
-- **Forms** (new listener, listener settings, rename): rounded accent border
-  with a title. Clicking a field focuses it; clicking inside text places the cursor.
+- **Forms** (new listener, rename): rounded accent border with a title. Clicking a field focuses it; clicking inside text places the cursor.
 - **Right-click menus**: square accent border, opened at the click and kept on
   screen, hover highlights, ↑/↓/Enter/Esc. Any click outside dismisses without
-  passing through. Endpoints and tabs have menus (a listener's adds
-  Settings); the sessions list does not. herdr's global menu (settings,
+  passing through. Endpoints and tabs have menus; the sessions list does not. herdr's global menu (settings,
   keybinds, quit) is the same kind of menu, opened above the footer's `menu`.
-- **Settings** (`prefix s`): herdr's square panel with section tabs; for now
-  only integrations, listed with a status. Only esc or its button closes it.
+- **Settings** (`prefix s`): herdr's square panel with section tabs: the
+  focused listener's settings (only when a listener is focused, and opened
+  first) and integrations, listed with a status. Tab switches sections and
+  ↑/↓ move between fields; only esc or its close button closes it.
 - **Confirmations**: herdr's red square box, title + one detail line, centered
   `↵ confirm` / `esc cancel` buttons. Other keys and stray clicks are ignored.
   Ask before any action that drops live connections; skip asking otherwise.

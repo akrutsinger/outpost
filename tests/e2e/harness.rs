@@ -24,6 +24,7 @@ pub const ENTER: &str = "\r";
 pub const TAB: &str = "\t";
 pub const ESC: &str = "\x1b";
 pub const BACKSPACE: &str = "\x7f";
+pub const DOWN: &str = "\x1b[B";
 pub const LEFT: &str = "\x1b[D";
 pub const RIGHT: &str = "\x1b[C";
 
