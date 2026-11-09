@@ -5,7 +5,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use super::{Hits, human, put, put_right, status_glyph};
-use crate::app::{App, Kind, ListenState, Tab, Target};
+use crate::app::{App, Endpoint, Kind, ListenState, Tab, Target};
+use crate::detect::Destination;
 use crate::theme::*;
 
 const ENDPOINT_HEADER_ROWS: u16 = 2;
@@ -118,6 +119,19 @@ fn render_endpoints(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         let secondary = Style::new().fg(if focused { MAUVE } else { OVERLAY0 });
         let (detail, style) = match &endpoint.kind {
             Kind::Local => (format!("{} open", endpoint.open_count()), secondary),
+            Kind::Ssh(dest) => {
+                // The address matters more than the count, which the status
+                // glyph and the sessions list show too: drop the count first.
+                let host = host_port(dest);
+                let with_count = format!("{host} · {} open", endpoint.open_count());
+                let room = right.saturating_sub(rect.x + 3) as usize;
+                let detail = if with_count.chars().count() <= room {
+                    with_count
+                } else {
+                    shorten(&host, room)
+                };
+                (detail, secondary)
+            }
             Kind::Listener(listener) => match &listener.state {
                 ListenState::Failed(error) => (error.clone(), Style::new().fg(RED)),
                 ListenState::Binding => ("binding…".to_string(), secondary),
@@ -189,14 +203,17 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
         " sessions",
         header_style(),
     );
-    // Connections only: shells aren't sessions.
     let open = app
         .endpoints
         .iter()
-        .flat_map(|endpoint| &endpoint.tabs)
-        .filter_map(Tab::session)
-        .filter(|s| s.is_open())
-        .count();
+        .map(|endpoint| {
+            endpoint
+                .tabs
+                .iter()
+                .filter(|tab| is_connection(endpoint, tab))
+                .count()
+        })
+        .sum::<usize>();
     put_right(
         buf,
         area,
@@ -228,12 +245,11 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
 
     let mut y = body.y;
     for (endpoint_index, endpoint) in app.endpoints.iter().enumerate() {
-        for (tab, s) in endpoint
+        for (tab, t) in endpoint
             .tabs
             .iter()
             .enumerate()
-            .filter_map(|(tab, t)| Some((tab, t.session()?)))
-            .filter(|(_, s)| s.is_open())
+            .filter(|(_, t)| is_connection(endpoint, t))
         {
             if y + 2 > body.bottom() {
                 return;
@@ -243,7 +259,7 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             if focused {
                 buf.set_style(rect, Style::new().bg(ACTIVE_ROW_BG));
             }
-            let status = s.status();
+            let status = t.status();
             let (icon, color) = status_glyph(status);
             let state = status.text();
             let right = rect.right().saturating_sub(1);
@@ -258,12 +274,15 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
                 &format!("{icon} "),
                 Style::new().fg(color),
             );
-            put(buf, x, y, right, &s.label(), name_style);
+            put(buf, x, y, right, &t.label(), name_style);
             // Status sits on the second row: a full IPv4 peer barely fits the first.
             let state_x = right.saturating_sub(state.len() as u16);
             let detail_right = state_x.saturating_sub(1);
             // Shorten the endpoint label first so the byte count stays visible.
-            let bytes = format!(" · ↓{}", human(s.bytes_in));
+            let bytes = match t.session() {
+                Some(s) => format!(" · ↓{}", human(s.bytes_in)),
+                None => String::new(),
+            };
             let room = detail_right.saturating_sub(rect.x + 3) as usize;
             let label = shorten(
                 &endpoint.label(),
@@ -281,6 +300,21 @@ fn render_sessions(buf: &mut Buffer, area: Rect, app: &App, hits: &mut Hits) {
             hits.sessions.push((rect, (endpoint_index, tab)));
             y += 2;
         }
+    }
+}
+
+/// Whether `tab` is a live connection: a session, or a shell on another
+/// machine. Shells on this one aren't.
+fn is_connection(endpoint: &Endpoint, tab: &Tab) -> bool {
+    tab.is_open() && (tab.session().is_some() || matches!(endpoint.kind, Kind::Ssh(_)))
+}
+
+/// A host and its port, leaving out ssh's default.
+pub(super) fn host_port(dest: &Destination) -> String {
+    if dest.port == 22 {
+        dest.host.clone()
+    } else {
+        format!("{}:{}", dest.host, dest.port)
     }
 }
 

@@ -113,6 +113,20 @@ impl Pty {
         }
     }
 
+    /// The arguments of the command in the foreground: the shell itself, or
+    /// whatever it is running. `None` if there's no program or it's gone.
+    pub fn foreground(&self) -> Option<Vec<String>> {
+        let pid = self.process.as_ref()?.master.process_group_leader()?;
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        // Each argument ends in a NUL.
+        let args = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline);
+        Some(
+            args.split(|&byte| byte == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect(),
+        )
+    }
+
     /// The program exited and was reaped, so dropping the PTY must not
     /// signal its PID, which may already belong to another process.
     pub fn exited(&mut self) {
@@ -223,6 +237,26 @@ mod tests {
         assert!(output.contains("got:ping"), "{output:?}");
         assert!(output.contains("30 100"), "{output:?}");
         assert_eq!(status, "exited 0");
+    }
+
+    #[tokio::test]
+    async fn foreground_is_the_running_command() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pty = Pty::spawn(1, sh("echo ready; exec sleep 30"), 24, 80, tx).unwrap();
+        match timeout(WAIT, rx.recv()).await {
+            Ok(Some(Event::Pty(PtyEvent::Output { .. }))) => {}
+            _ => panic!("expected output first"),
+        }
+        // `exec` replaces the shell a moment after it prints.
+        let deadline = std::time::Instant::now() + WAIT;
+        while pty.foreground().as_deref() != Some(&["sleep".to_string(), "30".to_string()][..]) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreground is {:?}",
+                pty.foreground()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

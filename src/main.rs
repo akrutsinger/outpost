@@ -1,4 +1,5 @@
 mod app;
+mod detect;
 mod net;
 mod pty;
 mod text_input;
@@ -6,18 +7,25 @@ mod theme;
 mod ui;
 
 use std::io::{self, stdout};
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+/// How often terminal tabs are checked for what they're connected to.
+const DETECT_EVERY: Duration = Duration::from_millis(500);
+
 /// Everything the main loop reacts to: terminal input, network activity,
-/// and the programs in terminal tabs.
+/// the programs in terminal tabs, and detecting what those connect to.
 pub enum Event {
     Input(event::Event),
     Net(net::NetEvent),
     Pty(pty::PtyEvent),
+    /// Time to check terminal tabs' foreground commands.
+    Tick,
+    Resolved(detect::Resolved),
 }
 
 #[tokio::main]
@@ -29,6 +37,17 @@ async fn main() -> io::Result<()> {
     std::thread::spawn(move || {
         while let Ok(ev) = event::read() {
             if input_tx.send(Event::Input(ev)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let tick_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(DETECT_EVERY);
+        loop {
+            ticks.tick().await;
+            if tick_tx.send(Event::Tick).is_err() {
                 break;
             }
         }

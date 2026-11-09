@@ -12,6 +12,7 @@ use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Event;
+use crate::detect::{self, Resolved};
 use crate::net::{self, EndpointId, NetEvent, Outlet, SessId};
 use crate::pty::{self, Pty, PtyEvent};
 use crate::text_input::TextInput;
@@ -178,6 +179,8 @@ impl App {
             Event::Input(_) => {}
             Event::Net(ev) => self.on_net(ev),
             Event::Pty(ev) => self.on_pty(ev),
+            Event::Tick => self.detect(),
+            Event::Resolved(resolved) => self.on_resolved(resolved),
         }
         // Whatever is on screen has been seen.
         if let Some(tab) = self.focused_tab_mut() {
@@ -787,10 +790,19 @@ impl App {
         self.add_terminal(Terminal::new(id, pty::shell_name(), pty, rows, cols));
     }
 
-    /// Adds a terminal tab to the local endpoint, which comes first in the
-    /// sidebar and exists once there is a shell, and focuses it.
+    /// Adds a terminal tab to the local endpoint and focuses it.
     fn add_terminal(&mut self, terminal: Terminal) {
-        let index = match self
+        let index = self.local_index();
+        let endpoint = &mut self.endpoints[index];
+        endpoint.tabs.push(Tab::Terminal(terminal));
+        endpoint.active_tab = endpoint.tabs.len() - 1;
+        self.active = index;
+    }
+
+    /// The local endpoint, which comes first in the sidebar, created if
+    /// there isn't one yet.
+    fn local_index(&mut self) -> usize {
+        match self
             .endpoints
             .iter()
             .position(|endpoint| matches!(endpoint.kind, Kind::Local))
@@ -800,11 +812,103 @@ impl App {
                 self.endpoints.insert(0, Endpoint::new_local());
                 0
             }
-        };
-        let endpoint = &mut self.endpoints[index];
-        endpoint.tabs.push(Tab::Terminal(terminal));
-        endpoint.active_tab = endpoint.tabs.len() - 1;
-        self.active = index;
+        }
+    }
+
+    /// The host endpoint for the machine `dest` names, created if there
+    /// isn't one yet.
+    fn ssh_index(&mut self, dest: &detect::Destination) -> usize {
+        let existing = self.endpoints.iter().position(
+            |endpoint| matches!(&endpoint.kind, Kind::Ssh(host) if host.same_machine(dest)),
+        );
+        existing.unwrap_or_else(|| {
+            self.endpoints.push(Endpoint::new_ssh(dest.clone()));
+            self.endpoints.len() - 1
+        })
+    }
+
+    /// Checks what each shell is running, starts working out where newly
+    /// recognized commands connect, and files the shells accordingly.
+    fn detect(&mut self) {
+        let mut new = Vec::new();
+        for t in self
+            .endpoints
+            .iter_mut()
+            .flat_map(|endpoint| endpoint.tabs.iter_mut())
+            .filter_map(Tab::terminal_mut)
+        {
+            if let Some((integration, argv)) = t.poll() {
+                new.push((t.id, integration, argv));
+            }
+        }
+        for (tab, integration, argv) in new {
+            detect::spawn_resolve(tab, integration, argv, self.events.clone());
+        }
+        self.place_terminals();
+    }
+
+    fn on_resolved(&mut self, Resolved { tab, argv, dest }: Resolved) {
+        if let Some(t) = self.terminal_mut(tab) {
+            t.resolved(&argv, dest);
+            self.place_terminals();
+        }
+    }
+
+    /// Moves each running shell under the host it's connected to, or back to
+    /// local, then drops host endpoints with no shells left. Focus follows
+    /// the focused tab, and otherwise stays on the same endpoint.
+    fn place_terminals(&mut self) {
+        let mut moves = Vec::new();
+        for endpoint in &self.endpoints {
+            for t in endpoint.tabs.iter().filter_map(|tab| match tab {
+                Tab::Terminal(t) if t.is_open() => Some(t),
+                _ => None,
+            }) {
+                let placed = match (&endpoint.kind, t.destination()) {
+                    (Kind::Local, None) => true,
+                    (Kind::Ssh(host), Some(dest)) => host.same_machine(dest),
+                    _ => false,
+                };
+                if !placed {
+                    moves.push((t.id, t.destination().cloned()));
+                }
+            }
+        }
+        if moves.is_empty() {
+            return;
+        }
+
+        let focused_tab = self.focused_tab_mut().map(|tab| tab.id());
+        let focused_endpoint = self.endpoints.get(self.active).map(|endpoint| endpoint.id);
+        for (id, dest) in moves {
+            let Some(tab) = self
+                .locate_tab(id)
+                .and_then(|(endpoint, index)| self.take_tab(endpoint, index))
+            else {
+                continue;
+            };
+            let index = match &dest {
+                Some(dest) => self.ssh_index(dest),
+                None => self.local_index(),
+            };
+            let endpoint = &mut self.endpoints[index];
+            endpoint.tabs.push(tab);
+            if Some(id) == focused_tab {
+                endpoint.active_tab = endpoint.tabs.len() - 1;
+            }
+        }
+        self.endpoints
+            .retain(|endpoint| !matches!(endpoint.kind, Kind::Ssh(_)) || !endpoint.tabs.is_empty());
+
+        if let Some((endpoint, tab)) = focused_tab.and_then(|id| self.locate_tab(id)) {
+            self.active = endpoint;
+            self.endpoints[endpoint].active_tab = tab;
+        } else if let Some(index) = focused_endpoint
+            .and_then(|id| self.endpoints.iter().position(|endpoint| endpoint.id == id))
+        {
+            self.active = index;
+        }
+        self.active = self.active.min(self.endpoints.len().saturating_sub(1));
     }
 
     /// Sizes every terminal tab to `area`, the pane inside its border. Every
@@ -893,22 +997,26 @@ impl App {
         }
     }
 
-    /// Disconnects (if still open) and removes a tab, keeping focus on
-    /// the same tab when another one is removed.
+    /// Disconnects (if still open) and removes a tab.
     fn remove_tab(&mut self, endpoint: usize, index: usize) {
-        let Some(endpoint) = self.endpoints.get_mut(endpoint) else {
-            return;
-        };
+        self.take_tab(endpoint, index);
+    }
+
+    /// Takes a tab out of its endpoint, keeping that endpoint on the same
+    /// tab when another one goes.
+    fn take_tab(&mut self, endpoint: usize, index: usize) -> Option<Tab> {
+        let endpoint = self.endpoints.get_mut(endpoint)?;
         if index >= endpoint.tabs.len() {
-            return;
+            return None;
         }
-        endpoint.tabs.remove(index);
+        let tab = endpoint.tabs.remove(index);
         if index < endpoint.active_tab {
             endpoint.active_tab -= 1;
         }
         endpoint.active_tab = endpoint
             .active_tab
             .min(endpoint.tabs.len().saturating_sub(1));
+        Some(tab)
     }
 
     /// Closes an endpoint or tab, asking first if that would drop live connections.
@@ -1060,6 +1168,13 @@ impl App {
         let (rows, cols) = self.terminal_size;
         self.add_terminal(Terminal::new(id, "sh".into(), Ok(pty), rows, cols));
         (id, rx)
+    }
+
+    /// Has the shell in `tab` run `argv`, as the next check would see it.
+    pub fn test_observe(&mut self, tab: SessId, argv: Vec<String>) {
+        if let Some(t) = self.terminal_mut(tab) {
+            t.observe(Some(argv));
+        }
     }
 
     /// Like [`App::add_test_session`] for a QUIC connection: the receiver gets

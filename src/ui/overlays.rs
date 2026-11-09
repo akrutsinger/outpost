@@ -302,6 +302,7 @@ pub(super) fn render_confirm(
     let noun = |endpoint: &Endpoint| match endpoint.kind {
         Kind::Listener(_) => "open connection",
         Kind::Local => "running shell",
+        Kind::Ssh(_) => "ssh session",
     };
     // e.g. `web (tcp :4444)` and `2 open connections`.
     let describe = |endpoint: &Endpoint| {
@@ -316,6 +317,8 @@ pub(super) fn render_confirm(
         Confirm::Close(Target::Endpoint(id)) => {
             let title = match app.endpoint(id).map(|endpoint| &endpoint.kind) {
                 Some(Kind::Local) => " Close all shells?",
+                // Its tabs are local shells, which close with it.
+                Some(Kind::Ssh(_)) => " Close host and its shells?",
                 _ => " Close listener?",
             };
             endpoint(id).map(|(who, open)| (title, format!(" {who} has {open}.")))
@@ -340,7 +343,7 @@ pub(super) fn render_confirm(
                 _ => {
                     // e.g. `3 open connections and 1 running shell`.
                     let mut parts = Vec::new();
-                    for what in ["open connection", "running shell"] {
+                    for what in ["open connection", "ssh session", "running shell"] {
                         let open: usize = live
                             .iter()
                             .filter(|endpoint| noun(endpoint) == what)

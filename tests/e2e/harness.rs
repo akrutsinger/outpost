@@ -18,6 +18,7 @@ const SIZE: (NonZeroU16, NonZeroU16) = match (NonZeroU16::new(ROWS), NonZeroU16:
 pub const WAIT: Duration = Duration::from_secs(5);
 
 pub const CTRL_B: &str = "\x02";
+pub const CTRL_C: &str = "\x03";
 pub const CTRL_D: &str = "\x04";
 pub const ENTER: &str = "\r";
 pub const TAB: &str = "\t";

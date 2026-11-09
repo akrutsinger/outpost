@@ -1,5 +1,5 @@
-//! Terminal tabs: a shell in a PTY, the screen it draws, and turning keys
-//! into the bytes a terminal would send.
+//! Terminal tabs: a shell in a PTY, the screen it draws, what its foreground
+//! command connects to, and turning keys into the bytes a terminal sends.
 
 use std::io;
 use std::num::NonZeroU16;
@@ -7,6 +7,7 @@ use std::num::NonZeroU16;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::Status;
+use crate::detect::{self, Destination, Integration};
 use crate::net::SessId;
 use crate::pty::Pty;
 
@@ -22,6 +23,10 @@ pub struct Terminal {
     pty: Option<Pty>,
     /// How the shell ended, once it has.
     pub exit: Option<String>,
+    /// The foreground command when last checked.
+    foreground: Option<Vec<String>>,
+    /// Where that command connects, once an integration has worked it out.
+    dest: Option<Destination>,
 }
 
 impl Terminal {
@@ -46,6 +51,8 @@ impl Terminal {
             unread: false,
             pty,
             exit,
+            foreground: None,
+            dest: None,
         }
     }
 
@@ -54,11 +61,51 @@ impl Terminal {
     }
 
     pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.shell.clone())
+        self.name.clone().unwrap_or_else(|| self.default_label())
     }
 
+    /// The shell's name, or the user it's logged in as on another machine
+    /// (the host endpoint names the machine).
     pub(super) fn default_label(&self) -> String {
-        self.shell.clone()
+        match &self.dest {
+            Some(dest) => dest.user.clone(),
+            None => self.shell.clone(),
+        }
+    }
+
+    /// The machine this shell is connected to, if it's running a command an
+    /// integration recognized and resolved.
+    pub fn destination(&self) -> Option<&Destination> {
+        self.dest.as_ref()
+    }
+
+    /// Checks the foreground command. Returns a new command for an
+    /// integration to resolve.
+    pub(super) fn poll(&mut self) -> Option<(Integration, Vec<String>)> {
+        let foreground = self.pty.as_ref().and_then(Pty::foreground);
+        self.observe(foreground)
+    }
+
+    /// Records `foreground` as the running command; a different one forgets
+    /// where the last one was connected.
+    pub(super) fn observe(
+        &mut self,
+        foreground: Option<Vec<String>>,
+    ) -> Option<(Integration, Vec<String>)> {
+        if foreground == self.foreground {
+            return None;
+        }
+        self.foreground = foreground;
+        self.dest = None;
+        let argv = self.foreground.clone()?;
+        Some((detect::recognize(&argv)?, argv))
+    }
+
+    /// Where `argv` connects, unless the shell has moved on to another command.
+    pub(super) fn resolved(&mut self, argv: &[String], dest: Option<Destination>) {
+        if self.foreground.as_deref() == Some(argv) {
+            self.dest = dest;
+        }
     }
 
     pub fn status(&self) -> Status {

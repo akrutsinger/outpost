@@ -609,3 +609,91 @@ fn settings_button_shows_only_for_listeners() {
     render_rows(&mut app, W, H);
     assert_eq!(app.hits.settings.width, 0);
 }
+
+/// Files the shell in `tab` under a host, as detection would: the shell
+/// runs `ssh <alias>`, which resolves to `addr:port`.
+fn ssh_to(app: &mut App, tab: crate::net::SessId, alias: &str, addr: &str, port: u16) {
+    let argv = vec!["ssh".to_string(), alias.to_string()];
+    app.test_observe(tab, argv.clone());
+    app.handle(Event::Resolved(crate::detect::Resolved {
+        tab,
+        argv,
+        dest: Some(crate::detect::Destination {
+            alias: alias.into(),
+            user: "root".into(),
+            host: addr.into(),
+            port,
+        }),
+    }));
+}
+
+#[test]
+fn a_shell_on_a_host_shows_under_it_and_as_a_session() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    ssh_to(&mut app, tab, "proxmox", "192.168.12.69", 22);
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, "proxmox");
+    // A whole address leaves no room for the count.
+    let detail = row_with(&rows, "   192.168.12.69");
+    assert!(
+        !detail.contains('…') && !detail.contains("1 open"),
+        "{detail:?}"
+    );
+    // The local endpoint stays, now with nothing open.
+    row_with(&rows, "0 open");
+    // A shell on another machine is a connection.
+    row_with(&rows, "1 open");
+    row_with(&rows, "root");
+    assert!(
+        rows[0].contains(" root "),
+        "tab named for the user: {:?}",
+        rows[0]
+    );
+    assert!(rows[0].contains("ssh 192.168.12.69"), "{:?}", rows[0]);
+    row_with(&rows, "╭ root ");
+}
+
+#[test]
+fn a_host_row_keeps_the_whole_address_over_the_open_count() {
+    let (mut app, _rx) = App::test_new();
+    let (short, _a) = app.add_test_terminal();
+    ssh_to(&mut app, short, "nas", "10.0.0.2", 22);
+    let rows = render_rows(&mut app, W, H);
+    // A short address has room for the count.
+    row_with(&rows, "   10.0.0.2 · 1 open");
+
+    // The longest IPv4 address and port fit exactly, without the count.
+    let (long, _b) = app.add_test_terminal();
+    ssh_to(
+        &mut app,
+        long,
+        "edge-router-with-a-long-name",
+        "255.255.255.255",
+        65535,
+    );
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, " 3 edge-router-with-a-lo");
+    let detail = row_with(&rows, "   255.255.255.255:65535");
+    assert!(
+        !detail.contains('…') && !detail.contains("open"),
+        "{detail:?}"
+    );
+    assert!(
+        rows[0].contains("ssh 255.255.255.255:65535"),
+        "{:?}",
+        rows[0]
+    );
+}
+
+#[test]
+fn closing_a_host_says_its_shells_close_too() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    ssh_to(&mut app, tab, "nas", "10.0.0.2", 22);
+    let nas = app.endpoints[1].id;
+    app.mode = Mode::Confirm(Confirm::Close(Target::Endpoint(nas)));
+    let rows = render_rows(&mut app, W, H);
+    row_with(&rows, "│ Close host and its shells?");
+    row_with(&rows, " nas has 1 ssh session.");
+}

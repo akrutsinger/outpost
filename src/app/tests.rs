@@ -2097,3 +2097,147 @@ fn fitting_resizes_every_shell_and_new_ones() {
         assert_eq!((rows.get(), cols.get()), (10, 50));
     }
 }
+
+fn host(alias: &str, user: &str, host: &str, port: u16) -> crate::detect::Destination {
+    crate::detect::Destination {
+        alias: alias.into(),
+        user: user.into(),
+        host: host.into(),
+        port,
+    }
+}
+
+fn args(argv: &[&str]) -> Vec<String> {
+    argv.iter().map(|arg| arg.to_string()).collect()
+}
+
+/// The shell in `tab` now runs `argv`, as the next check would see.
+fn runs(app: &mut App, tab: SessId, argv: &[&str]) {
+    app.terminal_mut(tab).unwrap().observe(Some(args(argv)));
+    app.place_terminals();
+}
+
+/// The shell in `tab` runs `argv`, which an integration resolved to `dest`.
+fn connects(app: &mut App, tab: SessId, argv: &[&str], dest: Option<crate::detect::Destination>) {
+    runs(app, tab, argv);
+    app.handle(Event::Resolved(crate::detect::Resolved {
+        tab,
+        argv: args(argv),
+        dest,
+    }));
+}
+
+fn ssh_endpoints(app: &App) -> Vec<String> {
+    app.endpoints
+        .iter()
+        .filter(|endpoint| matches!(endpoint.kind, Kind::Ssh(_)))
+        .map(Endpoint::label)
+        .collect()
+}
+
+#[test]
+fn ssh_moves_the_shell_under_its_host_and_back() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    let proxmox = host("proxmox", "root", "192.168.12.69", 22);
+    connects(&mut app, tab, &["ssh", "proxmox"], Some(proxmox));
+    assert_eq!(ssh_endpoints(&app), ["proxmox"]);
+    // Focus follows the shell, which is named for the user it's logged in as.
+    let endpoint = &app.endpoints[app.active];
+    assert!(matches!(endpoint.kind, Kind::Ssh(_)));
+    assert_eq!(endpoint.tabs[endpoint.active_tab].id(), tab);
+    assert_eq!(endpoint.tabs[endpoint.active_tab].label(), "root");
+    assert!(app.endpoints[0].tabs.is_empty(), "left local");
+
+    // ssh exits; the shell comes back and the empty host goes.
+    runs(&mut app, tab, &["-sh"]);
+    assert!(ssh_endpoints(&app).is_empty());
+    assert_eq!(app.active, 0);
+    assert_eq!(app.endpoints[0].tabs[0].id(), tab);
+    assert_eq!(app.endpoints[0].tabs[0].label(), "sh");
+}
+
+#[test]
+fn shells_on_the_same_machine_share_its_endpoint() {
+    let (mut app, _rx) = App::test_new();
+    let (a, _a) = app.add_test_terminal();
+    let (b, _b) = app.add_test_terminal();
+    connects(
+        &mut app,
+        a,
+        &["ssh", "proxmox"],
+        Some(host("proxmox", "root", "192.168.12.69", 22)),
+    );
+    // Another name for the same address and port.
+    connects(
+        &mut app,
+        b,
+        &["ssh", "admin@192.168.12.69"],
+        Some(host("192.168.12.69", "admin", "192.168.12.69", 22)),
+    );
+    assert_eq!(ssh_endpoints(&app), ["proxmox"]);
+    let labels: Vec<String> = app.endpoints[1].tabs.iter().map(Tab::label).collect();
+    assert_eq!(labels, ["root", "admin"]);
+
+    // A different port is a different machine.
+    let (c, _c) = app.add_test_terminal();
+    connects(
+        &mut app,
+        c,
+        &["ssh", "-p", "2222", "proxmox"],
+        Some(host("proxmox", "root", "192.168.12.69", 2222)),
+    );
+    assert_eq!(ssh_endpoints(&app), ["proxmox", "proxmox"]);
+}
+
+#[test]
+fn a_background_shell_moving_leaves_focus_alone() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    let web = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    app.active = 1;
+    connects(
+        &mut app,
+        tab,
+        &["ssh", "nas"],
+        Some(host("nas", "root", "10.0.0.2", 22)),
+    );
+    assert_eq!(app.endpoints[app.active].id, web);
+    assert_eq!(ssh_endpoints(&app), ["nas"]);
+}
+
+#[test]
+fn ssh_that_is_not_resolved_or_already_gone_stays_local() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    // `ssh -G` failed, e.g. for bad arguments.
+    connects(&mut app, tab, &["ssh", "-Z"], None);
+    assert!(ssh_endpoints(&app).is_empty());
+
+    // The answer for a command the shell already finished is ignored.
+    runs(&mut app, tab, &["ssh", "nas"]);
+    runs(&mut app, tab, &["-sh"]);
+    app.handle(Event::Resolved(crate::detect::Resolved {
+        tab,
+        argv: args(&["ssh", "nas"]),
+        dest: Some(host("nas", "root", "10.0.0.2", 22)),
+    }));
+    assert!(ssh_endpoints(&app).is_empty());
+    assert_eq!(app.endpoints[0].tabs[0].id(), tab);
+}
+
+#[test]
+fn an_exited_shell_stays_where_it_was() {
+    let (mut app, _rx) = App::test_new();
+    let (tab, _shell) = app.add_test_terminal();
+    connects(
+        &mut app,
+        tab,
+        &["ssh", "nas"],
+        Some(host("nas", "root", "10.0.0.2", 22)),
+    );
+    shell_exit(&mut app, tab, "ended: hangup");
+    // With no shell, a check sees no command, but a closed tab isn't moved.
+    app.handle(Event::Tick);
+    assert_eq!(ssh_endpoints(&app), ["nas"]);
+}

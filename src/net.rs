@@ -371,7 +371,7 @@ mod tests {
     async fn next(rx: &mut UnboundedReceiver<Event>) -> NetEvent {
         match timeout(WAIT, rx.recv()).await {
             Ok(Some(Event::Net(ev))) => ev,
-            Ok(Some(Event::Input(_) | Event::Pty(_))) => panic!("unexpected non-network event"),
+            Ok(Some(_)) => panic!("unexpected non-network event"),
             Ok(None) => panic!("event channel closed"),
             Err(_) => panic!("timed out waiting for a net event"),
         }

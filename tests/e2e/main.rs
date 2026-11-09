@@ -246,3 +246,29 @@ async fn shell_tab_runs_commands_at_the_pane_size() {
     app.wait_for("0 open").await;
     app.quit().await;
 }
+
+/// Running ssh in a shell tab files the tab under that host, named for the
+/// user, until ssh ends. A proxy that never answers keeps ssh running
+/// without a network, and `-F /dev/null` ignores the user's ssh config.
+#[tokio::test]
+async fn ssh_in_a_shell_moves_the_tab_under_its_host() {
+    let mut app = Outpost::start();
+    app.wait_for("no endpoints").await;
+    app.prefix("c");
+    app.wait_for("╭ sh ").await;
+    app.keys("ssh -F /dev/null -o ProxyCommand='sleep 60' -p 2222 root@proxmox.test\r");
+    app.wait_for("2 proxmox.test").await;
+    app.wait_for("ssh proxmox.test:2222").await;
+    app.wait_for("╭ root ").await;
+
+    // Interrupting ssh brings the shell back to local, and the host goes.
+    // (The typed command stays on the shell's screen; watch the sidebar row
+    // and the tab bar instead.)
+    app.keys(CTRL_C);
+    app.wait_gone("2 proxmox.test").await;
+    app.wait_gone("ssh proxmox.test:2222").await;
+    app.wait_for("╭ sh ").await;
+    app.keys("exit 0\r");
+    app.wait_for(" exited 0 ").await;
+    app.quit().await;
+}

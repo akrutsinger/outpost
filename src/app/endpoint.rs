@@ -1,6 +1,7 @@
 //! Endpoints: the sidebar rows that own tabs. An endpoint is a listener (one
-//! bound socket, its listening task, and the sessions it accepted) or the
-//! local machine, whose tabs are shells.
+//! bound socket, its listening task, and the sessions it accepted), the
+//! local machine, whose tabs are shells, or a host those shells are
+//! connected to over ssh.
 
 use std::net::SocketAddr;
 
@@ -9,6 +10,7 @@ use tokio::task::AbortHandle;
 
 use super::{Session, Terminal};
 use crate::Event;
+use crate::detect::Destination;
 use crate::net::tls::{TlsConfig, TlsServer};
 use crate::net::{self, EndpointId, Protocol, SessId, UdpOut};
 
@@ -62,6 +64,9 @@ pub enum Kind {
     Listener(Listener),
     /// This machine. Its tabs are shells.
     Local,
+    /// A machine shells are connected to, named as first typed. Its tabs are
+    /// those shells; it goes once they all leave.
+    Ssh(Destination),
 }
 
 /// A bound socket and its listening task.
@@ -120,6 +125,13 @@ impl Tab {
         }
     }
 
+    pub fn status(&self) -> Status {
+        match self {
+            Tab::Session(s) => s.status(),
+            Tab::Terminal(t) => t.status(),
+        }
+    }
+
     pub fn unread(&self) -> bool {
         match self {
             Tab::Session(s) => s.unread,
@@ -174,6 +186,17 @@ impl Endpoint {
         }
     }
 
+    /// A host endpoint for `dest`, with no shells yet.
+    pub(super) fn new_ssh(dest: Destination) -> Self {
+        Self {
+            id: net::next_id(),
+            name: None,
+            kind: Kind::Ssh(dest),
+            tabs: Vec::new(),
+            active_tab: 0,
+        }
+    }
+
     /// The local endpoint, with no shells yet.
     pub(super) fn new_local() -> Self {
         Self {
@@ -189,7 +212,8 @@ impl Endpoint {
         self.name.clone().unwrap_or_else(|| self.addr_label())
     }
 
-    /// A listener's protocol and port, e.g. `tcp :4444`, or `local`.
+    /// A listener's protocol and port, e.g. `tcp :4444`, `local`, or a
+    /// host's name as typed.
     pub fn addr_label(&self) -> String {
         match &self.kind {
             Kind::Listener(listener) => format!(
@@ -198,20 +222,21 @@ impl Endpoint {
                 listener.config.addr.port()
             ),
             Kind::Local => "local".into(),
+            Kind::Ssh(dest) => dest.alias.clone(),
         }
     }
 
     pub fn listener(&self) -> Option<&Listener> {
         match &self.kind {
             Kind::Listener(listener) => Some(listener),
-            Kind::Local => None,
+            Kind::Local | Kind::Ssh(_) => None,
         }
     }
 
     pub fn listener_mut(&mut self) -> Option<&mut Listener> {
         match &mut self.kind {
             Kind::Listener(listener) => Some(listener),
-            Kind::Local => None,
+            Kind::Local | Kind::Ssh(_) => None,
         }
     }
 

@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Widget};
 
+use super::sidebar::host_port;
 use super::{Hits, TextTarget, human, put, put_right, render_input, status_glyph};
 use crate::app::{App, Dir, Kind, ListenState, Mode, Session, Tab, Target, Terminal};
 use crate::theme::*;
@@ -32,12 +33,16 @@ pub(super) fn render_tab_bar(buf: &mut Buffer, area: Rect, app: &App, hits: &mut
     };
 
     let mut tabs_right = area.right();
-    if let Some(listener) = endpoint.listener() {
-        let status = format!(
+    let status = match &endpoint.kind {
+        Kind::Listener(listener) => Some(format!(
             "{} {}",
             listener.config.protocol.label(),
             listener.config.addr
-        );
+        )),
+        Kind::Ssh(dest) => Some(format!("ssh {}", host_port(dest))),
+        Kind::Local => None,
+    };
+    if let Some(status) = status {
         let status_width = status.chars().count() as u16;
         // Status, then at least two tabs and the `+`, each with a gap.
         if area.width > status_width + 1 + MIN_TAB_WIDTH * 2 + NEW_TAB_WIDTH {
