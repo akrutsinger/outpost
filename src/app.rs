@@ -1031,7 +1031,7 @@ impl App {
     }
 
     /// Moves each running shell under the host it's connected to, or back to
-    /// local, then drops host endpoints with no shells left. Focus follows
+    /// local, then drops endpoints left with no shells. Focus follows
     /// the focused tab, and otherwise stays on the same endpoint.
     fn place_terminals(&mut self) {
         let mut moves = Vec::new();
@@ -1073,8 +1073,7 @@ impl App {
                 endpoint.active_tab = endpoint.tabs.len() - 1;
             }
         }
-        self.endpoints
-            .retain(|endpoint| !matches!(endpoint.kind, Kind::Ssh(_)) || !endpoint.tabs.is_empty());
+        self.drop_empty_endpoints();
 
         if let Some((endpoint, tab)) = focused_tab.and_then(|id| self.locate_tab(id)) {
             self.active = endpoint;
@@ -1085,6 +1084,17 @@ impl App {
             self.active = index;
         }
         self.active = self.active.min(self.endpoints.len().saturating_sub(1));
+    }
+
+    /// Removes the local and host endpoints that have no tabs left: the
+    /// sidebar shows what's active. Listeners stay; their socket is.
+    fn drop_empty_endpoints(&mut self) {
+        for index in (0..self.endpoints.len()).rev() {
+            let endpoint = &self.endpoints[index];
+            if endpoint.tabs.is_empty() && endpoint.listener().is_none() {
+                self.remove_endpoint(index);
+            }
+        }
     }
 
     /// Sizes every terminal tab to `area`, the pane inside its border. Every
@@ -1259,6 +1269,7 @@ impl App {
             Target::Tab(id) => {
                 if let Some((endpoint, index)) = self.locate_tab(id) {
                     self.remove_tab(endpoint, index);
+                    self.drop_empty_endpoints();
                 }
             }
         }

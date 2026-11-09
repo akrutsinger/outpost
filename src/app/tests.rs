@@ -2050,9 +2050,9 @@ fn an_exited_shell_stays_as_a_closed_tab() {
         written(&mut shell).is_empty(),
         "nothing goes to a dead shell"
     );
-    // Nothing is running, so closing doesn't ask.
+    // Nothing is running, so closing doesn't ask; local goes with it.
     prefix(&mut app, 'X');
-    assert!(app.endpoints[0].tabs.is_empty());
+    assert!(app.endpoints.is_empty());
 }
 
 #[test]
@@ -2062,7 +2062,7 @@ fn closing_a_running_shell_asks_first() {
     prefix(&mut app, 'X');
     assert!(matches!(app.mode, Mode::Confirm(Confirm::Close(t)) if t == Target::Tab(tab)));
     key(&mut app, KeyCode::Enter);
-    assert!(app.endpoints[0].tabs.is_empty());
+    assert!(app.endpoints.is_empty(), "local goes with its last shell");
 }
 
 #[test]
@@ -2150,7 +2150,10 @@ fn ssh_moves_the_shell_under_its_host_and_back() {
     assert!(matches!(endpoint.kind, Kind::Ssh(_)));
     assert_eq!(endpoint.tabs[endpoint.active_tab].id(), tab);
     assert_eq!(endpoint.tabs[endpoint.active_tab].label(), "root");
-    assert!(app.endpoints[0].tabs.is_empty(), "left local");
+    assert!(
+        !app.endpoints.iter().any(|e| matches!(e.kind, Kind::Local)),
+        "local goes with its last shell"
+    );
 
     // ssh exits; the shell comes back and the empty host goes.
     runs(&mut app, tab, &["-sh"]);
@@ -2179,7 +2182,8 @@ fn shells_on_the_same_machine_share_its_endpoint() {
         Some(host("192.168.12.69", "admin", "192.168.12.69", 22)),
     );
     assert_eq!(ssh_endpoints(&app), ["proxmox"]);
-    let labels: Vec<String> = app.endpoints[1].tabs.iter().map(Tab::label).collect();
+    // Both shells left local, so the host is the only endpoint.
+    let labels: Vec<String> = app.endpoints[0].tabs.iter().map(Tab::label).collect();
     assert_eq!(labels, ["root", "admin"]);
 
     // A different port is a different machine.
@@ -2369,4 +2373,18 @@ fn endpoint_and_tab_menus_are_rename_and_close() {
         assert_eq!(menu(&app).items, [MenuItem::Rename, MenuItem::Close]);
         key(&mut app, KeyCode::Esc);
     }
+}
+
+#[test]
+fn closing_the_last_shell_hides_local_and_focuses_what_is_left() {
+    let (mut app, _rx) = App::test_new();
+    let web = app.add_test_listener(Protocol::Tcp, "0.0.0.0:4444");
+    let (tab, _shell) = app.add_test_terminal();
+    assert_eq!(app.active, 0, "local comes first");
+    shell_exit(&mut app, tab, "exited 0");
+    // An exited shell is still a tab, so local stays until it's closed.
+    assert!(matches!(app.endpoints[0].kind, Kind::Local));
+    prefix(&mut app, 'X');
+    assert_eq!(app.endpoints.len(), 1);
+    assert_eq!(app.endpoints[app.active].id, web);
 }

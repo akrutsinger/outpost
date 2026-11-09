@@ -62,7 +62,7 @@ pub struct Endpoint {
 /// What an endpoint is, holding what only that kind has.
 pub enum Kind {
     Listener(Listener),
-    /// This machine. Its tabs are shells.
+    /// This machine. Its tabs are shells; it goes once it has none.
     Local,
     /// A machine shells are connected to, named as first typed. Its tabs are
     /// those shells; it goes once they all leave.

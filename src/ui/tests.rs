@@ -697,8 +697,11 @@ fn a_shell_on_a_host_shows_under_it_and_as_a_session() {
         !detail.contains('…') && !detail.contains("1 open"),
         "{detail:?}"
     );
-    // The local endpoint stays, now with nothing open.
-    row_with(&rows, "0 open");
+    // Local goes with its only shell.
+    assert!(
+        !rows.iter().any(|row| row.contains("1 local")),
+        "local still shown"
+    );
     // A shell on another machine is a connection.
     row_with(&rows, "1 open");
     row_with(&rows, "root");
@@ -730,7 +733,7 @@ fn a_host_row_keeps_the_whole_address_over_the_open_count() {
         65535,
     );
     let rows = render_rows(&mut app, W, H);
-    row_with(&rows, " 3 edge-router-with-a-lo");
+    row_with(&rows, " 2 edge-router-with-a-lo");
     let detail = row_with(&rows, "   255.255.255.255:65535");
     assert!(
         !detail.contains('…') && !detail.contains("open"),
@@ -748,7 +751,7 @@ fn closing_a_host_says_its_shells_close_too() {
     let (mut app, _rx) = App::test_new();
     let (tab, _shell) = app.add_test_terminal();
     ssh_to(&mut app, tab, "nas", "10.0.0.2", 22);
-    let nas = app.endpoints[1].id;
+    let nas = app.endpoints[0].id;
     app.mode = Mode::Confirm(Confirm::Close(Target::Endpoint(nas)));
     let rows = render_rows(&mut app, W, H);
     row_with(&rows, "│ Close host and its shells?");

@@ -257,7 +257,9 @@ async fn ssh_in_a_shell_moves_the_tab_under_its_host() {
     app.prefix("c");
     app.wait_for("╭ sh ").await;
     app.keys("ssh -F /dev/null -o ProxyCommand='sleep 60' -p 2222 root@proxmox.test\r");
-    app.wait_for("2 proxmox.test").await;
+    // Local goes with its only shell, so the host is the first row.
+    app.wait_for("1 proxmox.test").await;
+    app.wait_gone("local").await;
     app.wait_for("ssh proxmox.test:2222").await;
     app.wait_for("╭ root ").await;
 
@@ -265,7 +267,8 @@ async fn ssh_in_a_shell_moves_the_tab_under_its_host() {
     // (The typed command stays on the shell's screen; watch the sidebar row
     // and the tab bar instead.)
     app.keys(CTRL_C);
-    app.wait_gone("2 proxmox.test").await;
+    app.wait_gone("1 proxmox.test").await;
+    app.wait_for("1 local").await;
     app.wait_gone("ssh proxmox.test:2222").await;
     app.wait_for("╭ sh ").await;
     app.keys("exit 0\r");

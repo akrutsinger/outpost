@@ -8,7 +8,8 @@ goal is a TUI that feels almost identical to herdr.
 ## Vocabulary
 
 - **Endpoint**: a sidebar row that owns tabs: a listener, the **local** endpoint (this machine),
-  listed first once it has a shell, or a **host** that shells are connected to over ssh.
+  listed first while it has shells, or a **host** that shells are connected to over ssh. The sidebar
+  shows what's active: local and hosts go once they have no tabs; a listener stays while bound.
 - **Listener**: an endpoint with one socket bound to `IP:PORT`: TCP, UDP, TLS, or QUIC.
 - **Terminal tab**: the user's login shell in a PTY, drawn by an emulator (vt100). Every key but the
   prefix goes to the shell. A shell on this machine isn't a session; one running ssh is, and moves
